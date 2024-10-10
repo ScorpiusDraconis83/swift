@@ -35,7 +35,7 @@ deriveNilReturn(AbstractFunctionDecl *funcDecl, void *) {
   auto &C = parentDC->getASTContext();
 
   auto *nilExpr = new (C) NilLiteralExpr(SourceLoc(), /*Implicit=*/true);
-  auto *returnStmt = new (C) ReturnStmt(SourceLoc(), nilExpr);
+  auto *returnStmt = ReturnStmt::createImplicit(C, nilExpr);
   auto *body = BraceStmt::create(C, SourceLoc(), ASTNode(returnStmt),
                                  SourceLoc());
   return { body, /*isTypeChecked=*/false };
@@ -53,7 +53,7 @@ deriveRawValueReturn(AbstractFunctionDecl *funcDecl, void *) {
   auto *memberRef =
       UnresolvedDotExpr::createImplicit(C, selfRef, C.Id_rawValue);
 
-  auto *returnStmt = new (C) ReturnStmt(SourceLoc(), memberRef);
+  auto *returnStmt = ReturnStmt::createImplicit(C, memberRef);
   auto *body = BraceStmt::create(C, SourceLoc(), ASTNode(returnStmt),
                                  SourceLoc());
   return { body, /*isTypeChecked=*/false };
@@ -127,13 +127,13 @@ static ValueDecl *deriveInitDecl(DerivedConformance &derived, Type paramType,
 
   // init(rawValue:) decl
   auto *initDecl =
-    new (C) ConstructorDecl(name, SourceLoc(),
-                            /*Failable=*/true, /*FailabilityLoc=*/SourceLoc(),
-                            /*Async=*/false, /*AsyncLoc=*/SourceLoc(),
-                            /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(),
-                            /*ThrownType=*/TypeLoc(),
-                            paramList,
-                            /*GenericParams=*/nullptr, parentDC);
+      new (C) ConstructorDecl(name, SourceLoc(),
+                              /*Failable=*/true, /*FailabilityLoc=*/SourceLoc(),
+                              /*Async=*/false, /*AsyncLoc=*/SourceLoc(),
+                              /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(),
+                              /*ThrownType=*/TypeLoc(), paramList,
+                              /*GenericParams=*/nullptr, parentDC,
+                              /*LifetimeDependentTypeRepr*/ nullptr);
 
   initDecl->setImplicit();
 
@@ -162,12 +162,11 @@ static ValueDecl *deriveProperty(DerivedConformance &derived, Type type,
   VarDecl *propDecl;
   PatternBindingDecl *pbDecl;
   std::tie(propDecl, pbDecl) = derived.declareDerivedProperty(
-      DerivedConformance::SynthesizedIntroducer::Var, name, type, type,
+      DerivedConformance::SynthesizedIntroducer::Var, name, type,
       /*isStatic=*/false, /*isFinal=*/false);
 
   // Define the getter.
-  auto *getterDecl = derived.addGetterToReadOnlyDerivedProperty(
-      propDecl, type);
+  auto *getterDecl = derived.addGetterToReadOnlyDerivedProperty(propDecl);
 
   // Synthesize the body.
   synthesizer(getterDecl);
@@ -207,30 +206,27 @@ deriveBodyCodingKey_enum_stringValue(AbstractFunctionDecl *strValDecl, void *) {
     // return ""
     auto *emptyStringExpr = new (C) StringLiteralExpr("", SourceRange(),
                                                       /*Implicit=*/true);
-    auto *returnStmt = new (C) ReturnStmt(SourceLoc(), emptyStringExpr);
+    auto *returnStmt = ReturnStmt::createImplicit(C, emptyStringExpr);
     body = BraceStmt::create(C, SourceLoc(), ASTNode(returnStmt),
                              SourceLoc());
   } else {
     SmallVector<ASTNode, 4> cases;
     for (auto *elt : elements) {
-      auto *baseTE = TypeExpr::createImplicit(enumType, C);
-      auto *pat = new (C) EnumElementPattern(baseTE, SourceLoc(), DeclNameLoc(),
-                                             DeclNameRef(), elt, nullptr,
-                                             /*DC*/ strValDecl);
-      pat->setImplicit();
-
+      auto *pat = EnumElementPattern::createImplicit(enumType, elt,
+                                                     /*subPattern*/ nullptr,
+                                                     /*DC*/ strValDecl);
       auto labelItem = CaseLabelItem(pat);
 
       auto *caseValue = new (C) StringLiteralExpr(elt->getNameStr(),
                                                   SourceRange(),
                                                   /*Implicit=*/true);
-      auto *returnStmt = new (C) ReturnStmt(SourceLoc(), caseValue);
+      auto *returnStmt = ReturnStmt::createImplicit(C, caseValue);
       auto *caseBody = BraceStmt::create(C, SourceLoc(), ASTNode(returnStmt),
                                          SourceLoc());
       cases.push_back(CaseStmt::create(C, CaseParentKind::Switch, SourceLoc(),
                                        labelItem, SourceLoc(), SourceLoc(),
                                        caseBody,
-                                       /*case body var decls*/ llvm::None));
+                                       /*case body var decls*/ std::nullopt));
     }
 
     auto *selfRef = DerivedConformance::createSelfDeclRef(strValDecl);
@@ -299,7 +295,7 @@ deriveBodyCodingKey_init_stringValue(AbstractFunctionDecl *initDecl, void *) {
                                    SourceLoc());
     cases.push_back(CaseStmt::create(C, CaseParentKind::Switch, SourceLoc(),
                                      labelItem, SourceLoc(), SourceLoc(), body,
-                                     /*case body var decls*/ llvm::None));
+                                     /*case body var decls*/ std::nullopt));
   }
 
   auto *anyPat = AnyPattern::createImplicit(C);
@@ -311,7 +307,7 @@ deriveBodyCodingKey_init_stringValue(AbstractFunctionDecl *initDecl, void *) {
   cases.push_back(CaseStmt::create(C, CaseParentKind::Switch, SourceLoc(),
                                    dfltLabelItem, SourceLoc(), SourceLoc(),
                                    dfltBody,
-                                   /*case body var decls*/ llvm::None));
+                                   /*case body var decls*/ std::nullopt));
 
   auto *stringValueDecl = initDecl->getParameters()->get(0);
   auto *stringValueRef = new (C) DeclRefExpr(stringValueDecl, DeclNameLoc(),
@@ -419,7 +415,7 @@ ValueDecl *DerivedConformance::deriveCodingKey(ValueDecl *requirement) {
     };
 
     return deriveProperty(*this, optionalIntType, Context.Id_intValue, synth);
-  } else if (name == DeclBaseName::createConstructor()) {
+  } else if (name.isConstructor()) {
     auto argumentNames = requirement->getName().getArgumentNames();
     if (argumentNames.size() == 1) {
       if (argumentNames[0] == Context.Id_stringValue) {

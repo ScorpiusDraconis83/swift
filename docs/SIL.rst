@@ -459,6 +459,20 @@ number of ways:
   - Other function type conventions are described in ``Properties of Types`` and
     ``Calling Convention``.
 
+- SIL function types do not directly carry most of the actor-isolation
+  information available in the Swift type system.  Actor isolation is mostly
+  simply erased from the SIL type system and treated as a dynamic property
+  in SIL functions.
+
+  However, ``@isolated(any)`` requires some additional ABI support and
+  therefore must be carried on SIL function types.  ``@isolated(any)`` is
+  only allowed in combination with ``@convention(thick)``; in particular,
+  this precludes SIL function declarations from having ``@isolated(any)``
+  type.  Instead, ``@isolated(any)`` function values are constructed with
+  ``partial_apply [isolated_any]``, which has additional requirements.
+  The isolation of an ``@isolated(any)`` function can be read with the
+  ``function_extract_isolation`` instruction.
+
 - A SIL function type declares the conventions for its parameters.
   The parameters are written as an unlabeled tuple; the elements of that
   tuple must be legal SIL types, optionally decorated with one of the
@@ -678,6 +692,18 @@ autorelease in the callee.
   type behaves like a non-generic type, as if the substitutions were
   actually applied to the underlying function type.
 
+- SIL functions may optionally mark a function parameter as
+  ``@sil_isolated``. An ``@sil_isolated`` parameter must be one of:
+
+  - An actor or any actor type.
+  - A generic type that conforms to Actor or AnyActor.
+
+  and must be the actor instance that a function is isolated to. Importantly
+  this means that global actor isolated nominal types are never
+  ``@sil_isolated``. Only one parameter can ever be marked as ``@sil_isolated``
+  since a function cannot be isolated to multiple actors at the same time.
+
+
 Async Functions
 ```````````````
 
@@ -778,7 +804,7 @@ the ``@yields`` attribute.  A yielded value may have a convention attribute,
 taken from the set of parameter attributes and interpreted as if the yield
 site were calling back to the calling function.
 
-Currently, a coroutine may not have normal results.
+In addition to yielded values a coroutine could also have normal results.
 
 Coroutine functions may be used in many of the same ways as normal
 function values.  However, they cannot be called with the standard
@@ -1151,6 +1177,7 @@ information when inlined.
   sil-function-thunk ::= 'thunk'
   sil-function-thunk ::= 'signature_optimized_thunk'
   sil-function-thunk ::= 'reabstraction_thunk'
+  sil-function-thunk ::= 'back_deployed_thunk'
 
 The function is a compiler generated thunk.
 ::
@@ -1280,7 +1307,14 @@ The clang node owner.
 
 Specifies the performance constraints for the function, which defines which type
 of runtime functions are allowed to be called from the function.
+::
 
+  sil-function-attribute ::= '[perf_constraint]'
+
+Specifies that the optimizer and IRGen must not add runtime calls which are not
+in the function originally. This attribute is set for functions with performance
+constraints or functions which are called from functions with performance
+constraints.
 
 Argument Effects
 ````````````````
@@ -1587,6 +1621,7 @@ VTables
 
   decl ::= sil-vtable
   sil-vtable ::= 'sil_vtable' identifier '{' sil-vtable-entry* '}'
+  sil-vtable ::= 'sil_vtable' sil-type '{' sil-vtable-entry* '}'
 
   sil-vtable-entry ::= sil-decl-ref ':' sil-linkage? sil-function-name
 
@@ -1649,6 +1684,13 @@ class (such as ``C.bas`` in ``C``'s vtable).
 In case the SIL function is a thunk, the function name is preceded with the
 linkage of the original implementing function.
 
+If the vtable refers to a specialized class, a SIL type specifies the bound
+generic class type::
+
+  sil_vtable $G<Int> {
+    // ...
+  }
+
 Witness Tables
 ~~~~~~~~~~~~~~
 ::
@@ -1696,7 +1738,7 @@ the underlying normal conformance.
   sil-witness-entry ::= 'base_protocol' identifier ':' protocol-conformance
   sil-witness-entry ::= 'method' sil-decl-ref ':' sil-function-name
   sil-witness-entry ::= 'associated_type' identifier
-  sil-witness-entry ::= 'associated_type_protocol'
+  sil-witness-entry ::= 'associated_conformance'
                         '(' identifier ':' identifier ')' ':' protocol-conformance
 
 Witness tables consist of the following entries:
@@ -2707,12 +2749,12 @@ That's the case if the destroy point is jointly dominated by:
 
 or
 
-* an ``inject_enum_addr`` to the enum memory location with a non-trivial or
+* an ``inject_enum_addr`` to the enum memory location with a trivial or
   non-payload case.
 
 or
 
-* a successor of a ``switch_enum`` or ``switch_enum_addr`` for a non-trivial
+* a successor of a ``switch_enum`` or ``switch_enum_addr`` for a trivial
   or non-payload case.
 
 Dead End Blocks
@@ -3706,7 +3748,7 @@ of ``scalar_pack_index``, ``pack_pack_index``, or ``dynamic_pack_index``),
 and it must index into a pack type with the same shape as the indexed
 pack type.
 
-Third, additional restrictions must be satisifed depending on which
+Third, additional restrictions must be satisfied depending on which
 pack indexing instruction the pack index is:
 
 - For ``scalar_pack_index``, the projected element type must be the
@@ -3757,6 +3799,7 @@ alloc_stack
   sil-instruction ::= 'alloc_stack' alloc-stack-option* sil-type (',' debug-var-attr)*
   alloc-stack-option ::= '[dynamic_lifetime]'
   alloc-stack-option ::= '[lexical]'
+  alloc-stack-option ::= '[var_decl]'
   alloc-stack-option ::= '[moveable_value_debuginfo]'
 
   %1 = alloc_stack $T
@@ -3776,7 +3819,12 @@ The ``dynamic_lifetime`` attribute specifies that the initialization and
 destruction of the stored value cannot be verified at compile time.
 This is the case, e.g. for conditionally initialized objects.
 
-The optional ``lexical`` attribute specifies that the storage corresponds to a
+The optional ``lexical`` attribute specifies that the operand corresponds to a
+local variable with a lexical lifetime in the Swift source, so special care
+must be taken when hoisting ``destroy_addr``s.  Compare to the ``var_decl``
+attribute.
+
+The optional ``var_decl`` attribute specifies that the storage corresponds to a
 local variable in the Swift source.
 
 The optional ``moveable_value_debuginfo`` attribute specifies that when emitting
@@ -4132,7 +4180,7 @@ dealloc_box
 ```````````
 ::
 
-  sil-instruction ::= 'dealloc_box' sil-operand
+  sil-instruction ::= 'dealloc_box' '[dead_end]'? sil-operand
 
   dealloc_box %0 : $@box T
 
@@ -4144,6 +4192,9 @@ undefined behavior results.
 This does not destroy the boxed value. The contents of the
 value must have been fully uninitialized or destroyed before
 ``dealloc_box`` is applied.
+
+The optional ``dead_end`` attribute specifies that this instruction was created
+during lifetime completion and is eligible for deletion during OSSA lowering.
 
 project_box
 ```````````
@@ -4262,7 +4313,6 @@ less verbose.
    debug-var-attr ::= 'let'
    debug-var-attr ::= 'name' string-literal
    debug-var-attr ::= 'argno' integer-literal
-   debug-var-attr ::= 'implicit'
 
 There are a number of attributes that provide details about the source
 variable that is being described, including the name of the
@@ -4296,6 +4346,7 @@ from that of source variable.
   debug-info-expr   ::= di-expr-operand (':' di-expr-operand)*
   di-expr-operand   ::= di-expr-operator (':' sil-operand)*
   di-expr-operator  ::= 'op_fragment'
+  di-expr-operator  ::= 'op_tuple_fragment'
   di-expr-operator  ::= 'op_deref'
 
 SIL debug info expression (SIL DIExpression) is a powerful method to connect SSA
@@ -4342,6 +4393,10 @@ a field declaration -- which references the desired sub-field in source variable
 
 In the snippet above, source variable "the_struct" has an aggregate type ``$MyStruct`` and we use a SIL DIExpression with ``op_fragment`` operator to associate ``%1`` to the ``y`` member variable (via the ``#MyStruct.y`` directive) inside "the_struct".
 Note that the extra source location directive follows right after ``name "the_struct"`` indicate that "the_struct" was originally declared in line 8, but not until line 9 -- the current ``debug_value`` instruction's source location -- does member ``y`` got updated with SSA value ``%1``.
+
+For tuples, it works similarly, except we use ``op_tuple_fragment``, which takes two arguments: the tuple type and the index. If our struct was instead a tuple, we would have:
+
+  debug_value %1 : $Int, var, (name "the_tuple", loc "file.swift":8:7), type $(x: Int, y: Int), expr op_tuple_fragment:$(x: Int, y: Int):1, loc "file.swift":9:4
 
 It is worth noting that a SIL DIExpression is similar to
 `!DIExpression <https://www.llvm.org/docs/LangRef.html#diexpression>`_ in LLVM debug
@@ -4576,6 +4631,38 @@ We require that ``%1`` and ``%0`` have the same type ignoring SILValueCategory.
 
 This instruction is only valid in functions in Ownership SSA form.
 
+borrowed from
+`````````````
+
+::
+
+   sil-instruction ::= 'borrowed' sil-operand 'from' '(' (sil-operand (',' sil-operand)*)? ')'
+
+   bb1(%1 : @owned $T, %2 : @guaranteed $T):
+     %3 = borrowed %2 : $T from (%1 : $T, %0 : $S)
+     // %3 has type $T and guaranteed ownership
+
+Declares from which enclosing values a guaranteed phi argument is borrowed
+from.
+An enclosing value is either a dominating borrow introducer (``%0``) of the
+borrowed operand (``%2``) or an adjacent phi-argument in the same block
+(``%1``).
+In case of an adjacent phi, all incoming values of the adjacent phi must be
+borrow introducers for the corresponding incoming value of the borrowed
+operand in all predecessor blocks.
+
+The borrowed operand (``%2``) must be a guaranteed phi argument and is
+forwarded to the instruction result.
+
+The list of enclosing values (operands after ``from``) can be empty if the
+borrowed operand stems from a borrow introducer with no enclosing value, e.g.
+a ``load_borrow``.
+
+Guaranteed phi arguments must not have other users than borrowed-from
+instructions.
+
+This instruction is only valid in functions in Ownership SSA form.
+
 end_lifetime
 ````````````
 
@@ -4598,6 +4685,22 @@ The instruction accepts an object or address type.
 `@owned T`. If its argument is an address type, it's an identity projection.
 This instruction is valid only in OSSA and is lowered to a no-op when lowering
 to non-OSSA.
+
+extend_lifetime
+```````````````
+
+::
+
+   sil-instruction ::= 'extend_lifetime' sil-operand
+
+   // Indicate that %0's linear lifetime extends to this point
+   extend_lifetime %0 : $X
+
+Indicates that a value's linear lifetime extends to this point.  Inserted by
+OSSALifetimeCompletion(AvailabilityBoundary) in order to provide the invariant
+that a value is either consumed OR has an `extend_lifetime` user on all paths
+and furthermore that all uses are within the boundary defined by that set of
+instructions (the consumes and the `extend_lifetime`s).
 
 assign
 ``````
@@ -5151,7 +5254,7 @@ end_unpaired_access
   sil-enforcement ::= static
   sil-enforcement ::= dynamic
   sil-enforcement ::= unsafe
-  %1 = end_unpaired_access [dynamic] %0 : $*Builtin.UnsafeValueBuffer
+  end_unpaired_access [dynamic] %0 : $*Builtin.UnsafeValueBuffer
 
 Ends an access. This has the same semantics and constraints as ``end_access`` with the following exceptions:
 
@@ -5503,24 +5606,34 @@ mark_dependence
 
 ::
 
-  sil-instruction :: 'mark_dependence' sil-operand 'on' sil-operand
+  sil-instruction :: 'mark_dependence' '[nonescaping]'? sil-operand 'on' sil-operand
 
-  %2 = mark_dependence %0 : $*T on %1 : $Builtin.NativeObject
+  %2 = mark_dependence %value : $*T on %base : $Builtin.NativeObject
 
-Indicates that the validity of the first operand depends on the value
-of the second operand.  Operations that would destroy the second value
-must not be moved before any instructions which depend on the result
-of this instruction, exactly as if the address had been obviously
-derived from that operand (e.g. using ``ref_element_addr``).
+Indicates that the validity of ``%value`` depends on the value of
+``%base``. Operations that would destroy ``%base`` must not be moved
+before any instructions which depend on the result of this
+instruction, exactly as if the address had been directly derived from
+that operand (e.g. using ``ref_element_addr``).
 
-The result is always equal to the first operand.  The first operand
-will typically be an address, but it could be an address in a
-non-obvious form, such as a Builtin.RawPointer or a struct containing
-the same.  Transformations should be somewhat forgiving here.
+The result is the forwarded value of ``%value``. ``%value`` may be an
+address, but it could be an address in a non-obvious form, such as a
+Builtin.RawPointer or a struct containing the same.
 
-The second operand may have either object or address type.  In the
-latter case, the dependency is on the current value stored in the
-address.
+``%base`` may have either object or address type. In the latter case,
+the dependency is on the current value stored in the address.
+
+The optional ``nonescaping`` attribute indicates that no value derived
+from ``%value`` escapes the lifetime of ``%base``. As with escaping
+``mark_dependence``, all values transitively forwarded from ``%value``
+must be destroyed within the lifetime of ` `%base``. Unlike escaping
+``mark_dependence``, this must be statically verifiable. Additionally,
+unlike escaping ``mark_dependence``, derived values include copies of
+``%value`` and values transitively forwarded from those copies. If
+``%base`` must not be identical to ``%value``. Unlike escaping
+``mark_dependence``, no value derived from ``%value`` may have a
+bitwise escape (conversion to UnsafePointer) or pointer escape
+(unknown use).
 
 is_unique
 `````````
@@ -5540,7 +5653,7 @@ strong reference count is greater than 1.
 A discussion of the semantics can be found here:
 `is_unique instruction <arcopts_is_unique_>`_
 
-.. _arcopts_is_unique: https://github.com/apple/swift/blob/main/docs/ARCOptimization.md#is_unique-instruction
+.. _arcopts_is_unique: https://github.com/swiftlang/swift/blob/main/docs/ARCOptimization.md#is_unique-instruction
 
 begin_cow_mutation
 ``````````````````
@@ -5728,14 +5841,20 @@ global_addr
 
 ::
 
-  sil-instruction ::= 'global_addr' sil-global-name ':' sil-type
+  sil-instruction ::= 'global_addr' sil-global-name ':' sil-type ('depends_on' sil-operand)?
 
   %1 = global_addr @foo : $*Builtin.Word
+  %3 = global_addr @globalvar : $*Builtin.Word depends_on %2
+  // %2 has type $Builtin.SILToken
 
 Creates a reference to the address of a global variable which has been
 previously initialized by ``alloc_global``. It is undefined behavior to
 perform this operation on a global variable which has not been
 initialized, except the global variable has a static initializer.
+
+Optionally, the dependency to the initialization of the global can be
+specified with a dependency token ``depends_on <token>``. This is usually
+a ``builtin "once"`` which calls the initializer for the global variable.
 
 global_value
 `````````````
@@ -6044,6 +6163,14 @@ executing the ``begin_apply``) were being "called" by the ``yield``:
   or move the value from that position before ending or aborting the
   coroutine.
 
+A coroutine optionally may produce normal results. These do not have
+``@yields`` annotation in the result type tuple.
+::
+  (%float, %token) = begin_apply %0() : $@yield_once () -> (@yields Float, Int)
+
+Normal results of a coroutine are produced by the corresponding ``end_apply``
+instruction.
+
 A ``begin_apply`` must be uniquely either ended or aborted before
 exiting the function or looping to an earlier portion of the function.
 
@@ -6073,9 +6200,9 @@ end_apply
 `````````
 ::
 
-  sil-instruction ::= 'end_apply' sil-value
+  sil-instruction ::= 'end_apply' sil-value 'as' sil-type
 
-  end_apply %token
+  end_apply %token as $()
 
 Ends the given coroutine activation, which is currently suspended at
 a ``yield`` instruction.  Transfers control to the coroutine and takes
@@ -6085,8 +6212,8 @@ when the coroutine reaches a ``return`` instruction.
 The operand must always be the token result of a ``begin_apply``
 instruction, which is why it need not specify a type.
 
-``end_apply`` currently has no instruction results.  If coroutines were
-allowed to have normal results, they would be producted by ``end_apply``.
+The result of ``end_apply`` is the normal result of the coroutine function (the
+operand of the ``return`` instruction)."
 
 When throwing coroutines are supported, there will need to be a
 ``try_end_apply`` instruction.
@@ -6095,12 +6222,13 @@ partial_apply
 `````````````
 ::
 
-  sil-instruction ::= 'partial_apply' callee-ownership-attr? on-stack-attr? sil-value
+  sil-instruction ::= 'partial_apply' partial-apply-attr* sil-value
                         sil-apply-substitution-list?
                         '(' (sil-value (',' sil-value)*)? ')'
                         ':' sil-type
-  callee-ownership-attr ::= '[callee_guaranteed]'
-  on-stack-attr ::= '[on_stack]'
+  partial-apply-attr ::= '[callee_guaranteed]'
+  partial-apply-attr ::= '[isolated_any]'
+  partial-apply-attr ::= '[on_stack]'
 
   %c = partial_apply %0(%1, %2, ...) : $(Z..., A, B, ...) -> R
   // Note that the type of the callee '%0' is specified *after* the arguments
@@ -6156,13 +6284,24 @@ lowers to an uncurried entry point and is curried in the enclosing function::
     return %ret : $Int
   }
 
+**Erased Isolation**: If the ``partial_apply`` is marked with the flag
+``[isolated_any]``, the first applied argument must have type
+``Optional<any Actor>``.  In addition to being provided as an argument to
+the partially-applied function, this value will be stored in a special
+place in the context and can be recovered with ``function_extract_isolation``.
+The result type of the ``partial_apply`` will be an ``@isolated(any)``
+function type.
+
 **Ownership Semantics of Closure Context during Invocation**: By default, an
 escaping ``partial_apply`` (``partial_apply`` without ``[on_stack]]`` creates a
 closure whose invocation takes ownership of the context, meaning that a call
-implicitly releases the closure. If the ``partial_apply`` is marked with the
-flag ``[callee_guaranteed]`` the invocation instead uses a caller-guaranteed
-model, where the caller promises not to release the closure while the function
-is being called.
+implicitly releases the closure.
+
+If the ``partial_apply`` is marked with the flag ``[callee_guaranteed]``,
+the invocation instead uses a caller-guaranteed model, where the caller
+promises not to release the closure while the function is being called.
+The result type of the ``partial_apply`` will be a ``@callee_guaranteed``
+function type.
 
 **Captured Value Ownership Semantics**: In the instruction syntax, the type of
 the callee is specified after the argument list; the types of the argument and
@@ -6191,6 +6330,16 @@ callee function (and thus said signature). Instead:
    obtained from ``partial_apply`` will not own its underlying value.  The
    ``@inout_aliasable`` parameter convention is used when a ``@noescape``
    closure captures an ``inout`` argument.
+
+**Coroutines** ``partial_apply`` could be used to create closures over
+coroutines. Overall, the ``partial_apply`` of a coroutine is straightforward: it
+is another coroutine that captures arguments passed to the ``partial_apply``
+instruction. This closure applies the original coroutine (similar to the
+``begin_apply`` instruction) for yields (suspend) and yields the resulting
+values. Then it calls the original coroutine continuation for return or unwind,
+and forwards the results (if any) to the caller as well. Currently only the
+autodiff transformation produces ``partial_apply`` for coroutines while
+differentiating modify accessors.
 
 **NOTE:** If the callee is generic, all of its generic parameters must be bound
 by the given substitution list. The arguments are given with these generic
@@ -6529,7 +6678,7 @@ destroy_value
 
 ::
 
-  sil-instruction ::= 'destroy_value' '[poison]'? sil-operand
+  sil-instruction ::= 'destroy_value' '[dead_end]'? '[poison]'? sil-operand
 
   destroy_value %0 : $A
 
@@ -6547,6 +6696,9 @@ For aggregate types, especially enums, it is typically both easier
 and more efficient to reason about aggregate destroys than it is to
 reason about destroys of the subobjects.
 
+The optional ``dead_end`` attribute specifies that this instruction was created
+during lifetime completion and is eligible for deletion during OSSA lowering.
+
 autorelease_value
 `````````````````
 
@@ -6557,6 +6709,17 @@ autorelease_value
   autorelease_value %0 : $A
 
 *TODO* Complete this section.
+
+function_extract_isolation
+``````````````````````````
+
+::
+  sil-instruction ::= function_extract_isolation sil-operand
+
+Reads the isolation of a `@isolated(any)` function value.  The result is
+always a borrowed value of type `$Optional<any Actor>`.  It is exactly
+the value that was originally used to construct the function with
+`partial_apply [isolated_any]`.
 
 tuple
 `````
@@ -6871,7 +7034,7 @@ presence or value of the ``enum_extensibility`` Clang attribute.
 
 (See `SE-0192`__ for more information about non-frozen enums.)
 
-__ https://github.com/apple/swift-evolution/blob/main/proposals/0192-non-exhaustive-enums.md
+__ https://github.com/swiftlang/swift-evolution/blob/main/proposals/0192-non-exhaustive-enums.md
 
 enum
 ````
@@ -6958,18 +7121,25 @@ unchecked_take_enum_data_addr
   // #U.DataCase must be a case of enum $U with data
   // %1 will be of address type $*T for the data type of case U.DataCase
 
-Invalidates an enum value, and takes the address of the payload for the given
-enum ``case`` in-place in memory. The referenced enum value is no longer valid,
-but the payload value referenced by the result address is valid and must be
-destroyed. It is undefined behavior if the referenced enum does not contain a
-value of the given ``case``. The result shares memory with the original enum
-value; the enum memory cannot be reinitialized as an enum until the payload has
-also been invalidated.
+Takes the address of the payload for the given enum ``case`` in-place in
+memory. It is undefined behavior if the referenced enum does not contain a
+value of the given ``case``. 
 
-(1.0 only)
+The result shares memory with the original enum value.  If an enum declaration
+is unconditionally loadable (meaning it's loadable regardless of any generic
+parameters), and it has more than one case with an associated value, then it
+may embed the enum tag within the payload area. If this is the case, then
+`unchecked_take_enum_data_addr` will clear the tag from the payload,
+invalidating the referenced enum value, but leaving the
+payload value referenced by the result address valid. In these cases,
+the enum memory cannot be reinitialized as an enum until the payload has also
+been invalidated.
 
-For the first payloaded case of an enum, ``unchecked_take_enum_data_addr``
-is guaranteed to have no side effects; the enum value will not be invalidated.
+If an enum has no more than one payload case, or if the declaration is ever
+address-only, then `unchecked_take_enum_data_addr` is guaranteed to be
+nondestructive, and the payload address can be accessed without invalidating
+the enum in these cases. The payload can be invalidated to invalidate the
+enum (assuming the enum does not have a `deinit` at the type level).
 
 select_enum
 ```````````
@@ -7438,6 +7608,8 @@ scalar_pack_index
 
   sil-instruction ::= 'scalar_pack_index' int-literal 'of' sil-type
 
+  %index = scalar_pack_index 0 of $Pack{Int, repeat each T, Int}
+
 Produce the dynamic pack index of a scalar (non-pack-expansion)
 component of a pack.  The type operand is the indexed pack type.  The
 integer operand is an index into the components of this pack type; it
@@ -7557,6 +7729,8 @@ pack_element_get
 
   sil-instruction ::= 'pack_element_get' sil-value 'of' sil-operand 'as' sil-type
 
+  %addr = pack_element_get %index of %pack : $*Pack{Int, repeat each T} as $*Int
+
 Extracts the value previously stored in a pack at a particular index.
 If the pack element is uninitialized, this has undefined behavior.
 
@@ -7575,6 +7749,8 @@ pack_element_set
 
   sil-instruction ::= 'pack_element_set' sil-operand 'into' sil-value 'of' sil-operand
 
+  pack_element_set %addr : $*@pack_element("...") each U into %index of %pack : $*Pack{Int, repeat each T}
+
 Places a value in a pack at a particular index.
 
 Ownership is unclear for direct packs.
@@ -7585,6 +7761,20 @@ is the pack and must be the address of a pack value.  The type of the
 element value operand is the projected element type of the pack element
 and must be structurally well-typed for the given index and pack type;
 see the structural type matching rules for pack indices.
+
+Value Generics
+~~~~~~~~~~~~~~~~~
+
+type_value
+```````````
+
+::
+
+  sil-instruction ::= 'type_value' sil-type 'for' sil-identifier
+
+Produce the dynamic value of the given value generic, which must be a formal
+value generic type. The value of the instruction has the type of whatever the
+underlying value generic's type is. For right now that is limited to ``Int``.
 
 Unchecked Conversions
 ~~~~~~~~~~~~~~~~~~~~~
@@ -7916,6 +8106,40 @@ A ``convert_escape_to_noescape [escaped]`` indicates that the result was
 passed to a function (materializeForSet) which escapes the closure in a way not
 expressed by the convert's users. The mandatory pass must ensure the lifetime
 in a conservative way.
+
+
+thunk
+`````
+::
+
+  sil-instruction ::= 'thunk' sil-thunk-attr* sil-value sil-apply-substitution-list? () sil-type
+  sil-thunk-attr ::= '[' thunk-kind ']'
+  sil-thunk-kind ::= identity
+
+  %1 = thunk [identity] %0() : $@convention(thin) (T) -> U
+  // %0 must be of a function type $T -> U
+  // %1 will be of type @callee_guaranteed (T) -> U since we are creating an
+  // "identity" thunk.
+  
+  %1 = thunk [identity] %0<T>() : $@convention(thin) (τ_0_0) -> ()
+  // %0 must be of a function type $T -> ()
+  // %1 will be of type @callee_guaranteed <τ_0_0> (τ_0_0) -> () since we are creating a
+  // "identity" thunk.
+
+Takes in a function and depending on the kind produces a new function result
+that is ``@callee_guaranteed``. The specific way that the function type of the
+input is modified by this instruction depends on the specific sil-thunk-kind of
+the instruction. So for instance, the hop_to_mainactor_if_needed thunk just
+returns a callee_guaranteed version of the input function... but one could
+imagine a "reabstracted" thunk kind that would produce the appropriate
+reabstracted thunk kind.
+
+This instructions is lowered to a true think in Lowered SIL by the ThunkLowering
+pass.
+
+It is assumed that like `partial_apply`_, if we need a substitution map, it will be
+attached to `thunk`_. This ensures that we have the substitution
+map already created if we need to create a `partial_apply`_.
 
 classify_bridge_object
 ``````````````````````
@@ -8301,7 +8525,7 @@ switch_value
   // FIXME: All destination labels currently must take no arguments
 
 Conditionally branches to one of several destination basic blocks based on a
-value of builtin integer or function type. If the operand value matches one of the ``case``
+value of builtin integer. If the operand value matches one of the ``case``
 values of the instruction, control is transferred to the corresponding basic
 block. If there is a ``default`` basic block, control is transferred to it if
 the value does not match any of the ``case`` values. It is undefined behavior

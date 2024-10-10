@@ -702,6 +702,16 @@ module std [system] {
   module _Private [system] {
     requires cplusplus
 
+    explicit module __msvc_bit_utils {
+      header "__msvc_bit_utils.hpp"
+      export *
+    }
+
+    explicit module xatomic {
+      header "xatomic.h"
+      export *
+    }
+
     explicit module xhash {
       header "xhash"
       export *

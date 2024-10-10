@@ -12,6 +12,7 @@
 
 #include "swift/SIL/SILBuilder.h"
 #include "swift/AST/Expr.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/Projection.h"
 #include "swift/SIL/SILGlobalVariable.h"
 
@@ -54,12 +55,13 @@ TupleInst *SILBuilder::createTuple(SILLocation loc, ArrayRef<SILValue> elts) {
 SILType SILBuilder::getPartialApplyResultType(
     TypeExpansionContext context, SILType origTy, unsigned argCount,
     SILModule &M, SubstitutionMap subs, ParameterConvention calleeConvention,
+    SILFunctionTypeIsolation resultIsolation,
     PartialApplyInst::OnStackKind onStack) {
   CanSILFunctionType FTI = origTy.castTo<SILFunctionType>();
   if (!subs.empty())
     FTI = FTI->substGenericArgs(M, subs, context);
 
-  assert(!FTI->isPolymorphic()
+  ASSERT(!FTI->isPolymorphic()
          && "must provide substitutions for generic partial_apply");
   auto params = FTI->getParameters();
   auto newParams = params.slice(0, params.size() - argCount);
@@ -68,6 +70,7 @@ SILType SILBuilder::getPartialApplyResultType(
       FTI->getExtInfo()
           .intoBuilder()
           .withRepresentation(SILFunctionType::Representation::Thick)
+          .withIsolation(resultIsolation)
           .withIsPseudogeneric(false);
   if (onStack)
     extInfoBuilder = extInfoBuilder.withNoEscape();
@@ -100,6 +103,10 @@ SILType SILBuilder::getPartialApplyResultType(
   }
   for (auto yield : FTI->getYields()) {
     needsSubstFunctionType |= yield.getInterfaceType()->hasTypeParameter();
+  }
+  if (FTI->hasErrorResult()) {
+    needsSubstFunctionType
+      |= FTI->getErrorResult().getInterfaceType()->hasTypeParameter();
   }
 
   SubstitutionMap appliedSubs;
@@ -148,7 +155,7 @@ SILBuilder::createClassifyBridgeObject(SILLocation Loc, SILValue value) {
 SingleValueInstruction *
 SILBuilder::createUncheckedReinterpretCast(SILLocation Loc, SILValue Op,
                                            SILType Ty) {
-  assert(isLoadableOrOpaque(Ty));
+  ASSERT(isLoadableOrOpaque(Ty));
   if (Ty.isTrivial(getFunction()))
     return insert(UncheckedTrivialBitCastInst::create(
         getSILDebugLocation(Loc), Op, Ty, getFunction()));
@@ -182,7 +189,7 @@ SILBuilder::createUncheckedForwardingCast(SILLocation Loc, SILValue Op,
   if (!hasOwnership())
     return createUncheckedReinterpretCast(Loc, Op, Ty);
 
-  assert(isLoadableOrOpaque(Ty));
+  ASSERT(isLoadableOrOpaque(Ty));
   if (Ty.isTrivial(getFunction()))
     return insert(UncheckedTrivialBitCastInst::create(
         getSILDebugLocation(Loc), Op, Ty, getFunction()));
@@ -225,7 +232,7 @@ void SILBuilder::emitBlock(SILBasicBlock *BB, SILLocation BranchLoc) {
   }
 
   // Fall though from the currently active block into the given block.
-  assert(BB->args_empty() && "cannot fall through to bb with args");
+  ASSERT(BB->args_empty() && "cannot fall through to bb with args");
 
   // This is a fall through into BB, emit the fall through branch.
   createBranch(BranchLoc, BB);
@@ -254,9 +261,9 @@ SILBasicBlock *SILBuilder::splitBlockForFallthrough() {
   return NewBB;
 }
 
-llvm::Optional<SILDebugVariable>
+std::optional<SILDebugVariable>
 SILBuilder::substituteAnonymousArgs(llvm::SmallString<4> Name,
-                                    llvm::Optional<SILDebugVariable> Var,
+                                    std::optional<SILDebugVariable> Var,
                                     SILLocation Loc) {
   if (Var && shouldDropVariable(*Var, Loc))
     return {};
@@ -530,7 +537,7 @@ SILValue SILBuilder::emitObjCToThickMetatype(SILLocation Loc, SILValue Op,
 ValueMetatypeInst *SILBuilder::createValueMetatype(SILLocation Loc,
                                                    SILType MetatypeTy,
                                                    SILValue Base) {
-  assert(Base->getType().isLoweringOf(
+  ASSERT(Base->getType().isLoweringOf(
              getTypeExpansionContext(), getModule(),
              MetatypeTy.castTo<MetatypeType>().getInstanceType()) &&
          "value_metatype result must be formal metatype of the lowered operand "
@@ -628,8 +635,8 @@ void SILBuilder::emitDestructureValueOperation(
 
 DebugValueInst *SILBuilder::createDebugValue(SILLocation Loc, SILValue src,
                                              SILDebugVariable Var,
-                                             bool poisonRefs,
-                                             bool operandWasMoved,
+                                             PoisonRefs_t poisonRefs,
+                                             UsesMoveableValueDebugInfo_t moved,
                                              bool trace) {
   if (shouldDropVariable(Var, Loc))
     return nullptr;
@@ -637,26 +644,25 @@ DebugValueInst *SILBuilder::createDebugValue(SILLocation Loc, SILValue src,
   llvm::SmallString<4> Name;
 
   // Debug location overrides cannot apply to debug value instructions.
-  DebugLocOverrideRAII LocOverride{*this, llvm::None};
-  return insert(DebugValueInst::create(getSILDebugLocation(Loc, true), src,
-                                       getModule(),
-                                       *substituteAnonymousArgs(Name, Var, Loc),
-                                       poisonRefs, operandWasMoved, trace));
+  DebugLocOverrideRAII LocOverride{*this, std::nullopt};
+  return insert(DebugValueInst::create(
+      getSILDebugLocation(Loc, true), src, getModule(),
+      *substituteAnonymousArgs(Name, Var, Loc), poisonRefs, moved, trace));
 }
 
-DebugValueInst *SILBuilder::createDebugValueAddr(SILLocation Loc, SILValue src,
-                                                 SILDebugVariable Var,
-                                                 bool wasMoved, bool trace) {
+DebugValueInst *SILBuilder::createDebugValueAddr(
+    SILLocation Loc, SILValue src, SILDebugVariable Var,
+    UsesMoveableValueDebugInfo_t moved, bool trace) {
   if (shouldDropVariable(Var, Loc))
     return nullptr;
 
   llvm::SmallString<4> Name;
 
   // Debug location overrides cannot apply to debug addr instructions.
-  DebugLocOverrideRAII LocOverride{*this, llvm::None};
+  DebugLocOverrideRAII LocOverride{*this, std::nullopt};
   return insert(DebugValueInst::createAddr(
       getSILDebugLocation(Loc, true), src, getModule(),
-      *substituteAnonymousArgs(Name, Var, Loc), wasMoved, trace));
+      *substituteAnonymousArgs(Name, Var, Loc), moved, trace));
 }
 
 void SILBuilder::emitScopedBorrowOperation(SILLocation loc, SILValue original,
@@ -724,7 +730,7 @@ static ValueOwnershipKind deriveForwardingOwnership(SILValue operand,
 SwitchEnumInst *SILBuilder::createSwitchEnum(
     SILLocation Loc, SILValue Operand, SILBasicBlock *DefaultBB,
     ArrayRef<std::pair<EnumElementDecl *, SILBasicBlock *>> CaseBBs,
-    llvm::Optional<ArrayRef<ProfileCounter>> CaseCounts,
+    std::optional<ArrayRef<ProfileCounter>> CaseCounts,
     ProfileCounter DefaultCount) {
   // Consider the operand's type to be the target's type since a switch
   // covers all cases including the default argument.
@@ -751,7 +757,7 @@ CheckedCastBranchInst *SILBuilder::createCheckedCastBranch(
     SILType destLoweredTy, CanType destFormalTy, SILBasicBlock *successBB,
     SILBasicBlock *failureBB, ValueOwnershipKind forwardingOwnershipKind,
     ProfileCounter target1Count, ProfileCounter target2Count) {
-  assert((!hasOwnership() || !failureBB->getNumArguments() ||
+  ASSERT((!hasOwnership() || !failureBB->getNumArguments() ||
           failureBB->getArgument(0)->getType() == op->getType()) &&
          "failureBB's argument doesn't match incoming argument type");
 
@@ -766,7 +772,7 @@ void SILBuilderWithScope::insertAfter(SILInstruction *inst,
   if (isa<TermInst>(inst)) {
     for (const SILSuccessor &succ : inst->getParent()->getSuccessors()) {
       SILBasicBlock *succBlock = succ;
-      assert(succBlock->getSinglePredecessorBlock() == inst->getParent() &&
+      ASSERT(succBlock->getSinglePredecessorBlock() == inst->getParent() &&
              "the terminator instruction must not have critical successors");
       SILBuilderWithScope builder(succBlock->begin());
       func(builder);

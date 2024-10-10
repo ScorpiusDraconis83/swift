@@ -247,7 +247,7 @@ bool mayLoadWeakOrUnowned(SILInstruction* instruction);
 
 /// Conservatively, whether this instruction could involve a synchronization
 /// point like a memory barrier, lock or syscall.
-bool maySynchronizeNotConsideringSideEffects(SILInstruction* instruction);
+bool maySynchronize(SILInstruction* instruction);
 
 /// Conservatively, whether this instruction could be a barrier to hoisting
 /// destroys.
@@ -887,10 +887,10 @@ namespace swift {
 /// For convenience, encapsulate and AccessStorage value along with its
 /// accessed base address.
 struct AccessStorageWithBase {
-  /// Identical to AccessStorage::compute but preserves the access base.
+  /// Identical to AccessStorage::computeInScope but walks through begin_access.
   static AccessStorageWithBase compute(SILValue sourceAddress);
 
-  /// Identical to AccessStorage::computeInScope but preserves the base.
+  /// Identical to AccessStorage::compute but stops at begin_access
   static AccessStorageWithBase computeInScope(SILValue sourceAddress);
 
   AccessStorage storage;
@@ -945,7 +945,7 @@ struct RelativeAccessStorageWithBase {
   AccessStorageWithBase storageWithBase;
   /// The most transformative cast that was seen between when walking from
   /// address to storage.base;
-  llvm::Optional<AccessStorageCast> cast;
+  std::optional<AccessStorageCast> cast;
 
   AccessStorage getStorage() const { return storageWithBase.storage; }
 };
@@ -1271,7 +1271,9 @@ struct AccessPathWithBase {
 //
 // The "product leaves" are the leaves obtained by only looking through type
 // products (structs and tuples) and NOT type sums (enums).
-void visitProductLeafAccessPathNodes(
+//
+// Returns false if the access path couldn't be computed.
+bool visitProductLeafAccessPathNodes(
     SILValue address, TypeExpansionContext tec, SILModule &module,
     std::function<void(AccessPath::PathNode, SILType)> visitor);
 

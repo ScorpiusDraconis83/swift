@@ -67,7 +67,7 @@ NullablePtr<SILInstruction> createDecrementBefore(SILValue ptr,
                                                   SILInstruction *insertpt);
 
 /// Get the insertion point after \p val.
-llvm::Optional<SILBasicBlock::iterator> getInsertAfterPoint(SILValue val);
+std::optional<SILBasicBlock::iterator> getInsertAfterPoint(SILValue val);
 
 /// True if this instruction's only uses are debug_value (in -O mode),
 /// destroy_value, end_lifetime or end-of-scope instruction such as end_borrow.
@@ -127,6 +127,8 @@ bool isInstructionTriviallyDeletable(SILInstruction *inst);
 ///
 /// This routine only examines the state of the instruction at hand.
 bool isInstructionTriviallyDead(SILInstruction *inst);
+
+bool canTriviallyDeleteOSSAEndScopeInst(SILInstruction *inst);
 
 /// Return true if this is a release instruction that's not going to
 /// free the object.
@@ -192,9 +194,24 @@ SILValue getConcreteValueOfExistentialBoxAddr(SILValue addr,
 /// BranchInst (a phi is never the last guaranteed user). \p builder's current
 /// insertion point must dominate all \p usePoints.
 std::pair<SILValue, bool /* changedCFG */>
-castValueToABICompatibleType(SILBuilder *builder, SILLocation Loc,
+castValueToABICompatibleType(SILBuilder *builder, SILPassManager *pm,
+                             SILLocation Loc,
                              SILValue value, SILType srcTy, SILType destTy,
                              ArrayRef<SILInstruction *> usePoints);
+
+/// Returns true if the layout of a generic nominal type is dependent on its generic parameters.
+/// This is usually the case. Some examples, where they layout is _not_ dependent:
+/// ```
+///    struct S<T> {
+///      var x: Int // no members which depend on T
+///    }
+///
+///    struct S<T> {
+///      var c: SomeClass<T> // a class reference does not depend on the layout of the class
+///    }
+/// ```
+bool layoutIsTypeDependent(NominalTypeDecl *decl);
+
 /// Peek through trivial Enum initialization, typically for pointless
 /// Optionals.
 ///
@@ -231,7 +248,7 @@ SILLinkage getSpecializedLinkage(SILFunction *f, SILLinkage linkage);
 /// Tries to perform jump-threading on all checked_cast_br instruction in
 /// function \p Fn.
 bool tryCheckedCastBrJumpThreading(
-    SILFunction *fn, DominanceInfo *dt, DeadEndBlocks *deBlocks,
+    SILFunction *fn, SILPassManager *pm, DominanceInfo *dt, DeadEndBlocks *deBlocks,
     SmallVectorImpl<SILBasicBlock *> &blocksForWorklist,
     bool EnableOSSARewriteTerminator);
 
@@ -488,7 +505,7 @@ struct LLVM_LIBRARY_VISIBILITY FindLocalApplySitesResult {
 ///
 /// 1. We discovered that the function_ref never escapes.
 /// 2. We were able to find either a partial apply or a full apply site.
-llvm::Optional<FindLocalApplySitesResult>
+std::optional<FindLocalApplySitesResult>
 findLocalApplySites(FunctionRefBaseInst *fri);
 
 /// Gets the base implementation of a method.
@@ -582,20 +599,39 @@ IntegerLiteralInst *optimizeBuiltinCanBeObjCClass(BuiltinInst *bi,
 /// Performs "predictable" memory access optimizations.
 ///
 /// See the PredictableMemoryAccessOptimizations pass.
-bool optimizeMemoryAccesses(SILFunction *fn, DominanceInfo *domInfo);
+bool optimizeMemoryAccesses(SILFunction *fn);
 
 /// Performs "predictable" dead allocation optimizations.
 ///
 /// See the PredictableDeadAllocationElimination pass.
 bool eliminateDeadAllocations(SILFunction *fn, DominanceInfo *domInfo);
 
-SILVTable *specializeVTableForType(SILType type, SILModule &mod, SILTransform *transform);
-
 bool specializeClassMethodInst(ClassMethodInst *cm);
+bool specializeWitnessMethodInst(WitnessMethodInst *wm);
 
 bool specializeAppliesInFunction(SILFunction &F,
                                  SILTransform *transform,
                                  bool isMandatory);
+
+bool tryOptimizeKeypath(ApplyInst *AI, SILBuilder Builder);
+bool tryOptimizeKeypathApplication(ApplyInst *AI, SILFunction *callee, SILBuilder Builder);
+bool tryOptimizeKeypathOffsetOf(ApplyInst *AI, FuncDecl *calleeFn,
+                                KeyPathInst *kp, SILBuilder Builder);
+bool tryOptimizeKeypathKVCString(ApplyInst *AI, FuncDecl *calleeFn,
+                                KeyPathInst *kp, SILBuilder Builder);
+
+/// Instantiate the specified type by recursively tupling and structing the
+/// unique instances of the empty types and undef "instances" of the non-empty
+/// types aggregated together at each level.
+SILValue createEmptyAndUndefValue(SILType ty, SILInstruction *insertionPoint,
+                                  SILBuilderContext &ctx, bool noUndef = false);
+
+/// Check if a struct or its fields can have unreferenceable storage.
+bool findUnreferenceableStorage(StructDecl *decl, SILType structType,
+                                SILFunction *func);
+
+SILValue getInitOfTemporaryAllocStack(AllocStackInst *asi);
+
 } // end namespace swift
 
 #endif // SWIFT_SILOPTIMIZER_UTILS_INSTOPTUTILS_H

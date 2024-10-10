@@ -16,6 +16,7 @@
 //
 //===----------------------------------------------------------------------===//
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Compiler.h"
 #include "swift/Sema/Constraint.h"
 #include "swift/Sema/ConstraintSystem.h"
@@ -84,6 +85,7 @@ Constraint::Constraint(ConstraintKind Kind, Type First, Type Second,
   case ConstraintKind::ExplicitGenericArguments:
   case ConstraintKind::SameShape:
   case ConstraintKind::MaterializePackExpansion:
+  case ConstraintKind::LValueObject:
     assert(!First.isNull());
     assert(!Second.isNull());
     break;
@@ -175,6 +177,7 @@ Constraint::Constraint(ConstraintKind Kind, Type First, Type Second, Type Third,
   case ConstraintKind::ExplicitGenericArguments:
   case ConstraintKind::SameShape:
   case ConstraintKind::MaterializePackExpansion:
+  case ConstraintKind::LValueObject:
     llvm_unreachable("Wrong constructor");
 
   case ConstraintKind::KeyPath:
@@ -325,6 +328,7 @@ Constraint *Constraint::clone(ConstraintSystem &cs) const {
   case ConstraintKind::ExplicitGenericArguments:
   case ConstraintKind::SameShape:
   case ConstraintKind::MaterializePackExpansion:
+  case ConstraintKind::LValueObject:
     return create(cs, getKind(), getFirstType(), getSecondType(), getLocator());
 
   case ConstraintKind::ApplicableFunction:
@@ -534,6 +538,9 @@ void Constraint::print(llvm::raw_ostream &Out, SourceManager *sm,
     case OverloadChoiceKind::MaterializePack:
       Out << "materialize pack";
       break;
+    case OverloadChoiceKind::ExtractFunctionIsolation:
+      Out << "extract function islation";
+      break;
     case OverloadChoiceKind::KeyPathApplication:
       Out << "key path application";
       break;
@@ -584,6 +591,10 @@ void Constraint::print(llvm::raw_ostream &Out, SourceManager *sm,
 
   case ConstraintKind::MaterializePackExpansion:
     Out << " materialize pack expansion ";
+    break;
+
+  case ConstraintKind::LValueObject:
+    Out << " l-value object type ";
     break;
 
   case ConstraintKind::Disjunction:
@@ -756,6 +767,7 @@ gatherReferencedTypeVars(Constraint *constraint,
   case ConstraintKind::ExplicitGenericArguments:
   case ConstraintKind::SameShape:
   case ConstraintKind::MaterializePackExpansion:
+  case ConstraintKind::LValueObject:
     constraint->getFirstType()->getTypeVariables(typeVars);
     constraint->getSecondType()->getTypeVariables(typeVars);
     break;
@@ -1061,7 +1073,7 @@ Constraint *Constraint::createConjunction(
 
 Constraint *Constraint::createApplicableFunction(
     ConstraintSystem &cs, Type argumentFnType, Type calleeType,
-    llvm::Optional<TrailingClosureMatching> trailingClosureMatching,
+    std::optional<TrailingClosureMatching> trailingClosureMatching,
     ConstraintLocator *locator) {
   // Collect type variables.
   SmallPtrSet<TypeVariableType *, 4> typeVars;
@@ -1118,12 +1130,12 @@ Constraint *Constraint::createSyntacticElement(ConstraintSystem &cs,
   return new (mem) Constraint(node, context, isDiscarded, locator, typeVars);
 }
 
-llvm::Optional<TrailingClosureMatching>
+std::optional<TrailingClosureMatching>
 Constraint::getTrailingClosureMatching() const {
   assert(Kind == ConstraintKind::ApplicableFunction);
   switch (trailingClosureMatching) {
   case 0:
-    return llvm::None;
+    return std::nullopt;
   case 1: return TrailingClosureMatching::Forward;
   case 2: return TrailingClosureMatching::Backward;
   }

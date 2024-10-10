@@ -12,6 +12,7 @@
 
 #include "AvailabilityMixin.h"
 #include "JSON.h"
+#include "swift/Basic/Assertions.h"
 
 using namespace swift;
 using namespace symbolgraphgen;
@@ -47,6 +48,8 @@ StringRef getDomain(const AvailableAttr &AvAttr) {
       return { "tvOS" };
     case swift::PlatformKind::watchOS:
       return { "watchOS" };
+    case swift::PlatformKind::visionOS:
+      return { "visionOS" };
     case swift::PlatformKind::iOSApplicationExtension:
       return { "iOSAppExtension" };
     case swift::PlatformKind::macCatalystApplicationExtension:
@@ -57,6 +60,8 @@ StringRef getDomain(const AvailableAttr &AvAttr) {
       return { "tvOSAppExtension" };
     case swift::PlatformKind::watchOSApplicationExtension:
       return { "watchOSAppExtension" };
+    case swift::PlatformKind::visionOSApplicationExtension:
+      return { "visionOSAppExtension" };
     case swift::PlatformKind::OpenBSD:
       return { "OpenBSD" };
     case swift::PlatformKind::Windows:

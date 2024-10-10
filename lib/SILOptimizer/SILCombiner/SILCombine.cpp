@@ -21,10 +21,12 @@
 #define DEBUG_TYPE "sil-combine"
 
 #include "SILCombiner.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/BasicBlockDatastructures.h"
 #include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILVisitor.h"
+#include "swift/SIL/Test.h"
 #include "swift/SILOptimizer/Analysis/AliasAnalysis.h"
 #include "swift/SILOptimizer/Analysis/DominanceAnalysis.h"
 #include "swift/SILOptimizer/Analysis/NonLocalAccessBlockAnalysis.h"
@@ -190,8 +192,8 @@ SILCombiner::SILCombiner(SILFunctionTransform *trans,
                 use->set(newValue);
                 Worklist.add(use->getUser());
               })),
-  deadEndBlocks(trans->getFunction()), MadeChange(false),
-  RemoveCondFails(removeCondFails),
+  DEBA(trans->getPassManager()->getAnalysis<DeadEndBlocksAnalysis>()), 
+  MadeChange(false), RemoveCondFails(removeCondFails),
   enableCopyPropagation(enableCopyPropagation), Iteration(0),
   Builder(*trans->getFunction(), &TrackingList),
   FuncBuilder(*trans),
@@ -350,9 +352,9 @@ void SILCombiner::canonicalizeOSSALifetimes(SILInstruction *currentInst) {
 
   DominanceInfo *domTree = DA->get(&Builder.getFunction());
   CanonicalizeOSSALifetime canonicalizer(
-      false /*prune debug*/,
-      !parentTransform->getFunction()->shouldOptimize() /*maximize lifetime*/,
-      parentTransform->getFunction(), NLABA, domTree, CA, deleter);
+      DontPruneDebugInsts,
+      MaximizeLifetime_t(!parentTransform->getFunction()->shouldOptimize()),
+      parentTransform->getFunction(), NLABA, DEBA, domTree, CA, deleter);
   CanonicalizeBorrowScope borrowCanonicalizer(parentTransform->getFunction(),
                                               deleter);
 
@@ -395,7 +397,7 @@ bool SILCombiner::doOneIteration(SILFunction &F, unsigned Iteration) {
   // Add reachable instructions to our worklist.
   addReachableCodeToWorklist(&*F.begin());
 
-  SILCombineCanonicalize scCanonicalize(Worklist, deadEndBlocks);
+  SILCombineCanonicalize scCanonicalize(Worklist, *DEBA->get(&F));
 
   // Process until we run out of items in our worklist.
   while (!Worklist.isEmpty()) {
@@ -498,6 +500,29 @@ bool SILCombiner::doOneIteration(SILFunction &F, unsigned Iteration) {
   return MadeChange;
 }
 
+namespace swift::test {
+// Arguments:
+// - instruction: the instruction to be canonicalized
+// Dumps:
+// - the function after the canonicalization is attempted
+static FunctionTest SILCombineCanonicalizeInstruction(
+    "sil_combine_instruction", [](auto &function, auto &arguments, auto &test) {
+      SILCombiner combiner(test.getPass(), false, false);
+      auto inst = arguments.takeInstruction();
+      combiner.Builder.setInsertionPoint(inst);
+      auto *result = combiner.visit(inst);
+      if (result) {
+        combiner.Worklist.replaceInstructionWithInstruction(inst, result
+#ifndef NDEBUG
+                                                            ,
+                                                            ""
+#endif
+        );
+      }
+      function.dump();
+    });
+} // end namespace swift::test
+
 bool SILCombiner::runOnFunction(SILFunction &F) {
   clear();
 
@@ -595,6 +620,7 @@ class SILCombine : public SILFunctionTransform {
     bool Changed = Combiner.runOnFunction(*getFunction());
 
     if (Changed) {
+      updateBorrowedFrom(getPassManager(), getFunction());
       // Invalidate everything.
       invalidateAnalysis(SILAnalysis::InvalidationKind::FunctionBody);
     }
@@ -615,6 +641,7 @@ void SwiftPassInvocation::eraseInstruction(SILInstruction *inst) {
   if (silCombiner) {
     silCombiner->eraseInstFromFunction(*inst);
   } else {
+    swift::salvageDebugInfo(inst);
     if (inst->isStaticInitializerInst()) {
       inst->getParent()->erase(inst, *getPassManager()->getModule());
     } else {

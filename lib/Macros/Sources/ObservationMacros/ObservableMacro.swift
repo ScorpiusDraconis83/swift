@@ -12,7 +12,6 @@
 import SwiftSyntax
 import SwiftSyntaxMacros
 import SwiftDiagnostics
-import SwiftOperators
 import SwiftSyntaxBuilder
 
 public struct ObservableMacro {
@@ -118,6 +117,7 @@ extension DeclModifierListSyntax {
         case .fileprivate: fallthrough
         case .private: fallthrough
         case .internal: fallthrough
+        case .package: fallthrough
         case .public:
           return false
         default:
@@ -326,8 +326,18 @@ public struct ObservationTrackedMacro: AccessorMacro {
       }
       }
       """
+      
+    let modifyAccessor: AccessorDeclSyntax =
+      """
+      _modify {
+      access(keyPath: \\.\(identifier))
+      \(raw: ObservableMacro.registrarVariableName).willSet(self, keyPath: \\.\(identifier))
+      defer { \(raw: ObservableMacro.registrarVariableName).didSet(self, keyPath: \\.\(identifier)) } 
+      yield &_\(identifier)
+      }
+      """
 
-    return [initAccessor, getAccessor, setAccessor]
+    return [initAccessor, getAccessor, setAccessor, modifyAccessor]
   }
 }
 

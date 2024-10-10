@@ -30,6 +30,7 @@
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/SemanticAttrs.h"
+#include "swift/Basic/Assertions.h"
 using namespace swift;
 
 /// Check whether a given \p decl has a @_semantics attribute with the given
@@ -354,7 +355,7 @@ void swift::diagnoseConstantArgumentRequirement(
       }
 
       if (!expr || isa<ErrorExpr>(expr) || !expr->getType())
-        return Action::SkipChildren(expr);
+        return Action::SkipNode(expr);
       if (auto *callExpr = dyn_cast<CallExpr>(expr)) {
         diagnoseConstantArgumentRequirementOfCall(callExpr, DC->getASTContext());
       }

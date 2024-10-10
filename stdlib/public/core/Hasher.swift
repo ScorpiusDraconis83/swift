@@ -164,6 +164,8 @@ extension Hasher {
       combine(UInt64(truncatingIfNeeded: value))
 #elseif _pointerBitWidth(_32)
       combine(UInt32(truncatingIfNeeded: value))
+#elseif _pointerBitWidth(_16)
+      combine(UInt16(truncatingIfNeeded: value))
 #else
 #error("Unknown platform")
 #endif
@@ -250,6 +252,16 @@ extension Hasher {
     }
   }
 }
+
+#if $Embedded
+@usableFromInline
+var _swift_stdlib_Hashing_parameters: _SwiftHashingParameters = {
+  var seed0: UInt64 = 0, seed1: UInt64 = 0
+  swift_stdlib_random(&seed0, MemoryLayout<UInt64>.size)
+  swift_stdlib_random(&seed1, MemoryLayout<UInt64>.size)
+  return .init(seed0: seed0, seed1: seed1, deterministic: false)
+}()
+#endif
 
 /// The universal hash function used by `Set` and `Dictionary`.
 ///
@@ -429,7 +441,7 @@ public struct Hasher {
     _internalInvariant(UInt.bitWidth == UInt64.bitWidth)
     state.compress(UInt64(truncatingIfNeeded: value))
     let tbc = _TailBuffer(tail: 0, byteCount: 8)
-#elseif _pointerBitWidth(_32)
+#elseif _pointerBitWidth(_32) || _pointerBitWidth(_16)
     _internalInvariant(UInt.bitWidth < UInt64.bitWidth)
     let tbc = _TailBuffer(
       tail: UInt64(truncatingIfNeeded: value),

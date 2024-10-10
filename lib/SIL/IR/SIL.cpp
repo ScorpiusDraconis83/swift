@@ -23,6 +23,7 @@
 #include "swift/AST/Pattern.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/ProtocolConformance.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "clang/AST/Attr.h"
 #include "clang/AST/Decl.h"
@@ -41,6 +42,7 @@ FormalLinkage swift::getDeclLinkage(const ValueDecl *D) {
 
   switch (D->getEffectiveAccess()) {
   case AccessLevel::Package:
+    return FormalLinkage::PackageUnique;
   case AccessLevel::Public:
   case AccessLevel::Open:
     return FormalLinkage::PublicUnique;
@@ -65,6 +67,9 @@ SILLinkage swift::getSILLinkage(FormalLinkage linkage,
     // uniqueness is buggy.
     return (forDefinition ? SILLinkage::Shared : SILLinkage::PublicExternal);
 
+  case FormalLinkage::PackageUnique:
+    return (forDefinition ? SILLinkage::Package : SILLinkage::PackageExternal);
+
   case FormalLinkage::HiddenUnique:
     return (forDefinition ? SILLinkage::Hidden : SILLinkage::HiddenExternal);
 
@@ -75,11 +80,10 @@ SILLinkage swift::getSILLinkage(FormalLinkage linkage,
 }
 
 SILLinkage
-swift::getLinkageForProtocolConformance(const RootProtocolConformance *C,
+swift::getLinkageForProtocolConformance(const ProtocolConformance *C,
                                         ForDefinition_t definition) {
-  // If the conformance was synthesized by the ClangImporter, give it
-  // shared linkage.
-  if (isa<ClangModuleUnit>(C->getDeclContext()->getModuleScopeContext()))
+  // If the conformance was synthesized, give it shared linkage.
+  if (C->getRootConformance()->isSynthesized())
     return SILLinkage::Shared;
 
   auto typeDecl = C->getDeclContext()->getSelfNominalTypeDecl();
@@ -89,11 +93,12 @@ swift::getLinkageForProtocolConformance(const RootProtocolConformance *C,
     case AccessLevel::Private:
     case AccessLevel::FilePrivate:
       return SILLinkage::Private;
-
     case AccessLevel::Internal:
       return (definition ? SILLinkage::Hidden : SILLinkage::HiddenExternal);
-
-    default:
+    case AccessLevel::Package:
+      return (definition ? SILLinkage::Package : SILLinkage::PackageExternal);
+    case AccessLevel::Public:
+    case AccessLevel::Open:
       return (definition ? SILLinkage::Public : SILLinkage::PublicExternal);
   }
 }
@@ -126,6 +131,7 @@ bool SILModule::isTypeMetadataAccessible(CanType type) {
     // Public declarations are accessible from everywhere.
     case FormalLinkage::PublicUnique:
     case FormalLinkage::PublicNonUnique:
+    case FormalLinkage::PackageUnique: 
       return false;
 
     // Hidden declarations are inaccessible from different modules.
@@ -172,9 +178,10 @@ FormalLinkage swift::getGenericSignatureLinkage(CanGenericSignature sig) {
     case RequirementKind::Conformance:
     case RequirementKind::SameType:
     case RequirementKind::Superclass:
-      switch (getTypeLinkage_correct(CanType(req.getSecondType()))) {
+      switch (getTypeLinkage(CanType(req.getSecondType()))) {
       case FormalLinkage::PublicUnique:
       case FormalLinkage::PublicNonUnique:
+      case FormalLinkage::PackageUnique:
         continue;
       case FormalLinkage::HiddenUnique:
         linkage = FormalLinkage::HiddenUnique;
@@ -190,19 +197,6 @@ FormalLinkage swift::getGenericSignatureLinkage(CanGenericSignature sig) {
 }
 
 /// Return the formal linkage of the given formal type.
-///
-/// Note that this function is buggy and generally should not be
-/// used in new code; we should migrate all callers to
-/// getTypeLinkage_correct and then consolidate them.
-FormalLinkage swift::getTypeLinkage(CanType t) {
-  assert(t->isLegalFormalType());
-  // Due to a bug, this always returns PublicUnique.
-  // It's a bit late in the 5.7 timeline to be changing that, but
-  // we can optimize it!
-  return FormalLinkage::PublicUnique;
-}
-
-/// Return the formal linkage of the given formal type.
 /// This in the appropriate linkage for a lazily-emitted entity
 /// derived from the type.
 ///
@@ -211,7 +205,7 @@ FormalLinkage swift::getTypeLinkage(CanType t) {
 /// uniquely-emitted nominal type, the formal linkage of that
 /// type may differ from the formal linkage of the underlying
 /// type declaration.
-FormalLinkage swift::getTypeLinkage_correct(CanType t) {
+FormalLinkage swift::getTypeLinkage(CanType t) {
   assert(t->isLegalFormalType());
   
   class Walker : public TypeWalker {
@@ -263,9 +257,26 @@ static bool isTypeMetadataForLayoutAccessible(SILModule &M, SILType type) {
   if (type.is<AnyMetatypeType>())
     return true;
 
+  //   - pack expansion types
+  if (auto expansionType = type.getAs<PackExpansionType>()) {
+    auto patternType = SILType::getPrimitiveType(expansionType.getPatternType(),
+                                                 type.getCategory());
+    return isTypeMetadataForLayoutAccessible(M, patternType);
+  }
+
+  //   - lowered pack types
+  if (auto packType = type.getAs<SILPackType>()) {
+    for (auto eltType : packType.getElementTypes()) {
+      if (!isTypeMetadataForLayoutAccessible(
+              M, SILType::getPrimitiveAddressType(eltType)))
+        return false;
+    }
+
+    return true;
+  }
+
   // Otherwise, check that we can fetch the type metadata.
   return M.isTypeMetadataAccessible(type.getASTType());
-
 }
 
 /// Can we perform value operations on the given type?  We have no way
@@ -296,14 +307,14 @@ bool SILModule::isTypeMetadataForLayoutAccessible(SILType type) {
   return ::isTypeMetadataForLayoutAccessible(*this, type);
 }
 
-static bool isUnsupportedKeyPathValueType(Type ty, GenericEnvironment *env) {
+static bool isUnsupportedKeyPathValueType(Type ty) {
   // Visit lowered positions.
   if (auto tupleTy = ty->getAs<TupleType>()) {
     for (auto eltTy : tupleTy->getElementTypes()) {
       if (eltTy->is<PackExpansionType>())
         return true;
 
-      if (isUnsupportedKeyPathValueType(eltTy, env))
+      if (isUnsupportedKeyPathValueType(eltTy))
         return true;
     }
 
@@ -321,11 +332,11 @@ static bool isUnsupportedKeyPathValueType(Type ty, GenericEnvironment *env) {
       if (paramTy->is<PackExpansionType>())
         return true;
 
-      if (isUnsupportedKeyPathValueType(paramTy, env))
+      if (isUnsupportedKeyPathValueType(paramTy))
         return true;
     }
 
-    if (isUnsupportedKeyPathValueType(funcTy->getResult(), env))
+    if (isUnsupportedKeyPathValueType(funcTy->getResult()))
       return true;
   }
 
@@ -333,7 +344,7 @@ static bool isUnsupportedKeyPathValueType(Type ty, GenericEnvironment *env) {
   // They would also need a new ABI that's yet to be implemented in order to
   // be properly supported, so let's suppress the descriptor for now if either
   // the container or storage type of the declaration is non-copyable.
-  if (ty->isNoncopyable(env))
+  if (ty->isNoncopyable())
     return true;
 
   return false;
@@ -350,16 +361,21 @@ bool AbstractStorageDecl::exportsPropertyDescriptor() const {
       }
     }
   }
-  
-  // TODO: Global and static properties ought to eventually be referenceable
-  // as key paths from () or T.Type too.
-  if (!getDeclContext()->isTypeContext() || isStatic())
+
+  // TODO: Global properties ought to eventually be referenceable
+  // as key paths from ().
+  if (!getDeclContext()->isTypeContext())
     return false;
   
   // Protocol requirements do not need property descriptors.
   if (isa<ProtocolDecl>(getDeclContext()))
     return false;
-  
+
+  // Static properties in protocol extensions do not need
+  // descriptors as existential Any.Type will not resolve to a value.
+  if (isStatic() && getDeclContext()->getSelfProtocolDecl())
+    return false;
+
   // FIXME: We should support properties and subscripts with '_read' accessors;
   // 'get' is not part of the opaque accessor set there.
   auto *getter = getOpaqueAccessor(AccessorKind::Get);
@@ -384,6 +400,8 @@ bool AbstractStorageDecl::exportsPropertyDescriptor() const {
   switch (getterLinkage) {
   case SILLinkage::Public:
   case SILLinkage::PublicNonABI:
+  case SILLinkage::Package:
+  case SILLinkage::PackageNonABI:
     // We may need a descriptor.
     break;
     
@@ -395,11 +413,13 @@ bool AbstractStorageDecl::exportsPropertyDescriptor() const {
     
   case SILLinkage::HiddenExternal:
   case SILLinkage::PublicExternal:
+  case SILLinkage::PackageExternal:
     llvm_unreachable("should be definition linkage?");
   }
 
-  auto *env = getDeclContext()->getGenericEnvironmentOfContext();
-  if (isUnsupportedKeyPathValueType(getValueInterfaceType(), env)) {
+  auto typeInContext = getInnermostDeclContext()->mapTypeIntoContext(
+      getValueInterfaceType());
+  if (isUnsupportedKeyPathValueType(typeInContext)) {
     return false;
   }
 

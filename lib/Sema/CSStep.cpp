@@ -20,6 +20,7 @@
 #include "swift/AST/Types.h"
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/GenericEnvironment.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Sema/ConstraintSystem.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
@@ -40,9 +41,9 @@ ComponentStep::Scope::Scope(ComponentStep &component)
   auto &workList = CS.InactiveConstraints;
   workList.splice(workList.end(), *component.Constraints);
 
-  SolverScope = new ConstraintSystem::SolverScope(CS);
-  PrevPartialScope = CS.solverState->PartialSolutionScope;
-  CS.solverState->PartialSolutionScope = SolverScope;
+  SolverScope.emplace(CS);
+  prevPartialSolutionFixes = CS.solverState->numPartialSolutionFixes;
+  CS.solverState->numPartialSolutionFixes = CS.Fixes.size();
 }
 
 StepResult SplitterStep::take(bool prevFailed) {
@@ -147,7 +148,7 @@ void SplitterStep::computeFollowupSteps(
     // handles all combinations of incoming partial solutions.
     steps.push_back(std::make_unique<DependentComponentSplitterStep>(
         CS, &Components[i], solutionIndex, std::move(components[i]),
-        llvm::makeMutableArrayRef(PartialSolutions.get(), numComponents)));
+        llvm::MutableArrayRef(PartialSolutions.get(), numComponents)));
   }
 
   assert(CS.InactiveConstraints.empty() && "Missed a constraint");
@@ -233,7 +234,7 @@ bool SplitterStep::mergePartialSolutions() const {
       if (!IncludeInMergedResults[i])
         continue;
 
-      CS.applySolution(PartialSolutions[i][indices[i]]);
+      CS.replaySolution(PartialSolutions[i][indices[i]]);
     }
 
     // This solution might be worse than the best solution found so far.
@@ -280,7 +281,7 @@ StepResult DependentComponentSplitterStep::take(bool prevFailed) {
   // Produce all combinations of partial solutions for the inputs.
   SmallVector<std::unique_ptr<SolverStep>, 4> followup;
   SmallVector<unsigned, 2> indices(Component.getDependencies().size(), 0);
-  auto dependsOnSetsRef = llvm::makeArrayRef(dependsOnSets);
+  auto dependsOnSetsRef = llvm::ArrayRef(dependsOnSets);
   do {
     // Form the set of input partial solutions.
     SmallVector<const Solution *, 2> dependsOnSolutions;
@@ -318,7 +319,7 @@ StepResult ComponentStep::take(bool prevFailed) {
   // One of the previous components created by "split"
   // failed, it means that we can't solve this component.
   if ((prevFailed && DependsOnPartialSolutions.empty()) ||
-      CS.isTooComplex(Solutions))
+      CS.isTooComplex(Solutions) || CS.worseThanBestSolution())
     return done(/*isSuccess=*/false);
 
   // Setup active scope, only if previous component didn't fail.
@@ -327,7 +328,7 @@ StepResult ComponentStep::take(bool prevFailed) {
   // If there are any dependent partial solutions to compose, do so now.
   if (!DependsOnPartialSolutions.empty()) {
     for (auto partial : DependsOnPartialSolutions) {
-      CS.applySolution(*partial);
+      CS.replaySolution(*partial);
     }
 
     // Activate all of the one-way constraints.
@@ -398,7 +399,7 @@ StepResult ComponentStep::take(bool prevFailed) {
 
   enum class StepKind { Binding, Disjunction, Conjunction };
 
-  auto chooseStep = [&]() -> Optional<StepKind> {
+  auto chooseStep = [&]() -> std::optional<StepKind> {
     // Bindings usually happen first, but sometimes we want to prioritize a
     // disjunction or conjunction.
     if (bestBindings) {
@@ -416,7 +417,7 @@ StepResult ComponentStep::take(bool prevFailed) {
     if (conjunction)
       return StepKind::Conjunction;
 
-    return None;
+    return std::nullopt;
   };
 
   if (auto step = chooseStep()) {
@@ -438,14 +439,30 @@ StepResult ComponentStep::take(bool prevFailed) {
     // If there are no disjunctions or type variables to bind
     // we can't solve this system unless we have free type variables
     // allowed in the solution.
+    if (CS.isDebugMode()) {
+      PrintOptions PO;
+      PO.PrintTypesForDebugging = true;
+
+      auto &log = getDebugLogger();
+      log << "(failed due to free variables:";
+      for (auto *typeVar : CS.getTypeVariables()) {
+        if (!typeVar->getImpl().hasRepresentativeOrFixed()) {
+          log << " " << typeVar->getString(PO);
+        }
+      }
+      log << ")\n";
+    }
+
     return finalize(/*isSuccess=*/false);
   }
 
   auto printConstraints = [&](const ConstraintList &constraints) {
-    for (auto &constraint : constraints)
+    for (auto &constraint : constraints) {
       constraint.print(
           getDebugLogger().indent(CS.solverState->getCurrentIndent()),
           &CS.getASTContext().SourceMgr, CS.solverState->getCurrentIndent());
+      getDebugLogger() << "\n";
+    }
   };
 
   // If we don't have any disjunction or type variable choices left, we're done
@@ -645,10 +662,12 @@ bool IsDeclRefinementOfRequest::evaluate(Evaluator &evaluator,
   // same structural position in the first type.
   TypeSubstitutionMap substMap;
   substTypeB = substTypeB->substituteBindingsTo(substTypeA,
-      [&](ArchetypeType *origType, CanType substType,
-          ArchetypeType *, ArrayRef<ProtocolConformanceRef>) -> CanType {
+      [&](ArchetypeType *origType, CanType substType) -> CanType {
     auto interfaceTy =
         origType->getInterfaceType()->getCanonicalType()->getAs<SubstitutableType>();
+
+    if (!interfaceTy)
+      return CanType();
 
     // Make sure any duplicate bindings are equal to the one already recorded.
     // Otherwise, the substitution has conflicting generic arguments.
@@ -663,12 +682,11 @@ bool IsDeclRefinementOfRequest::evaluate(Evaluator &evaluator,
   if (!substTypeB)
     return false;
 
-  auto result = TypeChecker::checkGenericArguments(
-      declA->getDeclContext()->getParentModule(),
+  auto result = checkRequirements(
       genericSignatureB.getRequirements(),
       QueryTypeSubstitutionMap{ substMap });
 
-  if (result != CheckGenericArgumentsResult::Success)
+  if (result != CheckRequirementsResult::Success)
     return false;
 
   return substTypeA->isEqual(substTypeB);
@@ -785,7 +803,7 @@ bool swift::isSIMDOperator(ValueDecl *value) {
   if (nominal->getName().empty())
     return false;
 
-  return nominal->getName().str().startswith_insensitive("simd");
+  return nominal->getName().str().starts_with_insensitive("simd");
 }
 
 bool DisjunctionStep::shortCircuitDisjunctionAt(
@@ -861,12 +879,13 @@ bool ConjunctionStep::attempt(const ConjunctionElement &element) {
     // Note that solution is removed here. This is done
     // because we want build a single complete solution
     // incrementally.
-    CS.applySolution(Solutions.pop_back_val());
+    CS.replaySolution(Solutions.pop_back_val(),
+                      /*shouldIncrementScore=*/false);
   }
 
   // Make sure that element is solved in isolation
   // by dropping all scoring information.
-  CS.CurrentScore = Score();
+  CS.clearScore();
 
   // Reset the scope counter to avoid "too complex" failures
   // when closure has a lot of elements in the body.
@@ -908,6 +927,10 @@ StepResult ConjunctionStep::resume(bool prevFailed) {
 
   // Rewind back the constraint system information.
   ActiveChoice.reset();
+
+  // Reset the best score which was updated by `ConstraintSystem::finalize`
+  // while forming solution(s) for the current element.
+  CS.solverState->BestScore.reset();
 
   if (CS.isDebugMode())
     getDebugLogger() << ")\n";
@@ -1002,14 +1025,15 @@ StepResult ConjunctionStep::resume(bool prevFailed) {
         for (auto &solution : Solutions) {
           ConstraintSystem::SolverScope scope(CS);
 
-          CS.applySolution(solution);
+          CS.replaySolution(solution,
+                            /*shouldIncrementScore=*/false);
 
-          // `applySolution` changes best/current scores
+          // `replaySolution` changes best/current scores
           // of the constraint system, so they have to be
           // restored right afterwards because score of the
           // element does contribute to the overall score.
           restoreBestScore();
-          restoreCurrentScore(solution.getFixedScore());
+          updateScoreAfterConjunction(solution.getFixedScore());
 
           // Transform all of the unbound outer variables into
           // placeholders since we are not going to solve for
@@ -1061,10 +1085,10 @@ StepResult ConjunctionStep::resume(bool prevFailed) {
 }
 
 void ConjunctionStep::restoreOuterState(const Score &solutionScore) const {
-  // Restore best/current score, since upcoming step is going to
-  // work with outer scope in relation to the conjunction.
+  // Restore best score and update current score, since upcoming step
+  // is going to work with outer scope in relation to the conjunction.
   restoreBestScore();
-  restoreCurrentScore(solutionScore);
+  updateScoreAfterConjunction(solutionScore);
 
   // Active all of the previously out-of-scope constraints
   // because conjunction can propagate type information up
@@ -1078,8 +1102,9 @@ void ConjunctionStep::restoreOuterState(const Score &solutionScore) const {
   }
 }
 
-void ConjunctionStep::SolverSnapshot::applySolution(const Solution &solution) {
-  CS.applySolution(solution);
+void ConjunctionStep::SolverSnapshot::replaySolution(const Solution &solution) {
+  CS.replaySolution(solution,
+                    /*shouldIncreaseScore=*/false);
 
   if (!CS.shouldAttemptFixes())
     return;

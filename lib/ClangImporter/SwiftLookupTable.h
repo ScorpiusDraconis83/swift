@@ -17,20 +17,20 @@
 #ifndef SWIFT_CLANGIMPORTER_SWIFTLOOKUPTABLE_H
 #define SWIFT_CLANGIMPORTER_SWIFTLOOKUPTABLE_H
 
+#include "swift/AST/Identifier.h"
 #include "swift/Basic/Debug.h"
 #include "swift/Basic/LLVM.h"
-#include "swift/AST/Identifier.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/DeclObjC.h"
 #include "clang/Serialization/ASTBitCodes.h"
 #include "clang/Serialization/ModuleFileExtension.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/Support/Compiler.h"
 #include <functional>
+#include <optional>
 #include <utility>
 
 namespace llvm {
@@ -282,8 +282,7 @@ const uint16_t SWIFT_LOOKUP_TABLE_VERSION_MAJOR = 1;
 /// Lookup table minor version number.
 ///
 /// When the format changes IN ANY WAY, this number should be incremented.
-const uint16_t SWIFT_LOOKUP_TABLE_VERSION_MINOR = 18; // Unsafe C++ method renaming.
-
+const uint16_t SWIFT_LOOKUP_TABLE_VERSION_MINOR = 19; // hash functions
 
 /// A lookup table that maps Swift names to the set of Clang
 /// declarations with that particular name.
@@ -452,11 +451,11 @@ public:
   SingleEntry mapStored(uint64_t &entry, bool assumeModule = false);
 
   /// Translate a Clang DeclContext into a context kind and name.
-  static llvm::Optional<StoredContext> translateDeclContext(
-                                         const clang::DeclContext *dc);
+  static std::optional<StoredContext>
+  translateDeclContext(const clang::DeclContext *dc);
 
   /// Translate a Clang effective context into a context kind and name.
-  llvm::Optional<StoredContext> translateContext(EffectiveClangContext context);
+  std::optional<StoredContext> translateContext(EffectiveClangContext context);
 
   /// Add an entry to the lookup table.
   ///
@@ -489,7 +488,7 @@ private:
   /// all results from all contexts should be produced.
   SmallVector<SingleEntry, 4>
   lookup(SerializedSwiftName baseName,
-         llvm::Optional<StoredContext> searchContext);
+         std::optional<StoredContext> searchContext);
 
   /// Retrieve the set of global declarations that are going to be
   /// imported as the given Swift name into the given context.
@@ -502,7 +501,7 @@ private:
   /// all results from all contexts should be produced.
   SmallVector<SingleEntry, 4>
   lookupGlobalsAsMembersImpl(SerializedSwiftName baseName,
-                             llvm::Optional<StoredContext> searchContext);
+                             std::optional<StoredContext> searchContext);
 
   /// Retrieve the set of global declarations that are going to be imported as
   /// members in the given context.
@@ -549,7 +548,7 @@ public:
   /// entities should reside.
   SmallVector<SingleEntry, 4>
   lookupGlobalsAsMembers(SerializedSwiftName baseName,
-                         llvm::Optional<EffectiveClangContext> searchContext);
+                         EffectiveClangContext searchContext);
 
   SmallVector<SingleEntry, 4>
   allGlobalsAsMembersInContext(EffectiveClangContext context);

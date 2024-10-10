@@ -183,11 +183,10 @@ func testDerivedClass2Read(_ c: DerivedClass2) -> Int {
 }
 
 // CHECK-LABEL: sil {{.*}}testGenClassWrite
-// CHECK: [[S:%[0-9]+]] = alloc_stack $T
 // CHECK: [[E:%[0-9]+]] = ref_element_addr %0
 // CHECK: [[A:%[0-9]+]] = begin_access [modify] [dynamic] [[E]]
 // CHECK: destroy_addr [[A]]
-// CHECK: copy_addr [take] [[S]] to [init] [[A]]
+// CHECK: copy_addr %1 to [init] [[A]]
 // CHECK: end_access [[A]]
 // CHECK: return
 @inline(never)
@@ -331,9 +330,9 @@ func testGetter<T : P>(_ s: GenStruct<T>) -> Int {
 }
 
 // CHECK-LABEL: sil {{.*}} [noinline] {{.*}}testClassMemberGetter
+// CHECK: [[A:%[0-9]+]] = alloc_stack $Int
 // CHECK: [[E:%[0-9]+]] = ref_element_addr
 // CHECK: [[M:%[0-9]+]] = begin_access [read] [dynamic] [[E]]
-// CHECK: [[A:%[0-9]+]] = alloc_stack $Int
 // CHECK: [[F:%[0-9]+]] = function_ref {{.*}}computed
 // CHECK: apply [[F]]<T>([[A]], [[M]])
 // CHECK: end_access

@@ -26,6 +26,7 @@
 #include "swift/AST/SILOptions.h"
 #include "swift/AST/SearchPathOptions.h"
 #include "swift/AST/SourceFile.h"
+#include "swift/Basic/CASOptions.h"
 #include "swift/Basic/DiagnosticOptions.h"
 #include "swift/Basic/LangOptions.h"
 #include "swift/Basic/SourceManager.h"
@@ -102,6 +103,7 @@ class CompilerInvocation {
   IRGenOptions IRGenOpts;
   TBDGenOptions TBDGenOpts;
   ModuleInterfaceOptions ModuleInterfaceOpts;
+  CASOptions CASOpts;
   llvm::MemoryBuffer *IDEInspectionTargetBuffer = nullptr;
 
   /// The offset that IDEInspection wants to further examine in offset of bytes
@@ -154,7 +156,7 @@ public:
   /// Serialize the command line arguments for emitting them
   /// to DWARF or CodeView and inject SDKPath if necessary.
   static void buildDebugFlags(std::string &Output,
-                              const ArrayRef<const char*> &Args,
+                              const llvm::opt::ArgList &Args,
                               StringRef SDKPath,
                               StringRef ResourceDir);
 
@@ -166,7 +168,7 @@ public:
   }
 
   bool requiresCAS() const {
-    return FrontendOpts.EnableCaching || FrontendOpts.UseCASBackend;
+    return CASOpts.EnableCaching || IRGenOpts.UseCASBackend;
   }
 
   void setClangModuleCachePath(StringRef Path) {
@@ -231,11 +233,13 @@ public:
 
   void setRuntimeResourcePath(StringRef Path);
 
+  void setPlatformAvailabilityInheritanceMapPath(StringRef Path);
+
   /// Compute the default prebuilt module cache path for a given resource path
   /// and SDK version. This function is also used by LLDB.
   static std::string
   computePrebuiltCachePath(StringRef RuntimeResourcePath, llvm::Triple target,
-                           llvm::Optional<llvm::VersionTuple> sdkVer);
+                           std::optional<llvm::VersionTuple> sdkVer);
 
   /// If we haven't explicitly passed -prebuilt-module-cache-path, set it to
   /// the default value of <resource-dir>/<platform>/prebuilt-modules.
@@ -245,6 +249,16 @@ public:
 
   /// If we haven't explicitly passed -blocklist-paths, set it to the default value.
   void setDefaultBlocklistsIfNecessary();
+
+  /// If we haven't explicitly passed '-in-process-plugin-server-path', infer
+  /// it as a default value.
+  ///
+  /// FIXME: Remove this after all the clients start sending it.
+  void setDefaultInProcessPluginServerPathIfNecessary();
+
+  /// Determine which C++ stdlib should be used for this compilation, and which
+  /// C++ stdlib is the default for the specified target.
+  void computeCXXStdlibOptions();
 
   /// Computes the runtime resource path relative to the given Swift
   /// executable.
@@ -273,6 +287,9 @@ public:
 
   FrontendOptions &getFrontendOptions() { return FrontendOpts; }
   const FrontendOptions &getFrontendOptions() const { return FrontendOpts; }
+
+  CASOptions &getCASOptions() { return CASOpts; }
+  const CASOptions &getCASOptions() const { return CASOpts; }
 
   TBDGenOptions &getTBDGenOptions() { return TBDGenOpts; }
   const TBDGenOptions &getTBDGenOptions() const { return TBDGenOpts; }
@@ -398,6 +415,9 @@ public:
   /// imported.
   bool shouldImportSwiftBacktracing() const;
 
+  /// Whether the CXX module should be implicitly imported.
+  bool shouldImportCxx() const;
+
   /// Performs input setup common to these tools:
   /// sil-opt, sil-func-extractor, sil-llvm-gen, and sil-nm.
   /// Return value includes the buffer so caller can keep it alive.
@@ -467,7 +487,7 @@ class CompilerInstance {
   /// the file buffer provided by CAS needs to outlive the SourceMgr.
   std::shared_ptr<llvm::cas::ObjectStore> CAS;
   std::shared_ptr<llvm::cas::ActionCache> ResultCache;
-  llvm::Optional<llvm::cas::ObjectRef> CompileJobBaseKey;
+  std::optional<llvm::cas::ObjectRef> CompileJobBaseKey;
 
   SourceManager SourceMgr;
   DiagnosticEngine Diagnostics{SourceMgr};
@@ -566,7 +586,7 @@ public:
   std::shared_ptr<llvm::cas::ObjectStore> getSharedCASInstance() const {
     return CAS;
   }
-  llvm::Optional<llvm::cas::ObjectRef> getCompilerBaseKey() const {
+  std::optional<llvm::cas::ObjectRef> getCompilerBaseKey() const {
     return CompileJobBaseKey;
   }
   CachingDiagnosticsProcessor *getCachingDiagnosticsProcessor() const {
@@ -653,6 +673,9 @@ public:
   /// i.e. if it can be found.
   bool canImportSwiftBacktracing() const;
 
+  /// Whether the Cxx library can be imported
+  bool canImportCxx() const;
+
   /// Whether the CxxShim library can be imported
   /// i.e. if it can be found.
   bool canImportCxxShim() const;
@@ -684,6 +707,10 @@ public:
   bool setup(const CompilerInvocation &Invocation, std::string &Error,
              ArrayRef<const char *> Args = {});
 
+  /// The fast setup function for cache replay.
+  bool setupForReplay(const CompilerInvocation &Invocation, std::string &Error,
+                      ArrayRef<const char *> Args = {});
+
   const CompilerInvocation &getInvocation() const { return Invocation; }
 
   /// If a IDE inspection buffer has been set, returns the corresponding source
@@ -714,34 +741,33 @@ private:
   /// \return false if successful, true on error.
   bool setupDiagnosticVerifierIfNeeded();
 
-  llvm::Optional<unsigned> setUpIDEInspectionTargetBuffer();
+  std::optional<unsigned> setUpIDEInspectionTargetBuffer();
 
   /// Find a buffer for a given input file and ensure it is recorded in
   /// SourceMgr, PartialModules, or InputSourceCodeBufferIDs as appropriate.
   /// Return the buffer ID if it is not already compiled, or None if so.
   /// Set failed on failure.
 
-  llvm::Optional<unsigned> getRecordedBufferID(const InputFile &input,
-                                               const bool shouldRecover,
-                                               bool &failed);
+  std::optional<unsigned> getRecordedBufferID(const InputFile &input,
+                                              const bool shouldRecover,
+                                              bool &failed);
 
   /// Given an input file, return a buffer to use for its contents,
   /// and a buffer for the corresponding module doc file if one exists.
   /// On failure, return a null pointer for the first element of the returned
   /// pair.
-  llvm::Optional<ModuleBuffers>
-  getInputBuffersIfPresent(const InputFile &input);
+  std::optional<ModuleBuffers> getInputBuffersIfPresent(const InputFile &input);
 
   /// Try to open the module doc file corresponding to the input parameter.
   /// Return None for error, nullptr if no such file exists, or the buffer if
   /// one was found.
-  llvm::Optional<std::unique_ptr<llvm::MemoryBuffer>>
+  std::optional<std::unique_ptr<llvm::MemoryBuffer>>
   openModuleDoc(const InputFile &input);
 
   /// Try to open the module source info file corresponding to the input parameter.
   /// Return None for error, nullptr if no such file exists, or the buffer if
   /// one was found.
-  llvm::Optional<std::unique_ptr<llvm::MemoryBuffer>>
+  std::optional<std::unique_ptr<llvm::MemoryBuffer>>
   openModuleSourceInfo(const InputFile &input);
 
 public:
@@ -763,7 +789,7 @@ private:
   /// Creates a new source file for the main module.
   SourceFile *createSourceFileForMainModule(ModuleDecl *mod,
                                             SourceFileKind FileKind,
-                                            llvm::Optional<unsigned> BufferID,
+                                            unsigned BufferID,
                                             bool isMainBuffer = false) const;
 
   /// Creates all the files to be added to the main module, appending them to

@@ -219,8 +219,10 @@ enum class ConstraintKind : char {
   /// Both (first and second) pack types should have the same reduced shape.
   SameShape,
   /// The first type is a tuple containing a single unlabeled element that is a
-  /// pack expansion. The second type is that pack expansion.
+  /// pack expansion. The second type is its pattern type.
   MaterializePackExpansion,
+  /// The first type is a l-value type whose object type is the second type.
+  LValueObject,
 };
 
 /// Classification of the different kinds of constraints.
@@ -588,7 +590,7 @@ public:
   /// Create a new Applicable Function constraint.
   static Constraint *createApplicableFunction(
       ConstraintSystem &cs, Type argumentFnType, Type calleeType,
-      llvm::Optional<TrailingClosureMatching> trailingClosureMatching,
+      std::optional<TrailingClosureMatching> trailingClosureMatching,
       ConstraintLocator *locator);
 
   static Constraint *createSyntacticElement(ConstraintSystem &cs,
@@ -606,9 +608,9 @@ public:
   ConstraintKind getKind() const { return Kind; }
 
   /// Retrieve the restriction placed on this constraint.
-  llvm::Optional<ConversionRestrictionKind> getRestriction() const {
+  std::optional<ConversionRestrictionKind> getRestriction() const {
     if (!HasRestriction)
-      return llvm::None;
+      return std::nullopt;
 
     return Restriction;
   }
@@ -691,6 +693,7 @@ public:
     case ConstraintKind::PackElementOf:
     case ConstraintKind::SameShape:
     case ConstraintKind::MaterializePackExpansion:
+    case ConstraintKind::LValueObject:
       return ConstraintClassification::Relational;
 
     case ConstraintKind::ValueMember:
@@ -880,7 +883,7 @@ public:
 
   /// For an applicable function constraint, retrieve the trailing closure
   /// matching rule.
-  llvm::Optional<TrailingClosureMatching> getTrailingClosureMatching() const;
+  std::optional<TrailingClosureMatching> getTrailingClosureMatching() const;
 
   /// Retrieve the locator for this constraint.
   ConstraintLocator *getLocator() const { return Locator; }

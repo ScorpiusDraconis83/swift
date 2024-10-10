@@ -20,23 +20,30 @@ extension std.string {
   /// - Complexity: O(*n*), where *n* is the number of UTF-8 code units in the
   ///   Swift string.
   public init(_ string: String) {
-    self.init()
-    for char in string.utf8 {
-      self.push_back(value_type(bitPattern: char))
+    self = string.withCString(encodedAs: UTF8.self) { buffer in
+#if os(Windows)
+      // Use the 2 parameter constructor.
+      // The MSVC standard library has a enable_if template guard
+      // on the 3 parameter constructor, and thus it's not imported into Swift.
+      std.string(buffer, string.utf8.count)
+#else
+      std.string(buffer, string.utf8.count, .init())
+#endif
     }
   }
 
   public init(_ string: UnsafePointer<CChar>?) {
-    self.init()
-
-    guard let str = string else {
-      return
-    }
-
-    let len = UTF8._nullCodeUnitOffset(in: str)
-    for i in 0..<len {
-      let char = UInt8(str[i])
-      self.push_back(value_type(bitPattern: char))
+    if let str = string {
+#if os(Windows)
+      // Use the 2 parameter constructor.
+      // The MSVC standard library has a enable_if template guard
+      // on the 3 parameter constructor, and thus it's not imported into Swift.
+      self.init(str, UTF8._nullCodeUnitOffset(in: str))
+#else
+      self.init(str, UTF8._nullCodeUnitOffset(in: str), .init())
+#endif
+    } else {
+      self.init()
     }
   }
 }
@@ -91,9 +98,13 @@ extension std.u32string: ExpressibleByStringLiteral {
 
 // MARK: Concatenating and comparing C++ strings
 
-extension std.string: Equatable {
+extension std.string: Equatable, Comparable {
   public static func ==(lhs: std.string, rhs: std.string) -> Bool {
     return lhs.compare(rhs) == 0
+  }
+
+  public static func <(lhs: std.string, rhs: std.string) -> Bool {
+    return lhs.compare(rhs) < 0
   }
 
   public static func +=(lhs: inout std.string, rhs: std.string) {
@@ -112,9 +123,13 @@ extension std.string: Equatable {
   }
 }
 
-extension std.u16string: Equatable {
+extension std.u16string: Equatable, Comparable {
   public static func ==(lhs: std.u16string, rhs: std.u16string) -> Bool {
     return lhs.compare(rhs) == 0
+  }
+
+  public static func <(lhs: std.u16string, rhs: std.u16string) -> Bool {
+    return lhs.compare(rhs) < 0
   }
 
   public static func +=(lhs: inout std.u16string, rhs: std.u16string) {
@@ -133,9 +148,13 @@ extension std.u16string: Equatable {
   }
 }
 
-extension std.u32string: Equatable {
+extension std.u32string: Equatable, Comparable {
   public static func ==(lhs: std.u32string, rhs: std.u32string) -> Bool {
     return lhs.compare(rhs) == 0
+  }
+
+  public static func <(lhs: std.u32string, rhs: std.u32string) -> Bool {
+    return lhs.compare(rhs) < 0
   }
 
   public static func +=(lhs: inout std.u32string, rhs: std.u32string) {

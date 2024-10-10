@@ -142,7 +142,7 @@ public:
   };
 
   /// Set target decl for attribute if the CC token is in attribute of the decl.
-  virtual void setAttrTargetDeclKind(llvm::Optional<DeclKind> DK) {}
+  virtual void setAttrTargetDeclKind(std::optional<DeclKind> DK) {}
 
   /// Set that the code completion token occurred in a custom attribute. This
   /// allows us to type check the custom attribute even if it is not attached to
@@ -170,10 +170,6 @@ public:
   /// is completing after set as its base.
   virtual void completePostfixExpr(CodeCompletionExpr *E, bool hasSpace){};
 
-  /// Complete a given expr-postfix, given that there is a following
-  /// left parenthesis.
-  virtual void completePostfixExprParen(Expr *E, Expr *CodeCompletionE) {};
-
   /// Complete the argument to an Objective-C #keyPath
   /// expression.
   ///
@@ -181,6 +177,12 @@ public:
   /// provide context. This will be \c NULL if no components of the
   /// #keyPath argument have been parsed yet.
   virtual void completeExprKeyPath(KeyPathExpr *KPE, SourceLoc DotLoc) {};
+
+  /// Complete the beginning of the type for a parameter of a
+  /// func/subscript/closure, or the type for a parameter in a function type.
+  /// For the latter, we cannot know for sure whether the user is trying to
+  /// write a function type, so will complete for e.g `let x: (#^COMPLETE^#`.
+  virtual void completeTypePossibleFunctionParamBeginning() {}
 
   /// Complete the beginning of the type of result of func/var/let/subscript.
   virtual void completeTypeDeclResultBeginning() {};
@@ -250,7 +252,7 @@ public:
   virtual void completeUnresolvedMember(CodeCompletionExpr *E,
                                         SourceLoc DotLoc) {};
 
-  virtual void completeCallArg(CodeCompletionExpr *E, bool isFirst) {};
+  virtual void completeCallArg(CodeCompletionExpr *E) {};
 
   virtual bool canPerformCompleteLabeledTrailingClosure() const {
     return false;
@@ -266,10 +268,10 @@ public:
   /// index means that the completion is within the parentheses and is
   /// for a specific yield value.
   virtual void completeYieldStmt(CodeCompletionExpr *E,
-                                 llvm::Optional<unsigned> yieldIndex){};
+                                 std::optional<unsigned> yieldIndex){};
 
   virtual void completeAfterPoundExpr(CodeCompletionExpr *E,
-                                      llvm::Optional<StmtKind> ParentKind){};
+                                      std::optional<StmtKind> ParentKind){};
 
   virtual void completeAfterPoundDirective() {};
 
@@ -285,6 +287,8 @@ public:
   void completeForEachPatternBeginning(bool hasTry, bool hasAwait) {};
 
   virtual void completeTypeAttrBeginning() {};
+
+  virtual void completeTypeAttrInheritanceBeginning() {};
 
   virtual void completeOptionalBinding(){};
 

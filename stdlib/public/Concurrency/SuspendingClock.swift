@@ -11,6 +11,8 @@
 //===----------------------------------------------------------------------===//
 import Swift
 
+#if !$Embedded
+
 /// A clock that measures time that always increments but stops incrementing 
 /// while the system is asleep. 
 ///
@@ -21,7 +23,7 @@ import Swift
 ///
 /// This clock is suitable for high resolution measurements of execution.
 @available(SwiftStdlib 5.7, *)
-public struct SuspendingClock {
+public struct SuspendingClock: Sendable {
   public struct Instant: Codable, Sendable {
     internal var _value: Swift.Duration
 
@@ -61,8 +63,9 @@ extension SuspendingClock: Clock {
       seconds: &seconds,
       nanoseconds: &nanoseconds,
       clock: _ClockID.suspending.rawValue)
-    return SuspendingClock.Instant(_value:
-      .seconds(seconds) + .nanoseconds(nanoseconds))
+    return Instant(
+      _value: Duration(_seconds: seconds, nanoseconds: nanoseconds)
+    )
   }
 
   /// The minimum non-zero resolution between any two calls to `now`.
@@ -74,7 +77,7 @@ extension SuspendingClock: Clock {
       seconds: &seconds,
       nanoseconds: &nanoseconds,
       clock: _ClockID.suspending.rawValue)
-    return .seconds(seconds) + .nanoseconds(nanoseconds)
+    return Duration(_seconds: seconds, nanoseconds: nanoseconds)
   }
 
 #if !SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
@@ -178,3 +181,4 @@ extension SuspendingClock.Instant: InstantProtocol {
   }
 }
 
+#endif

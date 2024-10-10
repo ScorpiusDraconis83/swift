@@ -16,9 +16,11 @@
 
 #define DEBUG_TYPE "sil-existential-transform"
 #include "ExistentialTransform.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/OptimizationRemark.h"
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILInstruction.h"
@@ -111,25 +113,6 @@ void ExistentialSpecializerCloner::cloneAndPopulateFunction() {
   }
 }
 
-// Gather the conformances needed for an existential value based on an opened
-// archetype. This adds any conformances inherited from superclass constraints.
-static ArrayRef<ProtocolConformanceRef>
-collectExistentialConformances(ModuleDecl *M, CanType openedType,
-                               CanType existentialType) {
-  assert(!openedType.isAnyExistentialType());
-
-  auto layout = existentialType.getExistentialLayout();
-  auto protocols = layout.getProtocols();
-
-  SmallVector<ProtocolConformanceRef, 4> conformances;
-  for (auto proto : protocols) {
-    auto conformance = M->lookupConformance(openedType, proto);
-    assert(conformance);
-    conformances.push_back(conformance);
-  }
-  return M->getASTContext().AllocateCopy(conformances);
-}
-
 // Create the entry basic block with the function arguments.
 void ExistentialSpecializerCloner::cloneArguments(
     SmallVectorImpl<SILValue> &entryArgs) {
@@ -180,11 +163,16 @@ void ExistentialSpecializerCloner::cloneArguments(
         ValueOwnershipKind(NewF, GenericSILType,
                            ArgDesc.Arg->getArgumentConvention()));
     NewArg->copyFlags(ArgDesc.Arg);
-    // Determine the Conformances.
+
+    // Gather the conformances needed for an existential value based on an
+    // opened archetype. This adds any conformances inherited from superclass
+    // constraints.
     SILType ExistentialType = ArgDesc.Arg->getType().getObjectType();
     CanType OpenedType = NewArg->getType().getASTType();
+    assert(!OpenedType.isAnyExistentialType());
     auto Conformances = collectExistentialConformances(
-        M.getSwiftModule(), OpenedType, ExistentialType.getASTType());
+        OpenedType, ExistentialType.getASTType());
+
     auto ExistentialRepr =
         ArgDesc.Arg->getType().getPreferredExistentialRepresentation();
     auto &EAD = ExistentialArgDescriptor[ArgDesc.Index];
@@ -290,10 +278,7 @@ void ExistentialTransform::convertExistentialArgTypesToGenericArgTypes(
   params.append(FTy->getParameters().begin(), FTy->getParameters().end());
 
   /// Determine the existing generic parameter depth.
-  int Depth = 0;
-  if (OrigGenericSig != nullptr) {
-    Depth = OrigGenericSig.getGenericParams().back()->getDepth() + 1;
-  }
+  int Depth = OrigGenericSig.getNextDepth();
 
   /// Index of the Generic Parameter.
   int GPIdx = 0;
@@ -310,8 +295,7 @@ void ExistentialTransform::convertExistentialArgTypesToGenericArgTypes(
       constraint = existential->getConstraintType()->getCanonicalType();
 
     /// Generate new generic parameter.
-    auto *NewGenericParam =
-        GenericTypeParamType::get(/*isParameterPack*/ false, Depth, GPIdx++, Ctx);
+    auto *NewGenericParam = GenericTypeParamType::getType(Depth, GPIdx++, Ctx);
     genericParams.push_back(NewGenericParam);
     Requirement NewRequirement(RequirementKind::Conformance, NewGenericParam,
                                constraint);
@@ -343,7 +327,8 @@ ExistentialTransform::createExistentialSpecializedFunctionType() {
   /// Compute the updated generic signature.
   NewGenericSig = buildGenericSignature(Ctx, OrigGenericSig,
                                         std::move(GenericParams),
-                                        std::move(Requirements));
+                                        std::move(Requirements),
+                                        /*allowInverses=*/true);
 
   /// Original list of parameters
   SmallVector<SILParameterInfo, 4> params;
@@ -366,7 +351,7 @@ ExistentialTransform::createExistentialSpecializedFunctionType() {
   }
 
   // Add error results.
-  llvm::Optional<SILResultInfo> InterfaceErrorResult;
+  std::optional<SILResultInfo> InterfaceErrorResult;
   if (FTy->hasErrorResult()) {
     InterfaceErrorResult = FTy->getErrorResult();
   }
@@ -395,7 +380,7 @@ void ExistentialTransform::populateThunkBody() {
   /// Remove original body of F.
   for (auto It = F->begin(), End = F->end(); It != End;) {
     auto *BB = &*It++;
-    removeDeadBlock(BB);
+    BB->removeDeadBlock();
   }
 
   /// Create a basic block and the function arguments.
@@ -440,12 +425,9 @@ void ExistentialTransform::populateThunkBody() {
     if (iter != ArgToGenericTypeMap.end() &&
         it != ExistentialArgDescriptor.end()) {
       ExistentialTransformArgumentDescriptor &ETAD = it->second;
-      OpenedArchetypeType *Opened;
       auto OrigOperand = ThunkBody->getArgument(ArgDesc.Index);
       auto SwiftType = ArgDesc.Arg->getType().getASTType();
-      auto OpenedType =
-          SwiftType
-              ->openAnyExistentialType(Opened, F->getGenericSignature())
+      auto OpenedType = OpenedArchetypeType::getAny(SwiftType)
               ->getCanonicalType();
       auto OpenedSILType = NewF->getLoweredType(OpenedType);
       SILValue archetypeValue;
@@ -526,10 +508,7 @@ void ExistentialTransform::populateThunkBody() {
     }
   }
 
-  unsigned int OrigDepth = 0;
-  if (F->getLoweredFunctionType()->isPolymorphic()) {
-    OrigDepth = OrigCalleeGenericSig.getGenericParams().back()->getDepth() + 1;
-  }
+  unsigned int OrigDepth = OrigCalleeGenericSig.getNextDepth();
   SubstitutionMap OrigSubMap = F->getForwardingSubstitutionMap();
 
   /// Create substitutions for Apply instructions.
@@ -634,11 +613,11 @@ void ExistentialTransform::createExistentialSpecializedFunction() {
     SILLinkage linkage = getSpecializedLinkage(F, F->getLinkage());
 
     NewF = FunctionBuilder.createFunction(
-      linkage, Name, NewFTy, NewFGenericEnv, F->getLocation(), F->isBare(),
-      F->isTransparent(), F->isSerialized(), IsNotDynamic, IsNotDistributed,
-      IsNotRuntimeAccessible, F->getEntryCount(), F->isThunk(),
-      F->getClassSubclassScope(), F->getInlineStrategy(), F->getEffectsKind(),
-      nullptr, F->getDebugScope());
+        linkage, Name, NewFTy, NewFGenericEnv, F->getLocation(), F->isBare(),
+        F->isTransparent(), F->getSerializedKind(), IsNotDynamic,
+        IsNotDistributed, IsNotRuntimeAccessible, F->getEntryCount(),
+        F->isThunk(), F->getClassSubclassScope(), F->getInlineStrategy(),
+        F->getEffectsKind(), nullptr, F->getDebugScope());
 
     /// Set the semantics attributes for the new function.
     for (auto &Attr : F->getSemanticsAttrs())
@@ -654,7 +633,7 @@ void ExistentialTransform::createExistentialSpecializedFunction() {
       [&](SubstitutableType *type) -> Type {
         return NewFGenericEnv->mapTypeIntoContext(type);
       },
-      LookUpConformanceInModule(F->getModule().getSwiftModule()));
+      LookUpConformanceInModule());
     ExistentialSpecializerCloner cloner(F, NewF, Subs, ArgumentDescList,
                                         ArgToGenericTypeMap,
                                         ExistentialArgDescriptor);

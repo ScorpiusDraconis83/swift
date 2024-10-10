@@ -280,12 +280,28 @@ public:
   Demangle::NodePointer _swift_buildDemanglingForMetadata(const Metadata *type,
                                                           Demangle::Demangler &Dem);
 
+  /// Build the demangling for the generic type that's created by specializing
+  /// the given type context descriptor with the given arguments.
+  Demangle::NodePointer
+  _buildDemanglingForGenericType(const TypeContextDescriptor *description,
+                                 const void *const *arguments,
+                                 Demangle::Demangler &Dem);
+
   /// Callback used to provide the substitution of a generic parameter
   /// (described by depth/index) to its metadata.
   ///
-  /// The return type here is a lie; it's actually a MetadataOrPack.
+  /// The return type here is a lie; it's actually a MetadataPackOrValue.
   using SubstGenericParameterFn =
     std::function<const void *(unsigned depth, unsigned index)>;
+
+  /// Callback used to provide the substitution of a generic parameter
+  /// (described by the ordinal, or "flat index") to its metadata. The index may
+  /// be "full" or it may be only relative to key arguments. The call is
+  /// provided both indexes and may use the one it requires.
+  ///
+  /// The return type here is a lie; it's actually a MetadataPackOrValue.
+  using SubstGenericParameterOrdinalFn =
+    std::function<const void *(unsigned fullOrdinal, unsigned keyOrdinal)>;
 
   /// Callback used to provide the substitution of a witness table based on
   /// its index into the enclosing generic environment.
@@ -293,16 +309,19 @@ public:
     std::function<const WitnessTable *(const Metadata *type, unsigned index)>;
 
   /// A pointer to type metadata or a heap-allocated metadata pack.
-  struct SWIFT_RUNTIME_LIBRARY_VISIBILITY MetadataOrPack {
+  struct SWIFT_RUNTIME_LIBRARY_VISIBILITY MetadataPackOrValue {
     const void *Ptr;
 
-    MetadataOrPack() : Ptr(nullptr) {}
+    MetadataPackOrValue() : Ptr(nullptr) {}
 
-    explicit MetadataOrPack(const void *ptr) : Ptr(ptr) {}
+    explicit MetadataPackOrValue(const void *ptr) : Ptr(ptr) {}
 
-    explicit MetadataOrPack(MetadataResponse response) : Ptr(response.Value) {}
+    explicit MetadataPackOrValue(intptr_t value)
+        : Ptr(reinterpret_cast<const void *>(value)) {}
 
-    explicit MetadataOrPack(MetadataPackPointer ptr) : Ptr(ptr.getPointer()) {
+    explicit MetadataPackOrValue(MetadataResponse response) : Ptr(response.Value) {}
+
+    explicit MetadataPackOrValue(MetadataPackPointer ptr) : Ptr(ptr.getPointer()) {
       if (ptr.getLifetime() != PackLifetime::OnHeap)
         fatalError(0, "Cannot have an on-stack pack here\n");
     }
@@ -343,7 +362,9 @@ public:
       fatalError(0, "Expected a metadata pack but got metadata\n");
     }
 
-    std::string nameForMetadata() const;
+    intptr_t getValue() const {
+      return reinterpret_cast<intptr_t>(Ptr);
+    }
   };
 
   /// Function object that produces substitutions for the generic parameters
@@ -445,7 +466,8 @@ public:
 
     const void * const *getGenericArgs() const { return genericArgs; }
 
-    MetadataOrPack getMetadata(unsigned depth, unsigned index) const;
+    MetadataPackOrValue getMetadata(unsigned depth, unsigned index) const;
+    MetadataPackOrValue getMetadataKeyArgOrdinal(unsigned ordinal) const;
     const WitnessTable *getWitnessTable(const Metadata *type,
                                         unsigned index) const;
   };
@@ -494,6 +516,19 @@ public:
                                SubstGenericParameterFn substGenericParam,
                                SubstDependentWitnessTableFn substWitnessTable);
 
+  /// Retrieve the type value described by the given type name.
+  ///
+  /// \p substGenericParam Function that provides generic argument metadata
+  /// given a particular generic parameter specified by depth/index.
+  /// \p substWitnessTable Function that provides witness tables given a
+  /// particular dependent conformance index.
+  SWIFT_RUNTIME_LIBRARY_VISIBILITY
+  TypeLookupErrorOr<intptr_t> getTypeValueByMangledName(
+                               StringRef typeName,
+                               const void * const *arguments,
+                               SubstGenericParameterFn substGenericParam,
+                               SubstDependentWitnessTableFn substWitnessTable);
+
 #pragma clang diagnostic pop
 
   /// Gather generic parameter counts from a context descriptor.
@@ -504,9 +539,9 @@ public:
                                      Demangler &BorrowFrom);
 
   /// Map depth/index to a flat index.
-  llvm::Optional<unsigned> _depthIndexToFlatIndex(
-                                          unsigned depth, unsigned index,
-                                          llvm::ArrayRef<unsigned> paramCounts);
+  std::optional<unsigned>
+  _depthIndexToFlatIndex(unsigned depth, unsigned index,
+                         llvm::ArrayRef<unsigned> paramCounts);
 
   /// Gathers all of the written generic parameters needed for
   /// '_gatherGenericParameters'. This takes a list of key arguments and fills
@@ -516,12 +551,15 @@ public:
   bool _gatherWrittenGenericParameters(
       const TypeContextDescriptor *descriptor,
       llvm::ArrayRef<const void *> keyArgs,
-      llvm::SmallVectorImpl<MetadataOrPack> &genericArgs,
+      llvm::SmallVectorImpl<MetadataPackOrValue> &genericArgs,
       Demangle::Demangler &Dem);
 
   /// Check the given generic requirements using the given set of generic
   /// arguments, collecting the key arguments (e.g., witness tables) for
   /// the caller.
+  ///
+  /// \param genericParams The generic parameters corresponding to the
+  /// arguments.
   ///
   /// \param requirements The set of requirements to evaluate.
   ///
@@ -530,10 +568,12 @@ public:
   /// passed to an instantiation function) will be added to this vector.
   ///
   /// \returns the error if an error occurred, None otherwise.
-  llvm::Optional<TypeLookupError> _checkGenericRequirements(
+  std::optional<TypeLookupError> _checkGenericRequirements(
+      llvm::ArrayRef<GenericParamDescriptor> genericParams,
       llvm::ArrayRef<GenericRequirementDescriptor> requirements,
       llvm::SmallVectorImpl<const void *> &extraArguments,
       SubstGenericParameterFn substGenericParam,
+      SubstGenericParameterOrdinalFn substGenericParamOrdinal,
       SubstDependentWitnessTableFn substWitnessTable);
 
   /// A helper function which avoids performing a store if the destination
@@ -583,6 +623,12 @@ public:
 
   SWIFT_RETURNS_NONNULL SWIFT_NODISCARD
   void *allocateMetadata(size_t size, size_t align);
+
+  // Compare two pieces of metadata that should be identical. Returns true if
+  // they are, false if they are not equal. Dumps the metadata contents to
+  // stderr if they are not equal.
+  bool compareGenericMetadata(const Metadata *original,
+                              const Metadata *newMetadata);
 
   Demangle::NodePointer
   _buildDemanglingForContext(const ContextDescriptor *context,

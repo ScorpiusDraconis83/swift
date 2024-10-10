@@ -24,6 +24,7 @@
 #include "swift/AST/ASTMangler.h"
 #include "swift/AST/ASTPrinter.h"
 #include "swift/AST/Availability.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/DistributedDecl.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/GenericEnvironment.h"
@@ -33,6 +34,7 @@
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "swift/Sema/ConstraintSystem.h"
@@ -324,20 +326,21 @@ static ConstructorDecl *createImplicitConstructor(NominalTypeDecl *decl,
   
   // Create the constructor.
   DeclName name(ctx, DeclBaseName::createConstructor(), paramList);
-  auto *ctor =
-    new (ctx) ConstructorDecl(name, Loc,
-                              /*Failable=*/false, /*FailabilityLoc=*/SourceLoc(),
-                              /*Async=*/false, /*AsyncLoc=*/SourceLoc(),
-                              /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(),
-                              /*ThrownType=*/TypeLoc(),
-                              paramList, /*GenericParams=*/nullptr, decl);
+  auto *ctor = new (ctx) ConstructorDecl(
+      name, Loc,
+      /*Failable=*/false, /*FailabilityLoc=*/SourceLoc(),
+      /*Async=*/false, /*AsyncLoc=*/SourceLoc(),
+      /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(),
+      /*ThrownType=*/TypeLoc(), paramList, /*GenericParams=*/nullptr, decl,
+      /*LifetimeDependentTypeRepr*/ nullptr);
 
   // Mark implicit.
   ctor->setImplicit();
   ctor->setSynthesized();
   ctor->setAccess(accessLevel);
 
-  if (ctx.LangOpts.hasFeature(Feature::IsolatedDefaultValues)) {
+  if (ctx.LangOpts.hasFeature(Feature::IsolatedDefaultValues) &&
+      !decl->isActor()) {
     // If any of the type's actor-isolated properties:
     //   1. Have non-Sendable type, or
     //   2. Have an isolated initial value
@@ -349,45 +352,82 @@ static ConstructorDecl *createImplicitConstructor(NominalTypeDecl *decl,
     // initializers apply Sendable checking to arguments at the call-site,
     // and actor initializers do not run on the actor, so initial values
     // cannot be actor-instance-isolated.
-    bool shouldAddNonisolated = true;
-    llvm::Optional<ActorIsolation> existingIsolation = llvm::None;
+    ActorIsolation existingIsolation = getActorIsolation(decl);
     VarDecl *previousVar = nullptr;
+    bool hasError = false;
 
-    // The memberwise init properties are also effectively what the
-    // default init uses, e.g. default initializers initialize via
-    // properties wrapped and init accessors.
-    for (auto var : decl->getMemberwiseInitProperties()) {
-      auto type = var->getTypeInContext();
-      auto isolation = getActorIsolation(var);
-      if (isolation.isGlobalActor()) {
-        if (!isSendableType(decl->getModuleContext(), type) ||
-            var->getInitializerIsolation().isGlobalActor()) {
-          // If different isolated stored properties require different
-          // global actors, it is impossible to initialize this type.
-          if (existingIsolation &&
-              *existingIsolation != isolation) {
-            ctx.Diags.diagnose(decl->getLoc(),
-                diag::conflicting_stored_property_isolation,
-                ICK == ImplicitConstructorKind::Memberwise,
-                decl->getDeclaredType(), *existingIsolation, isolation);
-            previousVar->diagnose(
-                diag::property_requires_actor,
-                previousVar->getDescriptiveKind(),
-                previousVar->getName(), *existingIsolation);
-            var->diagnose(
-                diag::property_requires_actor,
-                var->getDescriptiveKind(),
-                var->getName(), isolation);
+    // FIXME: Calling `getAllMembers` here causes issues for conformance
+    // synthesis to RawRepresentable and friends. Instead, iterate over
+    // both the stored properties and the init accessor properties, as
+    // those can participate in implicit initializers.
+
+    auto stored = decl->getStoredProperties();
+    auto initAccessor = decl->getInitAccessorProperties();
+
+    auto shouldAddNonisolated = [&](ArrayRef<VarDecl *> properties) {
+      if (hasError)
+        return false;
+
+      bool addNonisolated = true;
+      for (auto *var : properties) {
+        auto *pbd = var->getParentPatternBinding();
+        if (!pbd)
+          continue;
+
+        auto i = pbd->getPatternEntryIndexForVarDecl(var);
+        if (pbd->isInitializerSubsumed(i))
+          continue;
+
+        ActorIsolation initIsolation;
+        if (var->hasInitAccessor()) {
+          // Init accessors share the actor isolation of the property;
+          // the accessor body can call anything in that isolation domain,
+          // and we don't attempt to infer when the isolation isn't
+          // necessary.
+          initIsolation = getActorIsolation(var);
+        } else {
+          initIsolation = var->getInitializerIsolation();
+        }
+
+        auto type = var->getTypeInContext();
+        auto isolation = getActorIsolation(var);
+        if (isolation.isGlobalActor()) {
+          if (!type->isSendableType() ||
+              initIsolation.isGlobalActor()) {
+            // If different isolated stored properties require different
+            // global actors, it is impossible to initialize this type.
+            if (existingIsolation != isolation) {
+              ctx.Diags.diagnose(decl->getLoc(),
+                  diag::conflicting_stored_property_isolation,
+                  ICK == ImplicitConstructorKind::Memberwise,
+                  decl->getDeclaredType(), existingIsolation, isolation)
+                .warnUntilSwiftVersion(6);
+              if (previousVar) {
+                previousVar->diagnose(
+                    diag::property_requires_actor,
+                    previousVar->getDescriptiveKind(),
+                    previousVar->getName(), existingIsolation);
+              }
+              var->diagnose(
+                  diag::property_requires_actor,
+                  var->getDescriptiveKind(),
+                  var->getName(), isolation);
+              hasError = true;
+              return false;
+            }
+
+            existingIsolation = isolation;
+            previousVar = var;
+            addNonisolated = false;
           }
-
-          existingIsolation = isolation;
-          previousVar = var;
-          shouldAddNonisolated = false;
         }
       }
-    }
 
-    if (shouldAddNonisolated) {
+      return addNonisolated;
+    };
+
+    if (shouldAddNonisolated(stored) &&
+        shouldAddNonisolated(initAccessor)) {
       addNonIsolatedToSynthesized(decl, ctor);
     }
   }
@@ -481,7 +521,7 @@ synthesizeStubBody(AbstractFunctionDecl *fn, void *) {
 
   SmallVector<ASTNode, 2> stmts;
   stmts.push_back(call);
-  stmts.push_back(new (ctx) ReturnStmt(SourceLoc(), /*Result=*/nullptr));
+  stmts.push_back(ReturnStmt::createImplicit(ctx, /*Result=*/nullptr));
   return { BraceStmt::create(ctx, SourceLoc(), stmts, SourceLoc(),
                              /*implicit=*/true),
            /*isTypeChecked=*/true };
@@ -502,15 +542,13 @@ createDesignatedInitOverrideGenericParams(ASTContext &ctx,
   if (genericParams == nullptr)
     return nullptr;
 
-  unsigned depth = 0;
-  if (auto classSig = classDecl->getGenericSignature())
-    depth = classSig.getGenericParams().back()->getDepth() + 1;
+  unsigned depth = classDecl->getGenericSignature().getNextDepth();
 
   SmallVector<GenericTypeParamDecl *, 4> newParams;
   for (auto *param : genericParams->getParams()) {
     auto *newParam = GenericTypeParamDecl::createImplicit(
         classDecl, param->getName(), depth, param->getIndex(),
-        param->isParameterPack(), param->isOpaqueType());
+        param->getParamKind());
     newParams.push_back(newParam);
   }
 
@@ -602,8 +640,8 @@ configureInheritedDesignatedInitAttributes(ClassDecl *classDecl,
 
   // If the superclass constructor is @objc but the subclass constructor is
   // not representable in Objective-C, add @nonobjc implicitly.
-  llvm::Optional<ForeignAsyncConvention> asyncConvention;
-  llvm::Optional<ForeignErrorConvention> errorConvention;
+  std::optional<ForeignAsyncConvention> asyncConvention;
+  std::optional<ForeignErrorConvention> errorConvention;
   if (superclassCtor->isObjC() &&
       !isRepresentableInObjC(ctor, ObjCReason::MemberOfObjCSubclass,
                              asyncConvention, errorConvention))
@@ -670,7 +708,7 @@ synthesizeDesignatedInitOverride(AbstractFunctionDecl *fn, void *context) {
 
   SmallVector<ASTNode, 2> stmts;
   stmts.push_back(rebindSelfExpr);
-  stmts.push_back(new (ctx) ReturnStmt(SourceLoc(), /*Result=*/nullptr));
+  stmts.push_back(ReturnStmt::createImplicit(ctx, /*Result=*/nullptr));
   return { BraceStmt::create(ctx, SourceLoc(), stmts, SourceLoc(),
                             /*implicit=*/true),
            /*isTypeChecked=*/true };
@@ -730,7 +768,7 @@ createDesignatedInitOverride(ClassDecl *classDecl,
   auto genericSig = ctx.getOverrideGenericSignature(
       superclassDecl, classDecl, superclassCtorSig, genericParams);
 
-  assert(!subMap.hasArchetypes());
+  assert(!subMap.getRecursiveProperties().hasArchetype());
 
   if (superclassCtorSig) {
     auto *genericEnv = genericSig.getGenericEnvironment();
@@ -739,14 +777,13 @@ createDesignatedInitOverride(ClassDecl *classDecl,
     // requirements on the base class's own generic parameters that are not
     // satisfied by the derived class. In this case, we don't want to inherit
     // this initializer; there's no way to call it on the derived class.
-    auto checkResult = TypeChecker::checkGenericArguments(
-        classDecl->getParentModule(),
+    auto checkResult = checkRequirements(
         superclassCtorSig.getRequirements(),
         [&](Type type) -> Type {
           auto substType = type.subst(subMap);
           return GenericEnvironment::mapTypeIntoContext(genericEnv, substType);
         });
-    if (checkResult != CheckGenericArgumentsResult::Success)
+    if (checkResult != CheckRequirementsResult::Success)
       return nullptr;
   }
 
@@ -782,17 +819,16 @@ createDesignatedInitOverride(ClassDecl *classDecl,
   // Create the initializer declaration, inheriting the name,
   // failability, and throws from the superclass initializer.
   auto implCtx = classDecl->getImplementationContext()->getAsGenericContext();
-  auto ctor =
-    new (ctx) ConstructorDecl(superclassCtor->getName(),
-                              classDecl->getBraces().Start,
-                              superclassCtor->isFailable(),
-                              /*FailabilityLoc=*/SourceLoc(),
-                              /*Async=*/superclassCtor->hasAsync(),
-                              /*AsyncLoc=*/SourceLoc(),
-                              /*Throws=*/superclassCtor->hasThrows(),
-                              /*ThrowsLoc=*/SourceLoc(),
-                              TypeLoc::withoutLoc(thrownType),
-                              bodyParams, genericParams, implCtx);
+  auto ctor = new (ctx) ConstructorDecl(
+      superclassCtor->getName(), classDecl->getBraces().Start,
+      superclassCtor->isFailable(),
+      /*FailabilityLoc=*/SourceLoc(),
+      /*Async=*/superclassCtor->hasAsync(),
+      /*AsyncLoc=*/SourceLoc(),
+      /*Throws=*/superclassCtor->hasThrows(),
+      /*ThrowsLoc=*/SourceLoc(), TypeLoc::withoutLoc(thrownType), bodyParams,
+      genericParams, implCtx,
+      /*LifetimeDependentTypeRepr*/ nullptr);
 
   ctor->setImplicit();
 
@@ -1117,7 +1153,8 @@ static void collectNonOveriddenSuperclassInits(
   superclassDecl->synthesizeSemanticMembersIfNeeded(
     DeclBaseName::createConstructor());
 
-  NLOptions subOptions = (NL_QualifiedDefault | NL_IgnoreAccessControl);
+  NLOptions subOptions =
+      (NL_QualifiedDefault | NL_IgnoreAccessControl | NL_IgnoreMissingImports);
   SmallVector<ValueDecl *, 4> lookupResults;
   subclass->lookupQualified(
       superclassDecl, DeclNameRef::createConstructor(),
@@ -1345,16 +1382,22 @@ ResolveImplicitMemberRequest::evaluate(Evaluator &evaluator,
       return false;
 
     auto targetType = target->getDeclaredInterfaceType();
-    auto ref = target->getParentModule()->lookupConformance(
-        targetType, protocol);
+    auto ref = lookupConformance(targetType, protocol);
     if (ref.isInvalid()) {
       return false;
     }
 
     if (auto *conformance = dyn_cast<NormalProtocolConformance>(
             ref.getConcrete()->getRootConformance())) {
-      if (conformance->getState() == ProtocolConformanceState::Incomplete) {
-        TypeChecker::checkConformance(conformance);
+      // Complete evaluate the conformance.
+      evaluateOrDefault(evaluator,
+                        ResolveTypeWitnessesRequest{conformance},
+                        evaluator::SideEffect());
+
+      // FIXME: This should be more fine-grained to avoid having to check
+      // for a cycle here.
+      if (!evaluator.hasActiveRequest(ResolveValueWitnessesRequest{conformance})) {
+        conformance->resolveValueWitnesses();
       }
     }
 
@@ -1639,7 +1682,8 @@ static std::pair<BraceStmt *, bool>
 synthesizeSingleReturnFunctionBody(AbstractFunctionDecl *afd, void *) {
   ASTContext &ctx = afd->getASTContext();
   SmallVector<ASTNode, 1> stmts;
-  stmts.push_back(new (ctx) ReturnStmt(afd->getLoc(), nullptr));
+  stmts.push_back(
+      ReturnStmt::createImplicit(ctx, afd->getLoc(), /*result*/ nullptr));
   return { BraceStmt::create(ctx, afd->getLoc(), stmts, afd->getLoc(), true),
            /*isTypeChecked=*/true };
 }
@@ -1648,11 +1692,6 @@ ConstructorDecl *
 SynthesizeDefaultInitRequest::evaluate(Evaluator &evaluator,
                                        NominalTypeDecl *decl) const {
   auto &ctx = decl->getASTContext();
-
-  FrontendStatsTracer StatsTracer(ctx.Stats,
-                                  "define-default-ctor", decl);
-  PrettyStackTraceDecl stackTrace("defining default constructor for",
-                                  decl);
 
   // Create the default constructor.
   auto ctorKind = decl->isDistributedActor() ?

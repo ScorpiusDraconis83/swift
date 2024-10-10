@@ -1,4 +1,4 @@
-// RUN: %target-swift-frontend -typecheck -verify %s  -disable-availability-checking -package-name myPkg
+// RUN: %target-swift-frontend -typecheck -verify %s  -disable-availability-checking -package-name myPkg -enable-experimental-feature IsolatedDeinit
 // REQUIRES: concurrency
 
 actor SomeActor { }
@@ -20,11 +20,11 @@ struct GenericGlobalActor<T> {
 
 // Ill-formed global actors.
 @globalActor
-final class GA2 { // expected-error{{type 'GA2' does not conform to protocol 'GlobalActor'}}
+final class GA2 { // expected-error{{type 'GA2' does not conform to protocol 'GlobalActor'}} expected-note {{add stubs for conformance}}
 }
 
 @globalActor
-struct GA3 { // expected-error{{type 'GA3' does not conform to protocol 'GlobalActor'}}
+struct GA3 { // expected-error{{type 'GA3' does not conform to protocol 'GlobalActor'}} expected-note {{add stubs for conformance}}
   let shared = SomeActor()
 }
 
@@ -41,7 +41,7 @@ open class GA5 { // expected-error{{non-final class 'GA5' cannot be a global act
 }
 
 @globalActor
-struct GA6<T> { // expected-error{{type 'GA6<T>' does not conform to protocol 'GlobalActor'}}
+struct GA6<T> { // expected-error{{type 'GA6<T>' does not conform to protocol 'GlobalActor'}} expected-note {{add stubs for conformance}}
 }
 
 extension GA6 where T: Equatable {
@@ -67,7 +67,7 @@ struct OtherGlobalActor {
 }
 
 @GA1 struct X {
-  @GA1 var member: Int // expected-warning {{stored property 'member' within struct cannot have a global actor; this is an error in Swift 6}}
+  @GA1 var member: Int
 }
 
 struct Y {
@@ -80,7 +80,7 @@ struct Y {
 
 class SomeClass {
   @GA1 init() { }
-  @GA1 deinit { } // expected-error{{deinitializer cannot have a global actor}}
+  @GA1 deinit { }
 }
 
 @GA1 typealias Integer = Int // expected-error{{type alias cannot have a global actor}}

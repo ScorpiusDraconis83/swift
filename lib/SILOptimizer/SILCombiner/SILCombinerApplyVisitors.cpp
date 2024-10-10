@@ -18,6 +18,7 @@
 #include "swift/AST/Module.h"
 #include "swift/AST/SemanticAttrs.h"
 #include "swift/AST/SubstitutionMap.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Range.h"
 #include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/DynamicCasts.h"
@@ -157,6 +158,10 @@ SILCombiner::optimizeApplyOfConvertFunctionInst(FullApplySite AI,
   auto context = AI.getFunction()->getTypeExpansionContext();
   auto oldOpRetTypes = substConventions.getIndirectSILResultTypes(context);
   auto newOpRetTypes = convertConventions.getIndirectSILResultTypes(context);
+  auto oldIndirectErrorResultType =
+      substConventions.getIndirectErrorResultType(context);
+  auto newIndirectErrorResultType =
+      convertConventions.getIndirectErrorResultType(context);
   auto oldOpParamTypes = substConventions.getParameterSILTypes(context);
   auto newOpParamTypes = convertConventions.getParameterSILTypes(context);
 
@@ -186,7 +191,13 @@ SILCombiner::optimizeApplyOfConvertFunctionInst(FullApplySite AI,
        ++OpI, ++newRetI, ++oldRetI) {
     convertOp(Ops[OpI], *oldRetI, *newRetI);
   }
-  
+
+  if (oldIndirectErrorResultType) {
+    assert(newIndirectErrorResultType);
+    convertOp(Ops[OpI], oldIndirectErrorResultType, newIndirectErrorResultType);
+    ++OpI;
+  }
+
   auto newParamI = newOpParamTypes.begin();
   auto oldParamI = oldOpParamTypes.begin();
   for (auto e = newOpParamTypes.end(); newParamI != e;
@@ -263,8 +274,8 @@ SILCombiner::optimizeApplyOfConvertFunctionInst(FullApplySite AI,
 ///   %addr = struct_element_addr/ref_element_addr %root_object
 ///   ...
 ///   load/store %addr
-bool SILCombiner::tryOptimizeKeypathApplication(ApplyInst *AI,
-                                          SILFunction *callee) {
+bool swift::tryOptimizeKeypathApplication(ApplyInst *AI,
+                                          SILFunction *callee, SILBuilder Builder) {
   if (AI->getNumArguments() != 3)
     return false;
 
@@ -303,7 +314,6 @@ bool SILCombiner::tryOptimizeKeypathApplication(ApplyInst *AI,
     }
   });
   
-  eraseInstFromFunction(*AI);
   ++NumOptimizedKeypaths;
   return true;
 }
@@ -329,9 +339,9 @@ bool SILCombiner::tryOptimizeKeypathApplication(ApplyInst *AI,
 ///   %offset_builtin_int = unchecked_trivial_bit_cast %offset_ptr
 ///   %offset_int = struct $Int (%offset_builtin_int)
 ///   %offset = enum $Optional<Int>, #Optional.some!enumelt, %offset_int
-bool SILCombiner::tryOptimizeKeypathOffsetOf(ApplyInst *AI,
+bool swift::tryOptimizeKeypathOffsetOf(ApplyInst *AI,
                                              FuncDecl *calleeFn,
-                                             KeyPathInst *kp) {
+                                             KeyPathInst *kp, SILBuilder Builder) {
   auto *accessor = dyn_cast<AccessorDecl>(calleeFn);
   if (!accessor || !accessor->isGetter())
     return false;
@@ -432,7 +442,6 @@ bool SILCombiner::tryOptimizeKeypathOffsetOf(ApplyInst *AI,
     result = Builder.createOptionalNone(loc, AI->getType());
   }
   AI->replaceAllUsesWith(result);
-  eraseInstFromFunction(*AI);
   ++NumOptimizedKeypaths;
   return true;
 }
@@ -444,9 +453,9 @@ bool SILCombiner::tryOptimizeKeypathOffsetOf(ApplyInst *AI,
 ///   %string = apply %keypath_kvcString_method(%kp)
 /// With:
 ///   %string = string_literal "blah"
-bool SILCombiner::tryOptimizeKeypathKVCString(ApplyInst *AI,
+bool swift::tryOptimizeKeypathKVCString(ApplyInst *AI,
                                               FuncDecl *calleeFn,
-                                              KeyPathInst *kp) {
+                                              KeyPathInst *kp, SILBuilder Builder) {
   if (!calleeFn->getAttrs()
         .hasSemanticsAttr(semantics::KEYPATH_KVC_KEY_PATH_STRING))
     return false;
@@ -499,14 +508,13 @@ bool SILCombiner::tryOptimizeKeypathKVCString(ApplyInst *AI,
   }
 
   AI->replaceAllUsesWith(literalValue);
-  eraseInstFromFunction(*AI);
   ++NumOptimizedKeypaths;
   return true;
 }
 
-bool SILCombiner::tryOptimizeKeypath(ApplyInst *AI) {
+bool swift::tryOptimizeKeypath(ApplyInst *AI, SILBuilder Builder) {
   if (SILFunction *callee = AI->getReferencedFunctionOrNull()) {
-    return tryOptimizeKeypathApplication(AI, callee);
+    return tryOptimizeKeypathApplication(AI, callee, Builder);
   }
   
   // Try optimize keypath method calls.
@@ -530,10 +538,10 @@ bool SILCombiner::tryOptimizeKeypath(ApplyInst *AI) {
   if (!kp || !kp->hasPattern())
     return false;
   
-  if (tryOptimizeKeypathOffsetOf(AI, calleeFn, kp))
+  if (tryOptimizeKeypathOffsetOf(AI, calleeFn, kp, Builder))
     return true;
 
-  if (tryOptimizeKeypathKVCString(AI, calleeFn, kp))
+  if (tryOptimizeKeypathKVCString(AI, calleeFn, kp, Builder))
     return true;
 
   return false;
@@ -657,7 +665,7 @@ bool SILCombiner::eraseApply(FullApplySite FAS, const UserListTy &Users) {
       return false;
     // As we are extending the lifetimes of owned parameters, we have to make
     // sure that no dealloc_ref or dealloc_stack_ref instructions are
-    // within this extended liferange.
+    // within this extended liverange.
     // It could be that the dealloc_ref is deallocating a parameter and then
     // we would have a release after the dealloc.
     if (VLA.containsDeallocRef(Frontier))
@@ -682,6 +690,7 @@ bool SILCombiner::eraseApply(FullApplySite FAS, const UserListTy &Users) {
         case ParameterConvention::Indirect_In_Guaranteed:
         case ParameterConvention::Indirect_Inout:
         case ParameterConvention::Indirect_InoutAliasable:
+        case ParameterConvention::Indirect_In_CXX:
         case ParameterConvention::Direct_Unowned:
         case ParameterConvention::Direct_Guaranteed:
         case ParameterConvention::Pack_Guaranteed:
@@ -722,7 +731,7 @@ void SILCombiner::replaceWitnessMethodInst(
 // If some ConcreteOpenedExistentialInfo is returned, then new cast instructions
 // have already been added to Builder's tracking list. If the caller can't make
 // real progress then it must reset the Builder.
-llvm::Optional<ConcreteOpenedExistentialInfo>
+std::optional<ConcreteOpenedExistentialInfo>
 SILCombiner::buildConcreteOpenedExistentialInfoFromSoleConformingType(
     Operand &ArgOperand) {
   SILInstruction *AI = ArgOperand.getUser();
@@ -731,7 +740,7 @@ SILCombiner::buildConcreteOpenedExistentialInfoFromSoleConformingType(
 
   // SoleConformingType is only applicable in whole-module compilation.
   if (!M.isWholeModule())
-    return llvm::None;
+    return std::nullopt;
 
   // Determine the protocol.
   ProtocolDecl *PD = nullptr;
@@ -744,7 +753,7 @@ SILCombiner::buildConcreteOpenedExistentialInfoFromSoleConformingType(
     // FIXME: Remove this out-dated check for mutating self. canReplaceCopiedArg
     // is supposed to handle this case.
     if (FAS.getOrigCalleeType()->getSelfParameter().isIndirectMutating())
-      return llvm::None;
+      return std::nullopt;
     PD = WMI->getLookupProtocol();
   } else {
     auto ArgType = ArgOperand.get()->getType();
@@ -764,17 +773,17 @@ SILCombiner::buildConcreteOpenedExistentialInfoFromSoleConformingType(
   }
 
   if (!PD)
-    return llvm::None;
+    return std::nullopt;
 
   // Determine the sole conforming type.
   CanType ConcreteType;
   if (!PCA->getSoleConformingType(PD, CHA, ConcreteType))
-    return llvm::None;
+    return std::nullopt;
 
   // Determine OpenedArchetypeDef and SubstitutionMap.
   ConcreteOpenedExistentialInfo COAI(ArgOperand, ConcreteType, PD);
   if (!COAI.CEI)
-    return llvm::None;
+    return std::nullopt;
 
   const OpenedArchetypeInfo &OAI = COAI.OAI;
   ConcreteExistentialInfo &SoleCEI = *COAI.CEI;
@@ -803,7 +812,7 @@ SILCombiner::buildConcreteOpenedExistentialInfoFromSoleConformingType(
 
     auto *consumingUse = OER->getSingleConsumingUse();
     if (!consumingUse || !isa<DestroyValueInst>(consumingUse->getUser())) {
-      return llvm::None;
+      return std::nullopt;
     }
 
     // We use std::next(OER) as the insertion point so that we can reuse the
@@ -822,7 +831,7 @@ SILCombiner::buildConcreteOpenedExistentialInfoFromSoleConformingType(
     auto abstractionPattern = Lowering::AbstractionPattern::getOpaque();
     auto abstractTy = F->getLoweredType(abstractionPattern, ConcreteType);
     if (abstractTy != concreteSILType)
-      return llvm::None;
+      return std::nullopt;
 
     SoleCEI.ConcreteValue =
       Builder.createUncheckedAddrCast(
@@ -832,13 +841,13 @@ SILCombiner::buildConcreteOpenedExistentialInfoFromSoleConformingType(
   // Bail if OpenArchetypeInfo recognizes any additional opened archetype
   // producers. This shouldn't be hit currently because metatypes don't
   // conform to protocols.
-  return llvm::None;
+  return std::nullopt;
 }
 
 // This function builds a ConcreteExistentialInfo by first following the data
 // flow chain from the ArgOperand. Otherwise, we check if the operand is of
 // protocol type that conforms to a single concrete type.
-llvm::Optional<ConcreteOpenedExistentialInfo>
+std::optional<ConcreteOpenedExistentialInfo>
 SILCombiner::buildConcreteOpenedExistentialInfo(Operand &ArgOperand) {
   // Build a ConcreteOpenedExistentialInfo following the data flow chain of the
   // ArgOperand through the open_existential backward to an init_existential.
@@ -938,7 +947,9 @@ static bool canReplaceCopiedArg(FullApplySite Apply, SILValue Arg,
 static bool applyInvolvesOpenedArchetypeWithRoot(FullApplySite Apply,
                                                  OpenedArchetypeType *RootOA,
                                                  unsigned SkipArgIdx) {
-  if (Apply.getType().getASTType()->hasOpenedExistentialWithRoot(RootOA)) {
+  auto *env = RootOA->getGenericEnvironment();
+
+  if (Apply.getType().getASTType()->hasLocalArchetypeFromEnvironment(env)) {
     return true;
   }
 
@@ -949,7 +960,7 @@ static bool applyInvolvesOpenedArchetypeWithRoot(FullApplySite Apply,
     if (Apply.getArgument(Idx)
             ->getType()
             .getASTType()
-            ->hasOpenedExistentialWithRoot(RootOA)) {
+            ->hasLocalArchetypeFromEnvironment(env)) {
       return true;
     }
   }
@@ -1015,7 +1026,7 @@ struct ConcreteArgumentCopy {
     assert(origArg->getType().isAddress());
   }
 
-  static llvm::Optional<ConcreteArgumentCopy>
+  static std::optional<ConcreteArgumentCopy>
   generate(const ConcreteExistentialInfo &existentialInfo, ApplySite apply,
            unsigned argIdx, SILBuilderContext &builderCtx) {
     SILParameterInfo paramInfo =
@@ -1024,8 +1035,8 @@ struct ConcreteArgumentCopy {
     assert(!paramInfo.isIndirectMutating()
            && "A mutated opened existential value can't be replaced");
 
-    if (!paramInfo.isConsumed())
-      return llvm::None;
+    if (!paramInfo.isConsumedInCaller())
+      return std::nullopt;
 
     SILValue origArg = apply.getArgument(argIdx);
     // TODO_sil_opaque: With SIL opaque values, a formally indirect argument
@@ -1045,7 +1056,7 @@ struct ConcreteArgumentCopy {
     // destroy_value of the existential, which is no longer consumed by the
     // call.
     if (!paramInfo.isFormalIndirect())
-      return llvm::None;
+      return std::nullopt;
 
     SILBuilderWithScope builder(apply.getInstruction(), builderCtx);
     auto loc = apply.getLoc();
@@ -1123,8 +1134,6 @@ SILInstruction *SILCombiner::createApplyWithConcreteType(
     FullApplySite Apply,
     const llvm::SmallDenseMap<unsigned, ConcreteOpenedExistentialInfo> &COAIs,
     SILBuilderContext &BuilderCtx) {
-  // Ensure that the callee is polymorphic.
-  assert(Apply.getOrigCalleeType()->isPolymorphic());
 
   // Create the new set of arguments to apply including their substitutions.
   SubstitutionMap NewCallSubs = Apply.getSubstitutionMap();
@@ -1173,7 +1182,7 @@ SILInstruction *SILCombiner::createApplyWithConcreteType(
                 return CEI.lookupExistentialConformance(proto);
               }
               return ProtocolConformanceRef(proto);
-            });
+            }, SubstFlags::SubstituteLocalArchetypes);
         continue;
       }
       // Otherwise, use the original argument.
@@ -1211,7 +1220,7 @@ SILInstruction *SILCombiner::createApplyWithConcreteType(
             return CEI.lookupExistentialConformance(proto);
           }
           return ProtocolConformanceRef(proto);
-        });
+        }, SubstFlags::SubstituteLocalArchetypes);
   }
 
   // We need to make sure that we can a) update Apply to use the new args and b)
@@ -1423,7 +1432,8 @@ SILCombiner::propagateConcreteTypeOfInitExistential(FullApplySite Apply) {
 ///  getContiguousArrayStorageType<Int>(for:)
 ///    => metatype @thick ContiguousArrayStorage<Int>.Type
 /// We know that `getContiguousArrayStorageType` will not return the AnyObject
-/// type optimization for any non class or objc existential type instantiation.
+/// type optimization for any non class or objc existential type instantiation
+/// or a C++ foreign reference type.
 static bool shouldReplaceCallByMetadataConstructor(CanType storageMetaTy) {
   auto metaTy = dyn_cast<MetatypeType>(storageMetaTy);
   if (!metaTy || metaTy->getRepresentation() != MetatypeRepresentation::Thick)
@@ -1444,8 +1454,18 @@ static bool shouldReplaceCallByMetadataConstructor(CanType storageMetaTy) {
   if (ty->getStructOrBoundGenericStruct() || ty->getEnumOrBoundGenericEnum() ||
       isa<BuiltinVectorType>(ty) || isa<BuiltinIntegerType>(ty) ||
       isa<BuiltinFloatType>(ty) || isa<TupleType>(ty) ||
-      isa<AnyFunctionType>(ty) ||
+      isa<AnyFunctionType>(ty) || ty->isForeignReferenceType() ||
       (ty->isAnyExistentialType() && !ty->isObjCExistentialType()))
+    return true;
+
+  return false;
+}
+
+static bool canBeRemovedIfResultIsNotUsed(SILFunction *f) {
+  if (f->getEffectsKind() < EffectsKind::ReleaseNone)
+    return true;
+
+  if (f->hasSemanticsAttr("string.init_empty_with_capacity"))
     return true;
 
   return false;
@@ -1465,12 +1485,14 @@ SILInstruction *SILCombiner::visitApplyInst(ApplyInst *AI) {
   if (auto *CFI = dyn_cast<ConvertFunctionInst>(callee))
     return optimizeApplyOfConvertFunctionInst(AI, CFI);
 
-  if (tryOptimizeKeypath(AI))
+  if (tryOptimizeKeypath(AI, Builder)) {
+    eraseInstFromFunction(*AI);
     return nullptr;
+  }
 
   // Optimize readonly functions with no meaningful users.
   SILFunction *SF = AI->getReferencedFunctionOrNull();
-  if (SF && SF->getEffectsKind() < EffectsKind::ReleaseNone) {
+  if (SF && canBeRemovedIfResultIsNotUsed(SF)) {
     UserListTy Users;
     if (recursivelyCollectARCUsers(Users, AI)) {
       if (eraseApply(AI, Users))

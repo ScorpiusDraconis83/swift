@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/ScopedAddressUtils.h"
 #include "swift/SIL/OwnershipUtils.h"
 #include "swift/SIL/PrunedLiveness.h"
@@ -112,7 +113,7 @@ namespace swift::test {
 // Dumps:
 // - the liveness result and boundary
 static FunctionTest ScopedAddressLivenessTest(
-    "scoped-address-liveness", [](auto &function, auto &arguments, auto &test) {
+    "scoped_address_liveness", [](auto &function, auto &arguments, auto &test) {
       auto value = arguments.takeValue();
       assert(!arguments.hasUntaken());
       llvm::outs() << "Scoped address analysis: " << value;
@@ -201,7 +202,8 @@ bool swift::hasOtherStoreBorrowsInLifetime(StoreBorrowInst *storeBorrow,
 
   for (auto *otherStoreBorrow : otherStoreBorrows) {
     // Return true, if otherStoreBorrow was in \p storeBorrow's scope
-    if (liveness->isWithinBoundary(otherStoreBorrow)) {
+    if (liveness->isWithinBoundary(otherStoreBorrow,
+                                   /*deadEndBlocks=*/nullptr)) {
       return true;
     }
   }

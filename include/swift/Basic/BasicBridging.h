@@ -23,6 +23,15 @@
 // Pure bridging mode does not permit including any C++/llvm/swift headers.
 // See also the comments for `BRIDGING_MODE` in the top-level CMakeLists.txt file.
 //
+//
+// Note: On Windows ARM64, how a C++ struct/class value type is
+// returned is sensitive to conditions including whether a
+// user-defined constructor exists, etc. See
+// https://learn.microsoft.com/en-us/cpp/build/arm64-windows-abi-conventions?view=msvc-170#return-values
+// So, if a C++ struct/class type is returned as a value between Swift
+// and C++, we need to be careful to match the return convention
+// matches between the non-USED_IN_CPP_SOURCE (Swift) side and the
+// USE_IN_CPP_SOURCE (C++) side.
 #include "swift/Basic/BridgedSwiftObject.h"
 #include "swift/Basic/Compiler.h"
 
@@ -107,6 +116,9 @@ typedef uintptr_t SwiftUInt;
 #define BRIDGING_WRAPPER_NULLABLE(Node, Name) \
   BRIDGING_WRAPPER_IMPL(Node, Nullable##Name, _Nullable)
 
+void assertFail(const char * _Nonnull msg, const char * _Nonnull file,
+                SwiftUInt line, const char * _Nonnull function);
+
 //===----------------------------------------------------------------------===//
 // MARK: ArrayRef
 //===----------------------------------------------------------------------===//
@@ -178,20 +190,15 @@ void BridgedData_free(BridgedData data);
 //===----------------------------------------------------------------------===//
 
 enum ENUM_EXTENSIBILITY_ATTR(open) BridgedFeature {
-#define LANGUAGE_FEATURE(FeatureName, SENumber, Description, Option)           \
-  FeatureName,
+#define LANGUAGE_FEATURE(FeatureName, SENumber, Description) FeatureName,
 #include "swift/Basic/Features.def"
 };
 
 //===----------------------------------------------------------------------===//
-// MARK: OStream
-//===----------------------------------------------------------------------===//
-
-BRIDGING_WRAPPER_NONNULL(llvm::raw_ostream, OStream)
-
-//===----------------------------------------------------------------------===//
 // MARK: StringRef
 //===----------------------------------------------------------------------===//
+
+class BridgedOStream;
 
 class BridgedStringRef {
   const char *_Nullable Data;
@@ -229,6 +236,10 @@ class BridgedOwnedString {
   size_t Length;
 
 public:
+  // Ensure that this struct value type will be indirectly returned on
+  // Windows ARM64
+  BridgedOwnedString() {}
+
 #ifdef USED_IN_CPP_SOURCE
   BridgedOwnedString(const std::string &stringToCopy);
 
@@ -236,7 +247,7 @@ public:
 #endif
 
   void destroy() const;
-};
+} SWIFT_SELF_CONTAINED;
 
 SWIFT_NAME("getter:BridgedOwnedString.data(self:)")
 BRIDGED_INLINE 
@@ -247,6 +258,39 @@ BRIDGED_INLINE SwiftInt BridgedOwnedString_count(BridgedOwnedString str);
 
 SWIFT_NAME("getter:BridgedOwnedString.isEmpty(self:)")
 BRIDGED_INLINE bool BridgedOwnedString_empty(BridgedOwnedString str);
+
+//===----------------------------------------------------------------------===//
+// MARK: OStream
+//===----------------------------------------------------------------------===//
+
+class BridgedOStream {
+  llvm::raw_ostream * _Nonnull os;
+
+public:
+  SWIFT_UNAVAILABLE("Use init(raw:) instead")
+  BridgedOStream(llvm::raw_ostream * _Nonnull os) : os(os) {}
+
+  SWIFT_UNAVAILABLE("Use '.raw' instead")
+  llvm::raw_ostream * _Nonnull unbridged() const { return os; }
+
+  void write(BridgedStringRef string) const;
+
+  void newLine() const;
+
+  void flush() const;
+};
+
+SWIFT_NAME("getter:BridgedOStream.raw(self:)")
+inline void * _Nonnull BridgedOStream_getRaw(BridgedOStream bridged) {
+  return bridged.unbridged();
+}
+
+SWIFT_NAME("BridgedOStream.init(raw:)")
+inline BridgedOStream BridgedOStream_fromRaw(void * _Nonnull os) {
+  return static_cast<llvm::raw_ostream *>(os);
+}
+
+BridgedOStream Bridged_dbgs();
 
 //===----------------------------------------------------------------------===//
 // MARK: SourceLoc
@@ -292,6 +336,8 @@ public:
 
   SWIFT_NAME("end")
   BridgedSourceLoc End;
+
+  BridgedSourceRange() : Start(), End() {}
 
   SWIFT_NAME("init(start:end:)")
   BridgedSourceRange(BridgedSourceLoc start, BridgedSourceLoc end)
@@ -379,72 +425,6 @@ public:
   }
 #endif
 };
-
-//===----------------------------------------------------------------------===//
-// MARK: Plugins
-//===----------------------------------------------------------------------===//
-
-SWIFT_BEGIN_ASSUME_NONNULL
-
-/// Create a new root 'null' JSON value. Clients must call \c JSON_value_delete
-/// after using it.
-void *JSON_newValue();
-
-/// Parse \p data as a JSON data and return the top-level value. Clients must
-/// call \c JSON_value_delete after using it.
-void *JSON_deserializedValue(BridgedData data);
-
-/// Serialize a value and populate \p result with the result data. Clients
-/// must call \c BridgedData_free after using the \p result.
-void JSON_value_serialize(void *valuePtr, BridgedData *result);
-
-/// Destroy and release the memory for \p valuePtr that is a result from
-/// \c JSON_newValue() or \c JSON_deserializedValue() .
-void JSON_value_delete(void *valuePtr);
-
-bool JSON_value_getAsNull(void *valuePtr);
-bool JSON_value_getAsBoolean(void *valuePtr, bool *result);
-bool JSON_value_getAsString(void *valuePtr, BridgedData *result);
-bool JSON_value_getAsDouble(void *valuePtr, double *result);
-bool JSON_value_getAsInteger(void *valuePtr, int64_t *result);
-bool JSON_value_getAsObject(void *valuePtr, void *_Nullable *_Nonnull result);
-bool JSON_value_getAsArray(void *valuePtr, void *_Nullable *_Nonnull result);
-
-size_t JSON_object_getSize(void *objectPtr);
-BridgedData JSON_object_getKey(void *objectPtr, size_t i);
-bool JSON_object_hasKey(void *objectPtr, const char *key);
-void *JSON_object_getValue(void *objectPtr, const char *key);
-
-size_t JSON_array_getSize(void *arrayPtr);
-void *JSON_array_getValue(void *arrayPtr, size_t index);
-
-void JSON_value_emplaceNull(void *valuePtr);
-void JSON_value_emplaceBoolean(void *valuePtr, bool value);
-void JSON_value_emplaceString(void *valuePtr, const char *value);
-void JSON_value_emplaceDouble(void *valuePtr, double value);
-void JSON_value_emplaceInteger(void *valuePtr, int64_t value);
-void *JSON_value_emplaceNewObject(void *valuePtr);
-void *JSON_value_emplaceNewArray(void *valuePtr);
-
-void JSON_object_setNull(void *objectPtr, const char *key);
-void JSON_object_setBoolean(void *objectPtr, const char *key, bool value);
-void JSON_object_setString(void *objectPtr, const char *key, const char *value);
-void JSON_object_setDouble(void *objectPtr, const char *key, double value);
-void JSON_object_setInteger(void *objectPtr, const char *key, int64_t value);
-void *JSON_object_setNewObject(void *objectPtr, const char *key);
-void *JSON_object_setNewArray(void *objectPtr, const char *key);
-void *JSON_object_setNewValue(void *objectPtr, const char *key);
-
-void JSON_array_pushNull(void *arrayPtr);
-void JSON_array_pushBoolean(void *arrayPtr, bool value);
-void JSON_array_pushString(void *arrayPtr, const char *value);
-void JSON_array_pushDouble(void *arrayPtr, double value);
-void JSON_array_pushInteger(void *arrayPtr, int64_t value);
-void *JSON_array_pushNewObject(void *arrayPtr);
-void *JSON_array_pushNewArray(void *arrayPtr);
-void *JSON_array_pushNewValue(void *arrayPtr);
-
-SWIFT_END_ASSUME_NONNULL
 
 SWIFT_END_NULLABILITY_ANNOTATIONS
 

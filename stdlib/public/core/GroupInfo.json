@@ -76,6 +76,8 @@
     "Sort.swift",
     "Range.swift",
     "ClosedRange.swift",
+    "RangeSet.swift",
+    "RangeSetRanges.swift",
     "CollectionOfOne.swift",
     "BridgingBuffer.swift",
     "Sequence.swift",
@@ -102,6 +104,7 @@
         "Filter.swift",
         "Reverse.swift",
         "Slice.swift",
+        "DiscontiguousSlice.swift",
         "DropWhile.swift",
         "PrefixWhile.swift",
         "LazyCollection.swift",
@@ -119,7 +122,6 @@
         "ContiguousArray.swift",
         "ContiguousArrayBuffer.swift",
         "ContiguouslyStored.swift",
-        "FixedArray.swift",
         "SliceBuffer.swift",
         "SwiftNativeNSArray.swift"],
       "HashedCollections": [
@@ -148,7 +150,7 @@
     "Builtin.swift",
     "VarArgs.swift",
     "CTypes.swift",
-    "MemoryLayout.swift",
+    "MemoryLayout.swift"
   ],
   "KeyPaths": [
     "KeyPath.swift"
@@ -158,17 +160,21 @@
     "Mirror.swift",
     "Mirrors.swift",
     "ReflectionMirror.swift",
-    "ObjectIdentifier.swift"
+    "ObjectIdentifier.swift",
+    "ObjectIdentifier+DebugDescription.swift"
   ],
   "Math": [
     "SetAlgebra.swift",
     "BuiltinMath.swift",
     {
     "Integers": [
+      "Int128.swift",
       "Integers.swift",
       "IntegerTypes.swift",
       "IntegerParsing.swift",
-      "StaticBigInt.swift"],
+      "LegacyInt128.swift",
+      "StaticBigInt.swift",
+      "UInt128.swift"],
     "Floating": [
       "FloatingPoint.swift",
       "FloatingPointParsing.swift",
@@ -240,12 +246,12 @@
     "LegacyABI.swift",
     "MigrationSupport.swift",
     "PtrAuth.swift",
-    "Int128.swift",
     "Duration.swift",
     "DurationProtocol.swift",
     "Instant.swift",
     "EmbeddedRuntime.swift",
-    "EmbeddedStubs.swift"
+    "EmbeddedStubs.swift",
+    "EmbeddedPrint.swift"
   ],
   "Result": [
     "Result.swift"

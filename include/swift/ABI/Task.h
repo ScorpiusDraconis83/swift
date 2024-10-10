@@ -17,7 +17,6 @@
 #ifndef SWIFT_ABI_TASK_H
 #define SWIFT_ABI_TASK_H
 
-#include "swift/ABI/TaskLocal.h"
 #include "swift/ABI/Executor.h"
 #include "swift/ABI/HeapObject.h"
 #include "swift/ABI/Metadata.h"
@@ -42,6 +41,12 @@ class TaskExecutorPreferenceStatusRecord;
 class TaskOptionRecord;
 class TaskGroup;
 class ContinuationAsyncContext;
+
+// lldb knows about some of these internals. If you change things that lldb
+// knows about (or might know about in the future, as a future lldb might be
+// inspecting a process running an older Swift runtime), increment
+// _swift_concurrency_debug_internal_layout_version and add a comment describing
+// the new version.
 
 extern FullMetadata<DispatchClassMetadata> jobHeapMetadata;
 
@@ -170,8 +175,8 @@ static_assert(alignof(Job) == 2 * alignof(void*),
 class NullaryContinuationJob : public Job {
 
 private:
-  AsyncTask* Task;
-  AsyncTask* Continuation;
+  SWIFT_ATTRIBUTE_UNUSED AsyncTask *Task;
+  AsyncTask *Continuation;
 
 public:
   NullaryContinuationJob(AsyncTask *task, JobPriority priority, AsyncTask *continuation)
@@ -186,7 +191,7 @@ public:
   }
 };
 
-/// Descibes type information and offers value methods for an arbitrary concrete
+/// Describes type information and offers value methods for an arbitrary concrete
 /// type in a way that's compatible with regular Swift and embedded Swift. In
 /// regular Swift, just holds a Metadata pointer and dispatches to the value
 /// witness table. In embedded Swift, because we do not have any value witness
@@ -352,7 +357,11 @@ public:
   /// failing that will return ResumeTask. The returned function pointer may
   /// have a different signature than ResumeTask, and it's only for identifying
   /// code associated with the task.
-  const void *getResumeFunctionForLogging();
+  ///
+  /// If isStarting is true, look into the resume context when appropriate
+  /// to pull out a wrapped resume function. If isStarting is false, assume the
+  /// resume context may not be valid and just return the wrapper.
+  const void *getResumeFunctionForLogging(bool isStarting);
 
   /// Given that we've already fully established the job context
   /// in the current thread, start running this task.  To establish
@@ -415,16 +424,20 @@ public:
 
   /// Get the preferred task executor reference if there is one set for this
   /// task.
-  TaskExecutorRef getPreferredTaskExecutor();
+  TaskExecutorRef getPreferredTaskExecutor(bool assumeHasRecord = false);
 
   /// WARNING: Only to be used during task creation, in other situations prefer
   /// to use `swift_task_pushTaskExecutorPreference` and
   /// `swift_task_popTaskExecutorPreference`.
-  void pushInitialTaskExecutorPreference(TaskExecutorRef preferred);
+  ///
+  /// The `owned` parameter indicates if the executor is owned by the task,
+  /// and must be released when the task completes.
+  void pushInitialTaskExecutorPreference(
+      TaskExecutorRef preferred, bool owned);
 
   /// WARNING: Only to be used during task completion (destroy).
   ///
-  /// This is because between task creation and its destory, we cannot carry the
+  /// This is because between task creation and its destroy, we cannot carry the
   /// exact record to `pop(record)`, and instead assume that there will be
   /// exactly one record remaining -- the "initial" record (added during
   /// creating the task), and it must be that record that is removed by this

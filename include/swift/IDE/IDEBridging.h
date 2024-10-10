@@ -17,8 +17,8 @@
 
 #ifdef USED_IN_CPP_SOURCE
 #include "swift/Basic/SourceLoc.h"
-#include "llvm/ADT/Optional.h"
 #include "llvm/CAS/CASReference.h"
+#include <optional>
 #include <vector>
 #endif
 
@@ -37,6 +37,13 @@ enum class LabelRangeType {
   /// ### Example
   /// `func foo([a b]: Int)`
   Param,
+
+  /// The parameter of an enum case declaration
+  ///
+  /// ### Examples
+  ///  - `case myCase([a]: Int)`
+  ///  - `case myCase([]Int)`
+  EnumCaseParam,
 
   /// Parameters of a function that can't be collapsed if they are the same.
   ///
@@ -79,8 +86,8 @@ struct ResolvedLoc {
   std::vector<swift::CharSourceRange> labelRanges;
 
   /// The in index in `labelRanges` that belongs to the first trailing closure
-  /// or `llvm::None` if there is no trailing closure.
-  llvm::Optional<unsigned> firstTrailingLabel;
+  /// or `std::nullopt` if there is no trailing closure.
+  std::optional<unsigned> firstTrailingLabel;
 
   LabelRangeType labelType;
 
@@ -91,7 +98,7 @@ struct ResolvedLoc {
 
   ResolvedLoc(swift::CharSourceRange range,
               std::vector<swift::CharSourceRange> labelRanges,
-              llvm::Optional<unsigned> firstTrailingLabel,
+              std::optional<unsigned> firstTrailingLabel,
               LabelRangeType labelType, bool isActive,
               ResolvedLocContext context);
 

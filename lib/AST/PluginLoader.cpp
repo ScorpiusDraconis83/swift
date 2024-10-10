@@ -14,9 +14,11 @@
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/DiagnosticsFrontend.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Parse/Lexer.h"
 #include "llvm/Config/config.h"
+#include "llvm/Support/VirtualFileSystem.h"
 
 using namespace swift;
 
@@ -59,6 +61,15 @@ static StringRef pluginModuleNameStringFromPath(StringRef path) {
   return "";
 }
 
+static llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem>
+getPluginLoadingFS(ASTContext &Ctx) {
+  // If there is a clang include tree FS, using real file system to load plugin
+  // as the FS in SourceMgr doesn't support directory iterator.
+  if (Ctx.ClangImporterOpts.HasClangIncludeTreeRoot)
+    return llvm::vfs::getRealFileSystem();
+  return Ctx.SourceMgr.getFileSystem();
+}
+
 llvm::DenseMap<Identifier, PluginLoader::PluginEntry> &
 PluginLoader::getPluginMap() {
   if (PluginMap.has_value()) {
@@ -86,7 +97,7 @@ PluginLoader::getPluginMap() {
     (void)result;
   };
 
-  auto fs = Ctx.SourceMgr.getFileSystem();
+  auto fs = getPluginLoadingFS(Ctx);
   std::error_code ec;
 
   for (auto &entry : Ctx.SearchPathOpts.PluginSearchOpts) {
@@ -150,51 +161,40 @@ const PluginLoader::PluginEntry &
 PluginLoader::lookupPluginByModuleName(Identifier moduleName) {
   auto &map = getPluginMap();
   auto found = map.find(moduleName);
-  if (found != map.end()) {
-    return found->second;
-  } else {
+  if (found == map.end()) {
     static PluginEntry notFound{"", ""};
     return notFound;
   }
+
+  // Track the dependency.
+  recordDependency(found->second, moduleName);
+  return found->second;
 }
 
-llvm::Expected<LoadedLibraryPlugin *>
-PluginLoader::loadLibraryPlugin(StringRef path) {
-  auto fs = Ctx.SourceMgr.getFileSystem();
+llvm::Expected<CompilerPlugin *> PluginLoader::getInProcessPlugins() {
+  auto inProcPluginServerPath = Ctx.SearchPathOpts.InProcessPluginServerPath;
+  if (inProcPluginServerPath.empty()) {
+    return llvm::createStringError(
+        llvm::inconvertibleErrorCode(),
+        "library plugins require -in-process-plugin-server-path");
+  }
+
+  auto fs = getPluginLoadingFS(Ctx);
   SmallString<128> resolvedPath;
-  if (auto err = fs->getRealPath(path, resolvedPath)) {
+  if (auto err = fs->getRealPath(inProcPluginServerPath, resolvedPath)) {
     return llvm::createStringError(err, err.message());
   }
 
-  // Track the dependency.
-  recordDependency(path);
-
-  // Load the plugin.
-  auto plugin = getRegistry()->loadLibraryPlugin(resolvedPath);
-  if (!plugin) {
-    resolvedPath.push_back(0);
-    return llvm::handleErrors(
-        plugin.takeError(), [&](const llvm::ErrorInfoBase &err) {
-          return llvm::createStringError(
-              err.convertToErrorCode(),
-              "compiler plugin '%s' could not be loaded;  %s",
-              resolvedPath.data(), err.message().data());
-        });
-  }
-
-  return plugin;
+  return getRegistry()->getInProcessPlugins(resolvedPath);
 }
 
-llvm::Expected<LoadedExecutablePlugin *>
+llvm::Expected<CompilerPlugin *>
 PluginLoader::loadExecutablePlugin(StringRef path) {
-  auto fs = Ctx.SourceMgr.getFileSystem();
+  auto fs = getPluginLoadingFS(Ctx);
   SmallString<128> resolvedPath;
   if (auto err = fs->getRealPath(path, resolvedPath)) {
     return llvm::createStringError(err, err.message());
   }
-
-  // Track the dependency.
-  recordDependency(path);
 
   // Load the plugin.
   auto plugin =
@@ -213,7 +213,26 @@ PluginLoader::loadExecutablePlugin(StringRef path) {
   return plugin;
 }
 
-void PluginLoader::recordDependency(StringRef path) {
-  if (DepTracker)
-    DepTracker->addDependency(path, /*IsSystem=*/false);
+void PluginLoader::recordDependency(const PluginEntry &plugin,
+                                    Identifier moduleName) {
+  if (!DepTracker)
+    return;
+
+  // libraryPath: non-nil, executablePath: nil: in-process library plugin.
+  // libraryPath: non-nil, executablePath: non-nil: external library plugin.
+  // libraryPath: nil, executablePath: non-nil: executable plugin.
+  StringRef path =
+      !plugin.libraryPath.empty() ? plugin.libraryPath : plugin.executablePath;
+
+  // NOTE: We don't track plugin-server path as a dependency because it doesn't
+  // provide much value.
+
+  assert(!path.empty());
+  SmallString<128> resolvedPath;
+  auto fs = Ctx.SourceMgr.getFileSystem();
+  if (auto err = fs->getRealPath(path, resolvedPath)) {
+    return;
+  }
+
+  DepTracker->addMacroPluginDependency(resolvedPath, moduleName);
 }

@@ -30,6 +30,8 @@ protocol P2 {
 }
 
 class C1 : P1, P2 {
+  // expected-note@-1{{add '@preconcurrency' to the 'P1' conformance to defer isolation checking to run time}}
+
   typealias Assoc = String
 
   func method1() { }
@@ -52,7 +54,22 @@ protocol NonIsolatedRequirement {
 @MainActor class OnMain {}
 
 extension OnMain: NonIsolatedRequirement {
+  // expected-note@-1{{add '@preconcurrency' to the 'NonIsolatedRequirement' conformance to defer isolation checking to run time}}
+
   // expected-warning@+2 {{main actor-isolated instance method 'requirement()' cannot be used to satisfy nonisolated protocol requirement}}
   // expected-note@+1 {{add 'nonisolated' to 'requirement()' to make this instance method not isolated to the actor}}
   func requirement() {}
+}
+
+// expected-note@+1 {{calls to global function 'downgrade()' from outside of its actor context are implicitly asynchronous}}
+@preconcurrency @MainActor func downgrade() {}
+
+extension OnMain {
+  struct Nested {
+    // expected-note@+1 {{add '@MainActor' to make instance method 'test()' part of global actor 'MainActor'}}
+    func test() {
+      // expected-warning@+1 {{call to main actor-isolated global function 'downgrade()' in a synchronous nonisolated context}}
+      downgrade()
+    }
+  }
 }

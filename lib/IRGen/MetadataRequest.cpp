@@ -37,11 +37,13 @@
 #include "IRGenModule.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/CanTypeVisitor.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/DiagnosticsIRGen.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/IRGenOptions.h"
 #include "swift/AST/SubstitutionMap.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "swift/IRGen/Linking.h"
 #include "swift/SIL/FormalLinkage.h"
@@ -273,7 +275,7 @@ static bool usesExtendedExistentialMetadata(CanType type) {
   return layout.containsParameterized;
 }
 
-static llvm::Optional<std::pair<CanExistentialType, /*depth*/ unsigned>>
+static std::optional<std::pair<CanExistentialType, /*depth*/ unsigned>>
 usesExtendedExistentialMetadata(CanExistentialMetatypeType type) {
   unsigned depth = 1;
   auto cur = type.getInstanceType();
@@ -294,7 +296,7 @@ usesExtendedExistentialMetadata(CanExistentialMetatypeType type) {
     }
     return std::make_pair(cast<ExistentialType>(cur), depth);
   }
-  return llvm::None;
+  return std::nullopt;
 }
 
 llvm::Constant *IRGenModule::getAddrOfStringForMetadataRef(
@@ -516,11 +518,11 @@ static llvm::Value *emitObjCMetadataRef(IRGenFunction &IGF,
 CanType IRGenModule::getRuntimeReifiedType(CanType type) {
   // Leave type-erased ObjC generics with their generic arguments unbound, since
   // the arguments do not exist at runtime.
-  return CanType(type.transform([&](Type t) -> Type {
+  return CanType(type.transformRec([&](TypeBase *t) -> std::optional<Type> {
     if (CanType(t).isTypeErasedGenericClassType()) {
       return t->getAnyNominal()->getDeclaredType()->getCanonicalType();
     }
-    return t;
+    return std::nullopt;
   }));
 }
 
@@ -528,13 +530,8 @@ CanType IRGenModule::substOpaqueTypesWithUnderlyingTypes(CanType type) {
   // Substitute away opaque types whose underlying types we're allowed to
   // assume are constant.
   if (type->hasOpaqueArchetype()) {
-    ReplaceOpaqueTypesWithUnderlyingTypes replacer(
-        getSwiftModule(), ResilienceExpansion::Maximal,
-        getSILModule().isWholeModule());
-    auto underlyingTy =
-        type.subst(replacer, replacer, SubstFlags::SubstituteOpaqueArchetypes)
-            ->getCanonicalType();
-    return underlyingTy;
+    auto context = getMaximalTypeExpansionContext();
+    return swift::substOpaqueTypesWithUnderlyingTypes(type, context);
   }
 
   return type;
@@ -545,13 +542,10 @@ SILType IRGenModule::substOpaqueTypesWithUnderlyingTypes(
   // Substitute away opaque types whose underlying types we're allowed to
   // assume are constant.
   if (type.getASTType()->hasOpaqueArchetype()) {
-    ReplaceOpaqueTypesWithUnderlyingTypes replacer(
-        getSwiftModule(), ResilienceExpansion::Maximal,
-        getSILModule().isWholeModule());
-    auto underlyingTy =
-        type.subst(getSILModule(), replacer, replacer, genericSig,
-                   SubstFlags::SubstituteOpaqueArchetypes);
-    return underlyingTy;
+    auto context = getMaximalTypeExpansionContext();
+    return SILType::getPrimitiveType(
+      swift::substOpaqueTypesWithUnderlyingTypes(type.getASTType(), context),
+      type.getCategory());
   }
 
   return type;
@@ -563,15 +557,10 @@ IRGenModule::substOpaqueTypesWithUnderlyingTypes(CanType type,
   // Substitute away opaque types whose underlying types we're allowed to
   // assume are constant.
   if (type->hasOpaqueArchetype()) {
-    ReplaceOpaqueTypesWithUnderlyingTypes replacer(
-        getSwiftModule(), ResilienceExpansion::Maximal,
-        getSILModule().isWholeModule());
-    auto substConformance = conformance.subst(
-        type, replacer, replacer, SubstFlags::SubstituteOpaqueArchetypes);
-    auto underlyingTy =
-        type.subst(replacer, replacer, SubstFlags::SubstituteOpaqueArchetypes)
-            ->getCanonicalType();
-    return std::make_pair(underlyingTy, substConformance);
+    auto context = getMaximalTypeExpansionContext();
+    return std::make_pair(
+       swift::substOpaqueTypesWithUnderlyingTypes(type, context),
+       swift::substOpaqueTypesWithUnderlyingTypes(conformance, type, context));
   }
 
   return std::make_pair(type, conformance);
@@ -656,7 +645,7 @@ static MetadataResponse emitNominalPrespecializedGenericMetadataRef(
     DynamicMetadataRequest request,
     SpecializedMetadataCanonicality canonicality) {
   assert(isCompleteSpecializedNominalTypeMetadataStaticallyAddressable(
-      IGF.IGM, *theDecl, theType, canonicality));
+      IGF.IGM, theType, canonicality));
   // We are applying generic parameters to a generic type.
   assert(theType->getAnyNominal() == theDecl);
 
@@ -763,16 +752,16 @@ static MetadataResponse emitNominalMetadataRef(IRGenFunction &IGF,
   MetadataResponse response;
 
   if (isCompleteSpecializedNominalTypeMetadataStaticallyAddressable(
-          IGF.IGM, *theDecl, theType, CanonicalSpecializedMetadata)) {
+          IGF.IGM, theType, CanonicalSpecializedMetadata)) {
     response = emitNominalPrespecializedGenericMetadataRef(
         IGF, theDecl, theType, request, CanonicalSpecializedMetadata);
   } else if (isCompleteSpecializedNominalTypeMetadataStaticallyAddressable(
-                 IGF.IGM, *theDecl, theType, NoncanonicalSpecializedMetadata)) {
+                 IGF.IGM, theType, NoncanonicalSpecializedMetadata)) {
     response = emitNominalPrespecializedGenericMetadataRef(
         IGF, theDecl, theType, request, NoncanonicalSpecializedMetadata);
   } else if (auto theClass = dyn_cast<ClassDecl>(theDecl)) {
     if (isSpecializedNominalTypeMetadataStaticallyAddressable(
-            IGF.IGM, *theClass, theType, CanonicalSpecializedMetadata,
+            IGF.IGM, theType, CanonicalSpecializedMetadata,
             ForUseOnlyFromAccessor)) {
       llvm::Function *accessor =
           IGF.IGM
@@ -799,10 +788,13 @@ static MetadataResponse emitNominalMetadataRef(IRGenFunction &IGF,
 }
 
 bool irgen::isSpecializedNominalTypeMetadataStaticallyAddressable(
-    IRGenModule &IGM, NominalTypeDecl &nominal, CanType type,
+    IRGenModule &IGM, CanType type,
     SpecializedMetadataCanonicality canonicality,
     SpecializedMetadataUsageIsOnlyFromAccessor onlyFromAccessor) {
-  assert(nominal.isGenericContext());
+  auto *nominal = type->getAnyNominal();
+
+  assert(!isa<ProtocolDecl>(nominal));
+  assert(nominal->isGenericContext());
 
   if (!IGM.shouldPrespecializeGenericMetadata()) {
     return false;
@@ -812,13 +804,16 @@ bool irgen::isSpecializedNominalTypeMetadataStaticallyAddressable(
     return false;
   }
 
+  if (!IGM.getTypeInfoForUnlowered(type).isFixedSize(ResilienceExpansion::Maximal))
+    return false;
+
   switch (canonicality) {
   case CanonicalSpecializedMetadata:
     if (IGM.getSILModule().isWholeModule()) {
       // Canonical prespecializations can only be emitted within the module
       // where the generic type is itself defined, since it is the module where
       // the metadata accessor is defined.
-      if (IGM.getSwiftModule() != nominal.getModuleContext()) {
+      if (IGM.getSwiftModule() != nominal->getModuleContext()) {
         return false;
       }
     } else {
@@ -827,7 +822,7 @@ bool irgen::isSpecializedNominalTypeMetadataStaticallyAddressable(
       // containing the type's decl!  The reason is that the generic metadata
       // accessor is defined in the IRGenModule corresponding to the source file
       // containing the type's decl.
-      SourceFile *nominalFile = nominal.getDeclContext()->getParentSourceFile();
+      SourceFile *nominalFile = nominal->getDeclContext()->getParentSourceFile();
       if (auto *moduleFile = IGM.IRGen.getSourceFile(&IGM)) {
         if (nominalFile != moduleFile) {
           return false;
@@ -838,17 +833,17 @@ bool irgen::isSpecializedNominalTypeMetadataStaticallyAddressable(
   case NoncanonicalSpecializedMetadata:
     // Non-canonical metadata prespecializations for a type cannot be formed
     // within the module that defines that type.
-    if (IGM.getSwiftModule() == nominal.getModuleContext()) {
+    if (IGM.getSwiftModule() == nominal->getModuleContext()) {
       return false;
     }
-    if (nominal.isResilient(IGM.getSwiftModule(),
-                            ResilienceExpansion::Maximal)) {
+    if (nominal->isResilient(IGM.getSwiftModule(),
+                             ResilienceExpansion::Maximal)) {
       return false;
     }
     break;
   }
 
-  if (auto *theClass = dyn_cast<ClassDecl>(&nominal)) {
+  if (auto *theClass = dyn_cast<ClassDecl>(nominal)) {
     if (theClass->hasResilientMetadata(IGM.getSwiftModule(),
                                        ResilienceExpansion::Maximal)) {
       return false;
@@ -871,69 +866,67 @@ bool irgen::isSpecializedNominalTypeMetadataStaticallyAddressable(
     }
   }
 
-  auto *generic = type.getAnyGeneric();
-  assert(generic);
-  auto *environment = generic->getGenericEnvironment();
-  assert(environment);
-  auto substitutions =
-      type->getContextSubstitutionMap(IGM.getSwiftModule(), &nominal);
+  // Analyze the substitution map to determine if everything can be referenced
+  // statically.
+  auto substitutions = type->getContextSubstitutionMap();
 
-  auto allArgumentsAreStaticallyAddressable =
-      llvm::all_of(environment->getGenericParams(), [&](auto parameter) {
-        auto signature = environment->getGenericSignature();
-        const auto protocols = signature->getRequiredProtocols(parameter);
-        auto argument = ((Type *)parameter)->subst(substitutions);
-        auto canonicalType = argument->getCanonicalType();
-        auto witnessTablesAreReferenceable = [&]() {
-          return llvm::all_of(protocols, [&](ProtocolDecl *protocol) {
-            auto conformance =
-                signature->lookupConformance(canonicalType, protocol);
-            if (!conformance.isConcrete()) {
-              return false;
-            }
-            auto rootConformance =
-                conformance.getConcrete()->getRootConformance();
-            return !IGM.isDependentConformance(rootConformance) &&
-                   !IGM.isResilientConformance(rootConformance);
-          });
-        };
-        // TODO: Once witness tables are statically specialized, check whether
-        // the
-        //       ConformanceInfo returns nullptr from tryGetConstantTable.
-        auto isGenericWithoutPrespecializedConformance = [&]() {
-          auto genericArgument = argument->getAnyGeneric();
-          return genericArgument && genericArgument->isGenericContext() &&
-                 (protocols.size() > 0);
-        };
-        auto metadataAccessIsTrivial = [&]() {
-          if (onlyFromAccessor) {
-            // If an accessor is being used, then the accessor will be able to
-            // initialize the arguments, i.e. register classes with the ObjC
-            // runtime.
-            return irgen::
-                isCanonicalInitializableTypeMetadataStaticallyAddressable(
-                    IGM, canonicalType);
-          } else {
-            return irgen::isCanonicalCompleteTypeMetadataStaticallyAddressable(
-                IGM, canonicalType);
-          }
-        };
-        return !isGenericWithoutPrespecializedConformance() &&
-               metadataAccessIsTrivial() && witnessTablesAreReferenceable();
-      });
-  return allArgumentsAreStaticallyAddressable &&
-         IGM.getTypeInfoForUnlowered(type).isFixedSize(
-             ResilienceExpansion::Maximal);
+  // If we cannot statically reference type metadata for our replacement types,
+  // we cannot specialize.
+  for (auto replacementType : substitutions.getReplacementTypes()) {
+    auto canonicalType = replacementType->getCanonicalType();
+    if (onlyFromAccessor) {
+      // If an accessor is being used, then the accessor will be able to
+      // initialize the arguments, i.e. register classes with the ObjC
+      // runtime.
+      if (!irgen::isCanonicalInitializableTypeMetadataStaticallyAddressable(
+              IGM, canonicalType)) {
+        return false;
+      }
+    } else {
+      if (!irgen::isCanonicalCompleteTypeMetadataStaticallyAddressable(
+              IGM, canonicalType)) {
+        return false;
+      }
+    }
+  }
+
+  // If we have to instantiate resilient or dependent witness tables, we
+  // cannot prespecialize.
+  for (auto conformance : substitutions.getConformances()) {
+    auto protocol = conformance.getRequirement();
+    if (!Lowering::TypeConverter::protocolRequiresWitnessTable(protocol))
+      continue;
+
+    if (!conformance.isConcrete())
+      return false;
+
+    auto rootConformance = conformance.getConcrete()->getRootConformance();
+    if (IGM.isDependentConformance(rootConformance) ||
+        IGM.isResilientConformance(rootConformance))
+      return false;
+  }
+
+  return true;
 }
 
 bool irgen::isCompleteSpecializedNominalTypeMetadataStaticallyAddressable(
-    IRGenModule &IGM, NominalTypeDecl &nominal, CanType type,
+    IRGenModule &IGM, CanType type,
     SpecializedMetadataCanonicality canonicality) {
   if (isa<ClassType>(type) || isa<BoundGenericClassType>(type)) {
+    if (IGM.Context.LangOpts.hasFeature(Feature::Embedded)) {
+      if (type->hasArchetype()) {
+        llvm::errs() << "Cannot get metadata of generic class for type "
+                     << type << "\n";
+        llvm::report_fatal_error("cannot get metadata");
+      }
+      return true;
+    }
+
     // TODO: On platforms without ObjC interop, we can do direct access to
     // class metadata.
     return false;
   }
+
   // Prespecialized struct/enum metadata gets no dedicated accessor yet and so
   // cannot do the work of registering the generic arguments which are classes
   // with the ObjC runtime.  Concretely, the following cannot be prespecialized
@@ -941,7 +934,7 @@ bool irgen::isCompleteSpecializedNominalTypeMetadataStaticallyAddressable(
   //   Struct<Klass<Int>>
   //   Enum<Klass<Int>>
   return isSpecializedNominalTypeMetadataStaticallyAddressable(
-      IGM, nominal, type, canonicality, NotForUseOnlyFromAccessor);
+      IGM, type, canonicality, NotForUseOnlyFromAccessor);
 }
 
 /// Is there a known address for canonical specialized metadata?  The metadata
@@ -954,14 +947,17 @@ bool irgen::isCanonicalInitializableTypeMetadataStaticallyAddressable(
     return true;
   }
 
-  NominalTypeDecl *nominal;
-  if ((nominal = type->getAnyNominal()) && nominal->isGenericContext()) {
+  if (isa<ExistentialType>(type))
+    return false;
+
+  auto *nominal = type->getAnyNominal();
+  if (nominal && nominal->isGenericContext()) {
     // Prespecialized class metadata gets a dedicated accessor which can do
     // the work of registering the class and its arguments with the ObjC
     // runtime.
     // Concretely, Clazz<Klass<Int>> can be prespecialized.
     return isSpecializedNominalTypeMetadataStaticallyAddressable(
-        IGM, *nominal, type, CanonicalSpecializedMetadata,
+        IGM, type, CanonicalSpecializedMetadata,
         ForUseOnlyFromAccessor);
   }
 
@@ -977,15 +973,12 @@ bool irgen::isNoncanonicalCompleteTypeMetadataStaticallyAddressable(
   }
 
   if (isa<BoundGenericStructType>(type) || isa<BoundGenericEnumType>(type)) {
-    auto nominalType = cast<BoundGenericType>(type);
-    auto *nominalDecl = nominalType->getDecl();
-
     // Imported type metadata always requires an accessor.
-    if (isa<ClangModuleUnit>(nominalDecl->getModuleScopeContext()))
+    if (isa<ClangModuleUnit>(type->getAnyNominal()->getModuleScopeContext()))
       return false;
 
     return isCompleteSpecializedNominalTypeMetadataStaticallyAddressable(
-        IGM, *nominalDecl, type, NoncanonicalSpecializedMetadata);
+        IGM, type, NoncanonicalSpecializedMetadata);
   }
   return false;
 }
@@ -1007,11 +1000,9 @@ bool irgen::isCanonicalCompleteTypeMetadataStaticallyAddressable(
 
     if (nominalDecl->isGenericContext())
       return isCompleteSpecializedNominalTypeMetadataStaticallyAddressable(
-          IGM, *nominalDecl, type, CanonicalSpecializedMetadata);
+          IGM, type, CanonicalSpecializedMetadata);
 
     auto expansion = ResilienceExpansion::Maximal;
-
-    // Resiliently-sized metadata access always requires an accessor.
     return IGM.getTypeInfoForUnlowered(type).isFixedSize(expansion);
   }
 
@@ -1034,15 +1025,8 @@ bool irgen::isCanonicalCompleteTypeMetadataStaticallyAddressable(
     return true;
 
   if (isa<BoundGenericStructType>(type) || isa<BoundGenericEnumType>(type)) {
-    auto nominalType = cast<BoundGenericType>(type);
-    auto *nominalDecl = nominalType->getDecl();
-
-    // Imported type metadata always requires an accessor.
-    if (isa<ClangModuleUnit>(nominalDecl->getModuleScopeContext()))
-      return false;
-
     return isCompleteSpecializedNominalTypeMetadataStaticallyAddressable(
-        IGM, *nominalDecl, type, CanonicalSpecializedMetadata);
+        IGM, type, CanonicalSpecializedMetadata);
   }
 
   return false;
@@ -1066,7 +1050,7 @@ bool irgen::shouldCacheTypeMetadataAccess(IRGenModule &IGM, CanType type) {
       return true;
     if (classDecl->isGenericContext() &&
         isSpecializedNominalTypeMetadataStaticallyAddressable(
-            IGM, *classDecl, type, CanonicalSpecializedMetadata,
+            IGM, type, CanonicalSpecializedMetadata,
             ForUseOnlyFromAccessor))
       return false;
     auto strategy = IGM.getClassMetadataStrategy(classDecl);
@@ -1125,9 +1109,6 @@ MetadataAccessStrategy irgen::getTypeMetadataAccessStrategy(CanType type) {
       assert(type->hasUnboundGenericType());
     }
 
-    if (type->isForeignReferenceType())
-      return MetadataAccessStrategy::PublicUniqueAccessor;
-
     if (requiresForeignTypeMetadata(nominal))
       return MetadataAccessStrategy::ForeignAccessor;
 
@@ -1138,6 +1119,8 @@ MetadataAccessStrategy irgen::getTypeMetadataAccessStrategy(CanType type) {
     switch (getDeclLinkage(nominal)) {
     case FormalLinkage::PublicUnique:
       return MetadataAccessStrategy::PublicUniqueAccessor;
+    case FormalLinkage::PackageUnique:
+      return MetadataAccessStrategy::PackageUniqueAccessor;
     case FormalLinkage::HiddenUnique:
       return MetadataAccessStrategy::HiddenUniqueAccessor;
     case FormalLinkage::Private:
@@ -1226,8 +1209,8 @@ static MetadataResponse emitDynamicTupleTypeMetadataRef(IRGenFunction &IGF,
   {
     ConditionalDominanceScope scope(IGF);
 
-    llvm::Optional<StackAddress> labelString = emitDynamicTupleTypeLabels(
-        IGF, type, packType, shapeExpression);
+    std::optional<StackAddress> labelString =
+        emitDynamicTupleTypeLabels(IGF, type, packType, shapeExpression);
 
     // Otherwise, we know that either statically or dynamically, we have more than
     // one element. Emit the pack.
@@ -1390,11 +1373,12 @@ static llvm::Value *getFunctionParameterRef(IRGenFunction &IGF,
 /// Mapping type-level parameter flags to ABI parameter flags.
 ParameterFlags irgen::getABIParameterFlags(ParameterTypeFlags flags) {
   return ParameterFlags()
-        .withValueOwnership(flags.getValueOwnership())
-        .withVariadic(flags.isVariadic())
-        .withAutoClosure(flags.isAutoClosure())
-        .withNoDerivative(flags.isNoDerivative())
-        .withIsolated(flags.isIsolated());
+      .withOwnership(asParameterOwnership(flags.getValueOwnership()))
+      .withVariadic(flags.isVariadic())
+      .withAutoClosure(flags.isAutoClosure())
+      .withNoDerivative(flags.isNoDerivative())
+      .withIsolated(flags.isIsolated())
+      .withSending(flags.isSending());
 }
 
 static std::pair<FunctionTypeFlags, ExtendedFunctionTypeFlags>
@@ -1426,18 +1410,47 @@ getFunctionTypeFlags(CanFunctionType type) {
     break;
   }
 
+  // Compute the set of suppressed protocols.
+  InvertibleProtocolSet InvertedProtocols;
+  for (auto invertibleKind : InvertibleProtocolSet::allKnown()) {
+    switch (invertibleKind) {
+    case InvertibleProtocolKind::Copyable: {
+      // If the function type is noncopyable, note that in the suppressed
+      // protocols.
+      auto proto =
+        type->getASTContext().getProtocol(KnownProtocolKind::Copyable);
+      if (proto && lookupConformance(type, proto).isInvalid())
+        InvertedProtocols.insert(invertibleKind);
+      break;
+    }
+
+    case InvertibleProtocolKind::Escapable:
+      // We intentionally do not record the "escapable" bit here, because it's
+      // already in the normal function type flags. The runtime will
+      // introduce it as necessary.
+      break;
+    }
+  }
+
+  auto isolation = type->getIsolation();
+
   auto extFlags = ExtendedFunctionTypeFlags()
-      .withTypedThrows(!type->getThrownError().isNull());
-  
+                      .withTypedThrows(!type->getThrownError().isNull())
+                      .withSendingResult(type->hasSendingResult())
+                      .withInvertedProtocols(InvertedProtocols);
+
+  if (isolation.isErased())
+    extFlags = extFlags.withIsolatedAny();
+
   auto flags = FunctionTypeFlags()
       .withConvention(metadataConvention)
       .withAsync(type->isAsync())
-      .withConcurrent(type->isSendable())
+      .withSendable(type->isSendable())
       .withThrows(type->isThrowing())
       .withParameterFlags(hasParameterFlags)
       .withEscaping(isEscaping)
       .withDifferentiable(type->isDifferentiable())
-      .withGlobalActor(!type->getGlobalActor().isNull())
+      .withGlobalActor(isolation.isGlobalActor())
       .withExtendedFlags(extFlags.getIntValue() != 0);
 
   return std::make_pair(flags, extFlags);
@@ -1641,7 +1654,8 @@ static MetadataResponse emitFunctionTypeMetadataRef(IRGenFunction &IGF,
 
   default:
     assert((!params.empty() || type->isDifferentiable() ||
-            type->getGlobalActor()) &&
+            !type->getIsolation().isNonIsolated() ||
+            type->getThrownError()) &&
            "0 parameter case should be specialized unless it is a "
            "differentiable function or has a global actor");
 
@@ -1968,6 +1982,16 @@ namespace {
       
     MetadataResponse visitExistentialType(CanExistentialType type,
                                           DynamicMetadataRequest request) {
+      if (auto *PCT =
+              type->getConstraintType()->getAs<ProtocolCompositionType>()) {
+        auto constraintTy = PCT->withoutMarkerProtocols();
+        if (constraintTy->getClassOrBoundGenericClass()) {
+          auto response = IGF.emitTypeMetadataRef(
+              constraintTy->getCanonicalType(), request);
+          return setLocal(type, response);
+        }
+      }
+
       if (auto metadata = tryGetLocal(type, request))
         return metadata;
 
@@ -2190,6 +2214,11 @@ namespace {
     MetadataResponse visitErrorType(CanErrorType type,
                                     DynamicMetadataRequest request) {
       llvm_unreachable("error type should not appear in IRGen");
+    }
+
+    MetadataResponse visitIntegerType(CanIntegerType type,
+                                      DynamicMetadataRequest request) {
+      llvm_unreachable("integer type should not appear in IRGen");
     }
 
     // These types are artificial types used for internal purposes and
@@ -2692,8 +2721,7 @@ irgen::emitCanonicalSpecializedGenericTypeMetadataAccessFunction(
   assert(!theType->hasUnboundGenericType());
 
   auto requirements = GenericTypeRequirements(IGF.IGM, nominal);
-  auto substitutions =
-      theType->getContextSubstitutionMap(IGF.IGM.getSwiftModule(), nominal);
+  auto substitutions = theType->getContextSubstitutionMap();
   for (auto requirement : requirements.getRequirements()) {
     if (requirement.isAnyWitnessTable()) {
       continue;
@@ -3067,8 +3095,7 @@ static bool canIssueIncompleteMetadataRequests(IRGenModule &IGM) {
   // We can only answer blocking complete metadata requests with the <=5.1
   // runtime ABI entry points.
   auto &context = IGM.getSwiftModule()->getASTContext();
-  auto deploymentAvailability =
-      AvailabilityContext::forDeploymentTarget(context);
+  auto deploymentAvailability = AvailabilityRange::forDeploymentTarget(context);
   return deploymentAvailability.isContainedIn(
       context.getTypesInAbstractMetadataStateAvailability());
 }
@@ -3221,8 +3248,8 @@ emitMetadataAccessByMangledName(IRGenFunction &IGF, CanType type,
     stringAddr = subIGF.Builder.CreateIntToPtr(stringAddr, IGM.Int8PtrTy);
 
     llvm::CallInst *call;
-    bool signedDescriptor = IGM.getAvailabilityContext().isContainedIn(
-      IGM.Context.getSignedDescriptorAvailability());
+    bool signedDescriptor = IGM.getAvailabilityRange().isContainedIn(
+        IGM.Context.getSignedDescriptorAvailability());
     if (request.isStaticallyAbstract()) {
       call = signedDescriptor ?
         subIGF.Builder.CreateCall(
@@ -3352,7 +3379,7 @@ IRGenFunction::emitTypeMetadataRef(CanType type,
       !isMetadataAllowedInEmbedded(type)) {
     llvm::errs() << "Metadata pointer requested in embedded Swift for type "
                  << type << "\n";
-    assert(0 && "metadata used in embedded mode");
+    llvm::report_fatal_error("metadata used in embedded mode");
   }
 
   type = IGM.getRuntimeReifiedType(type);
@@ -3387,6 +3414,7 @@ llvm::Function *irgen::getOrCreateTypeMetadataAccessFunction(IRGenModule &IGM,
   switch (getTypeMetadataAccessStrategy(type)) {
   case MetadataAccessStrategy::ForeignAccessor:
   case MetadataAccessStrategy::PublicUniqueAccessor:
+  case MetadataAccessStrategy::PackageUniqueAccessor:
   case MetadataAccessStrategy::HiddenUniqueAccessor:
   case MetadataAccessStrategy::PrivateAccessor:
     return getOtherwiseDefinedTypeMetadataAccessFunction(IGM, type);
@@ -3555,6 +3583,15 @@ IRGenFunction::emitTypeMetadataRefForLayout(SILType ty,
   auto response = emitTypeMetadataRef(layoutEquivalentType, request);
   setScopedLocalTypeMetadataForLayout(ty.getObjectType(), response);
   return response.getMetadata();
+}
+
+llvm::Value *IRGenFunction::emitValueGenericRef(CanType type) {
+  if (auto integer = type->getAs<IntegerType>()) {
+    return llvm::ConstantInt::get(IGM.SizeTy,
+                    integer->getValue().zextOrTrunc(IGM.SizeTy->getBitWidth()));
+  }
+
+  return tryGetLocalTypeData(type, LocalTypeDataKind::forValue());
 }
 
 namespace {

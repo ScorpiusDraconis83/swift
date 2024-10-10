@@ -14,6 +14,7 @@
 
 #include "SILCombiner.h"
 #include "swift/AST/SemanticAttrs.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/STLExtras.h"
 #include "swift/SIL/BasicBlockBits.h"
 #include "swift/SIL/DebugUtils.h"
@@ -379,7 +380,7 @@ public:
     // analysis assumes memory is deinitialized on all paths, which is not the
     // case for discarded values. Eventually copyable types may also be
     // discarded; to support that, we will leave a drop_deinit_addr in place.
-    if (ASI->getType().getASTType()->isNoncopyable()) {
+    if (ASI->getType().isMoveOnly(/*orWrapped=*/false)) {
       LegalUsers = false;
       return;
     }
@@ -572,8 +573,15 @@ bool SILCombiner::optimizeStackAllocatedEnum(AllocStackInst *AS) {
   }
 
   // Second step: replace the enum alloc_stack with a payload alloc_stack.
+  Builder.setCurrentDebugScope(AS->getDebugScope());
   auto *newAlloc = Builder.createAllocStack(
-      AS->getLoc(), payloadType, AS->getVarInfo(), AS->hasDynamicLifetime());
+      AS->getLoc(), payloadType, {}, AS->hasDynamicLifetime(), IsNotLexical,
+      IsNotFromVarDecl, DoesNotUseMoveableValueDebugInfo, true);
+  if (auto varInfo = AS->getVarInfo()) {
+    // TODO: Add support for op_enum_fragment
+    // For now, we can't represent this variable correctly, so we drop it.
+    Builder.createDebugValue(AS->getLoc(), SILUndef::get(AS), *varInfo);
+  }
 
   while (!AS->use_empty()) {
     Operand *use = *AS->use_begin();
@@ -610,11 +618,9 @@ bool SILCombiner::optimizeStackAllocatedEnum(AllocStackInst *AS) {
         break;
       }
       case SILInstructionKind::DebugValueInst:
-        if (DebugValueInst::hasAddrVal(user)) {
-          eraseInstFromFunction(*user);
-          break;
-        }
-        LLVM_FALLTHROUGH;
+        // TODO: Add support for op_enum_fragment
+        use->set(SILUndef::get(AS));
+        break;
       default:
         llvm_unreachable("unexpected alloc_stack user");
     }
@@ -653,8 +659,20 @@ SILInstruction *SILCombiner::visitAllocStackInst(AllocStackInst *AS) {
   if (IEI && !OEI &&
       !IEI->getLoweredConcreteType().hasOpenedExistential()) {
     assert(!IEI->getLoweredConcreteType().isOpenedExistential());
+    Builder.setCurrentDebugScope(AS->getDebugScope());
+    auto varInfo = AS->getVarInfo();
+    if (varInfo) {
+      if (varInfo->Type == AS->getElementType()) {
+        varInfo->Type = {}; // Lower the variable's type too.
+      } else {
+        // Cannot salvage the variable, its type has changed and its expression
+        // cannot be rewritten.
+        Builder.createDebugValue(AS->getLoc(), SILUndef::get(AS), *varInfo);
+        varInfo = {};
+      }
+    }
     auto *ConcAlloc = Builder.createAllocStack(
-        AS->getLoc(), IEI->getLoweredConcreteType(), AS->getVarInfo());
+        AS->getLoc(), IEI->getLoweredConcreteType(), varInfo);
     IEI->replaceAllUsesWith(ConcAlloc);
     eraseInstFromFunction(*IEI);
 
@@ -827,6 +845,15 @@ SILInstruction *SILCombiner::visitCondFailInst(CondFailInst *CFI) {
   ValueSet DefinedValues(CFI->getFunction());
   for (auto Iter = std::next(CFI->getIterator());
        Iter != CFI->getParent()->end(); ++Iter) {
+
+    if (isBeginScopeMarker(&*Iter)) {
+      for (auto *scopeUse : cast<SingleValueInstruction>(&*Iter)->getUses()) {
+        auto *scopeEnd = scopeUse->getUser();
+        if (isEndOfScopeMarker(scopeEnd)) {
+          ToRemove.push_back(scopeEnd);
+        }
+      }
+    }
     if (!CFI->getFunction()->hasOwnership()) {
       ToRemove.push_back(&*Iter);
       continue;
@@ -853,6 +880,9 @@ SILInstruction *SILCombiner::visitCondFailInst(CondFailInst *CFI) {
     return nullptr;
 
   for (auto *Inst : ToRemove) {
+    if (Inst->isDeleted())
+      continue;
+
     // Replace any still-remaining uses with undef and erase.
     Inst->replaceAllUsesOfAllResultsWithUndef();
     eraseInstFromFunction(*Inst);
@@ -865,14 +895,20 @@ SILInstruction *SILCombiner::visitCondFailInst(CondFailInst *CFI) {
   return nullptr;
 }
 
-/// Create a value from stores to an address.
+/// Whether there exists a unique value to which \p addr is always initialized
+/// at \p forInst.
 ///
-/// If there are only stores to \p addr, return the stored value. Also, if there
-/// are address projections, create aggregate instructions for it.
-/// If builder is null, it's just a dry-run to check if it's possible.
-static SILValue createValueFromAddr(SILValue addr, SILBuilder *builder,
-                                    SILLocation loc) {
-  SmallVector<SILValue, 4> elems;
+/// If \p builder is passed, create the value using it.  If \p addr is
+/// initialized piecewise via initializations of tuple element memory, the full
+/// tuple is constructed via the builder.
+///
+/// A best effort.
+/// TODO: Construct structs.
+///       Handle stores of identical values on multiple paths.
+static std::optional<std::pair<SILValue, SILInstruction *>>
+createValueFromAddr(SILValue addr, SILInstruction *forInst, DominanceInfo *DI,
+                    SILBuilder *builder, SILLocation loc) {
+  SmallVector<std::optional<std::pair<SILValue, SILInstruction *>>, 4> pairs;
   enum Kind {
     none, store, tuple
   } kind = none;
@@ -884,7 +920,7 @@ static SILValue createValueFromAddr(SILValue addr, SILBuilder *builder,
 
     auto *st = dyn_cast<StoreInst>(user);
     if (st && kind == none && st->getDest() == addr) {
-      elems.push_back(st->getSrc());
+      pairs.push_back({{st->getSrc(), st}});
       kind = store;
       // We cannot just return st->getSrc() here because we also have to check
       // if the store destination is the only use of addr.
@@ -893,35 +929,55 @@ static SILValue createValueFromAddr(SILValue addr, SILBuilder *builder,
 
     if (auto *telem = dyn_cast<TupleElementAddrInst>(user)) {
       if (kind == none) {
-        elems.resize(addr->getType().castTo<TupleType>()->getNumElements());
+        pairs.resize(addr->getType().castTo<TupleType>()->getNumElements());
         kind = tuple;
       }
       if (kind == tuple) {
-        if (elems[telem->getFieldIndex()])
-          return SILValue();
-        elems[telem->getFieldIndex()] = createValueFromAddr(telem, builder, loc);
+        if (pairs[telem->getFieldIndex()]) {
+          // Already found a tuple_element_addr at this index.  Assume that a
+          // different value is stored to addr by it.
+          return std::nullopt;
+        }
+        pairs[telem->getFieldIndex()] =
+            createValueFromAddr(telem, forInst, DI, builder, loc);
         continue;
       }
     }
     // TODO: handle StructElementAddrInst to create structs.
 
-    return SILValue();
+    return std::nullopt;
   }
   switch (kind) {
   case none:
-    return SILValue();
+    return std::nullopt;
   case store:
-    assert(elems.size() == 1);
-    return elems[0];
+    assert(pairs.size() == 1);
+    {
+      auto pair = pairs[0];
+      assert(pair.has_value());
+      bool isEmpty = pair->first->getType().isEmpty(*addr->getFunction());
+      if (isEmpty && !DI->properlyDominates(pair->second, forInst))
+        return std::nullopt;
+      return pair;
+    }
   case tuple:
-    if (std::any_of(elems.begin(), elems.end(),
-                    [](SILValue v){ return !(bool)v; }))
-      return SILValue();
+    if (std::any_of(pairs.begin(), pairs.end(), [&](auto pair) {
+          return !pair.has_value() ||
+                 (pair->first->getType().isEmpty(*addr->getFunction()) &&
+                  !DI->properlyDominates(pair->second, forInst));
+        }))
+      return std::nullopt;
     if (builder) {
-      return builder->createTuple(loc, addr->getType().getObjectType(), elems);
+      SmallVector<SILValue, 4> elements;
+      for (auto pair : pairs) {
+        elements.push_back(pair->first);
+      }
+      auto *tuple =
+          builder->createTuple(loc, addr->getType().getObjectType(), elements);
+      return {{tuple, tuple}};
     }
     // Just return anything not null for the dry-run.
-    return elems[0];
+    return pairs[0];
   }
   llvm_unreachable("invalid kind");
 }
@@ -945,23 +1001,11 @@ static SILValue createValueFromAddr(SILValue addr, SILBuilder *builder,
 /// We leave the cleaning up to mem2reg.
 SILInstruction *
 SILCombiner::visitInjectEnumAddrInst(InjectEnumAddrInst *IEAI) {
-  if (IEAI->getFunction()->hasOwnership())
-    return nullptr;
-
+  auto *func = IEAI->getFunction();
   // Given an inject_enum_addr of a concrete type without payload, promote it to
   // a store of an enum. Mem2reg/load forwarding will clean things up for us. We
   // can't handle the payload case here due to the flow problems caused by the
   // dependency in between the enum and its data.
-
-  // Disable this for empty typle type because empty tuple stack locations maybe
-  // uninitialized. And converting to value form loses tag information.
-  if (IEAI->getElement()->hasAssociatedValues()) {
-    SILType elemType = IEAI->getOperand()->getType().getEnumElementType(
-        IEAI->getElement(), IEAI->getFunction());
-    if (elemType.isEmpty(*IEAI->getFunction())) {
-      return nullptr;
-    }
-  }
 
   assert(IEAI->getOperand()->getType().isAddress() && "Must be an address");
   Builder.setCurrentDebugScope(IEAI->getDebugScope());
@@ -1086,8 +1130,10 @@ SILCombiner::visitInjectEnumAddrInst(InjectEnumAddrInst *IEAI) {
     EnumInst *E =
       Builder.createEnum(IEAI->getLoc(), SILValue(), IEAI->getElement(),
                           IEAI->getOperand()->getType().getObjectType());
-    Builder.createStore(IEAI->getLoc(), E, IEAI->getOperand(),
-                        StoreOwnershipQualifier::Unqualified);
+    auto storeQual = !func->hasOwnership()
+                         ? StoreOwnershipQualifier::Unqualified
+                         : StoreOwnershipQualifier::Trivial;
+    Builder.createStore(IEAI->getLoc(), E, IEAI->getOperand(), storeQual);
     return eraseInstFromFunction(*IEAI);
   }
 
@@ -1195,17 +1241,25 @@ SILCombiner::visitInjectEnumAddrInst(InjectEnumAddrInst *IEAI) {
   //   store %payload1 to %elem1_addr
   //   inject_enum_addr %enum_addr, $EnumType.case
   //
-  if (createValueFromAddr(DataAddrInst, nullptr, DataAddrInst->getLoc())) {
-    SILValue en =
-      createValueFromAddr(DataAddrInst, &Builder, DataAddrInst->getLoc());
+  auto DI = DA->get(IEAI->getFunction());
+  if (createValueFromAddr(DataAddrInst, IEAI, DI, nullptr,
+                          DataAddrInst->getLoc())) {
+    SILValue en = createValueFromAddr(DataAddrInst, IEAI, DI, &Builder,
+                                      DataAddrInst->getLoc())
+                      ->first;
     assert(en);
 
     // In that case, create the payload enum/store.
     EnumInst *E = Builder.createEnum(
         DataAddrInst->getLoc(), en, DataAddrInst->getElement(),
         DataAddrInst->getOperand()->getType().getObjectType());
+    auto storeQual = !func->hasOwnership()
+                         ? StoreOwnershipQualifier::Unqualified
+                     : DataAddrInst->getOperand()->getType().isTrivial(*func)
+                         ? StoreOwnershipQualifier::Trivial
+                         : StoreOwnershipQualifier::Init;
     Builder.createStore(DataAddrInst->getLoc(), E, DataAddrInst->getOperand(),
-                        StoreOwnershipQualifier::Unqualified);
+                        storeQual);
     // Cleanup.
     getInstModCallbacks().notifyWillBeDeleted(DataAddrInst);
     deleter.forceDeleteWithUsers(DataAddrInst);
@@ -1229,8 +1283,16 @@ SILCombiner::visitInjectEnumAddrInst(InjectEnumAddrInst *IEAI) {
   //  store %1 to %nopayload_addr
   //
   auto *AI = dyn_cast_or_null<ApplyInst>(getSingleNonDebugUser(DataAddrInst));
-  if (!AI)
+  bool hasEmptyAssociatedType =
+      IEAI->getElement()->hasAssociatedValues()
+          ? IEAI->getOperand()
+                ->getType()
+                .getEnumElementType(IEAI->getElement(), func)
+                .isEmpty(*func)
+          : false;
+  if (!AI || (hasEmptyAssociatedType && !DI->properlyDominates(AI, IEAI)))
     return nullptr;
+
   unsigned ArgIdx = 0;
   Operand *EnumInitOperand = nullptr;
   for (auto &Opd : AI->getArgumentOperands()) {
@@ -1249,19 +1311,47 @@ SILCombiner::visitInjectEnumAddrInst(InjectEnumAddrInst *IEAI) {
     return nullptr;
   }
 
+  SILType elemType = IEAI->getOperand()->getType().getEnumElementType(
+      IEAI->getElement(), IEAI->getFunction());
+  auto *structDecl = elemType.getStructOrBoundGenericStruct();
+
+  // We cannot create a struct when it has unreferenceable storage.
+  if (elemType.isEmpty(*IEAI->getFunction()) && structDecl &&
+      findUnreferenceableStorage(structDecl, elemType, IEAI->getFunction())) {
+    return nullptr;
+  }
+
   // Localize the address access.
   Builder.setInsertionPoint(AI);
   auto *AllocStack = Builder.createAllocStack(DataAddrInst->getLoc(),
                                               EnumInitOperand->get()->getType());
   EnumInitOperand->set(AllocStack);
   Builder.setInsertionPoint(std::next(SILBasicBlock::iterator(AI)));
-  SILValue Load(Builder.createLoad(DataAddrInst->getLoc(), AllocStack,
-                                   LoadOwnershipQualifier::Unqualified));
+  SILValue enumValue;
+
+  // If it is an empty type, apply may not initialize it.
+  // Create an empty value of the empty type and store it to a new local.
+  if (elemType.isEmpty(*IEAI->getFunction())) {
+    enumValue = createEmptyAndUndefValue(
+        elemType.getObjectType(), &*Builder.getInsertionPoint(),
+        Builder.getBuilderContext(), /*noUndef*/ true);
+  } else {
+    auto loadQual = !func->hasOwnership() ? LoadOwnershipQualifier::Unqualified
+                    : DataAddrInst->getOperand()->getType().isTrivial(*func)
+                        ? LoadOwnershipQualifier::Trivial
+                        : LoadOwnershipQualifier::Take;
+    enumValue =
+        Builder.createLoad(DataAddrInst->getLoc(), AllocStack, loadQual);
+  }
   EnumInst *E = Builder.createEnum(
-      DataAddrInst->getLoc(), Load, DataAddrInst->getElement(),
+      DataAddrInst->getLoc(), enumValue, DataAddrInst->getElement(),
       DataAddrInst->getOperand()->getType().getObjectType());
+  auto storeQual = !func->hasOwnership() ? StoreOwnershipQualifier::Unqualified
+                   : DataAddrInst->getOperand()->getType().isTrivial(*func)
+                       ? StoreOwnershipQualifier::Trivial
+                       : StoreOwnershipQualifier::Init;
   Builder.createStore(DataAddrInst->getLoc(), E, DataAddrInst->getOperand(),
-                      StoreOwnershipQualifier::Unqualified);
+                      storeQual);
   Builder.createDeallocStack(DataAddrInst->getLoc(), AllocStack);
   eraseInstFromFunction(*DataAddrInst);
   return eraseInstFromFunction(*IEAI);
@@ -1468,9 +1558,15 @@ SILInstruction *SILCombiner::visitCondBranchInst(CondBranchInst *CBI) {
     if (!CBI->getTrueArgs().empty() || !CBI->getFalseArgs().empty())
       return nullptr;
     auto EnumOperandTy = SEI->getEnumOperand()->getType();
-    // Type should be loadable
-    if (!EnumOperandTy.isLoadable(*SEI->getFunction()))
+    // Type should be loadable and copyable.
+    // TODO: Generalize to work without copying address-only or noncopyable
+    // values.
+    if (!EnumOperandTy.isLoadable(*SEI->getFunction())) {
       return nullptr;
+    }
+    if (EnumOperandTy.isMoveOnly()) {
+      return nullptr;
+    }
 
     // Result of the select_enum should be a boolean.
     if (SEI->getType() != CBI->getCondition()->getType())
@@ -1691,34 +1787,38 @@ SILInstruction *SILCombiner::visitFixLifetimeInst(FixLifetimeInst *fli) {
   return nullptr;
 }
 
-static llvm::Optional<SILType>
+static std::optional<SILType>
 shouldReplaceCallByContiguousArrayStorageAnyObject(SILFunction &F,
                                                    CanType storageMetaTy) {
   auto metaTy = dyn_cast<MetatypeType>(storageMetaTy);
   if (!metaTy || metaTy->getRepresentation() != MetatypeRepresentation::Thick)
-    return llvm::None;
+    return std::nullopt;
 
   auto storageTy = metaTy.getInstanceType()->getCanonicalType();
   if (!storageTy->is_ContiguousArrayStorage())
-    return llvm::None;
+    return std::nullopt;
 
   auto boundGenericTy = dyn_cast<BoundGenericType>(storageTy);
   if (!boundGenericTy)
-    return llvm::None;
+    return std::nullopt;
 
   // On SwiftStdlib 5.7 we can replace the call.
   auto &ctxt = storageMetaTy->getASTContext();
-  auto deployment = AvailabilityContext::forDeploymentTarget(ctxt);
+  auto deployment = AvailabilityRange::forDeploymentTarget(ctxt);
   if (!deployment.isContainedIn(ctxt.getSwift57Availability()))
-    return llvm::None;
+    return std::nullopt;
 
   auto genericArgs = boundGenericTy->getGenericArgs();
   if (genericArgs.size() != 1)
-    return llvm::None;
+    return std::nullopt;
 
   auto ty = genericArgs[0]->getCanonicalType();
   if (!ty->getClassOrBoundGenericClass() && !ty->isObjCExistentialType())
-    return llvm::None;
+    return std::nullopt;
+  // C++ foreign reference types have custom release/retain operations and are
+  // not AnyObjects.
+  if (ty->isForeignReferenceType())
+    return std::nullopt;
 
   auto anyObjectTy = ctxt.getAnyObjectType();
   auto arrayStorageTy =
@@ -1906,24 +2006,6 @@ SILInstruction *SILCombiner::visitMarkDependenceInst(MarkDependenceInst *mdi) {
   return nullptr;
 }
 
-SILInstruction *
-SILCombiner::visitClassifyBridgeObjectInst(ClassifyBridgeObjectInst *cboi) {
-  auto *urc = dyn_cast<UncheckedRefCastInst>(cboi->getOperand());
-  if (!urc)
-    return nullptr;
-
-  auto type = urc->getOperand()->getType().getASTType();
-  if (ClassDecl *cd = type->getClassOrBoundGenericClass()) {
-    if (!cd->isObjC()) {
-      auto int1Ty = SILType::getBuiltinIntegerType(1, Builder.getASTContext());
-      SILValue zero = Builder.createIntegerLiteral(cboi->getLoc(), int1Ty, 0);
-      return Builder.createTuple(cboi->getLoc(), {zero, zero});
-    }
-  }
-
-  return nullptr;
-}
-
 /// Returns true if reference counting and debug_value users of a global_value
 /// can be deleted.
 static bool checkGlobalValueUsers(SILValue val,
@@ -1995,7 +2077,8 @@ SILCombiner::visitDifferentiableFunctionExtractInst(DifferentiableFunctionExtrac
       return nullptr;
 
     std::tie(newValue, std::ignore) =
-      castValueToABICompatibleType(&Builder, DFEI->getLoc(),
+      castValueToABICompatibleType(&Builder, parentTransform->getPassManager(),
+                                   DFEI->getLoc(),
                                    newValue,
                                    newValue->getType(), DFEI->getType(), {});
   }

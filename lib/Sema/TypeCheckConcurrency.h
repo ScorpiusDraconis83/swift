@@ -23,6 +23,8 @@
 #include "swift/AST/Expr.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/Type.h"
+#include "swift/Sema/Concurrency.h"
+
 #include <cassert>
 
 namespace swift {
@@ -42,6 +44,7 @@ class EnumElementDecl;
 class Expr;
 class FuncDecl;
 class Initializer;
+class LookupResult;
 class PatternBindingDecl;
 class ProtocolConformance;
 class TopLevelCodeDecl;
@@ -85,6 +88,10 @@ enum class SendableCheckReason {
 /// Check that the actor isolation of an override matches that of its
 /// overridden declaration.
 void checkOverrideActorIsolation(ValueDecl *value);
+
+/// Diagnose global state that is not either immutable plus Sendable or isolated
+/// to a global actor.
+void checkGlobalIsolation(VarDecl *var);
 
 /// Determine whether the given context requires strict concurrency checking,
 /// e.g., because it uses concurrency features directly or because it's in
@@ -215,14 +222,16 @@ struct ActorReferenceResult {
   const ActorIsolation isolation;
 
 private:
-  static ActorReferenceResult forSameConcurrencyDomain(
-      ActorIsolation isolation, Options options = llvm::None);
+  static ActorReferenceResult
+  forSameConcurrencyDomain(ActorIsolation isolation,
+                           Options options = std::nullopt);
 
   static ActorReferenceResult forEntersActor(
       ActorIsolation isolation, Options options);
 
-  static ActorReferenceResult forExitsActorToNonisolated(
-      ActorIsolation isolation, Options options = llvm::None);
+  static ActorReferenceResult
+  forExitsActorToNonisolated(ActorIsolation isolation,
+                             Options options = std::nullopt);
 
 public:
   /// Determine what happens when referencing the given declaration from the
@@ -238,10 +247,10 @@ public:
   /// of a member access or a parameter passed to a function.
   static ActorReferenceResult forReference(
       ConcreteDeclRef declRef, SourceLoc declRefLoc, const DeclContext *fromDC,
-      llvm::Optional<VarRefUseEnv> useKind = llvm::None,
-      llvm::Optional<ReferencedActor> actorInstance = llvm::None,
-      llvm::Optional<ActorIsolation> knownDeclIsolation = llvm::None,
-      llvm::Optional<ActorIsolation> knownContextIsolation = llvm::None,
+      std::optional<VarRefUseEnv> useKind = std::nullopt,
+      std::optional<ReferencedActor> actorInstance = std::nullopt,
+      std::optional<ActorIsolation> knownDeclIsolation = std::nullopt,
+      std::optional<ActorIsolation> knownContextIsolation = std::nullopt,
       llvm::function_ref<ActorIsolation(AbstractClosureExpr *)>
           getClosureActorIsolation = __AbstractClosureExpr_getActorIsolation);
 
@@ -252,10 +261,12 @@ struct IsolationError {
 
   SourceLoc loc;
 
+  bool preconcurrency;
+  
   Diagnostic diag;
 
 public:
-  IsolationError(SourceLoc loc, Diagnostic diag) : loc(loc), diag(diag) {}
+  IsolationError(SourceLoc loc, bool preconcurrency, Diagnostic diag) : loc(loc), preconcurrency(preconcurrency), diag(diag) {}
 
 };
 
@@ -303,14 +314,12 @@ using FunctionCheckOptions = OptionSet<FunctionCheckKind>;
 ///
 /// \returns true if an problem was detected, false otherwise.
 bool diagnoseNonSendableTypesInReference(
-    Expr *base, ConcreteDeclRef declRef,
-    const DeclContext *fromDC, SourceLoc refLoc,
-    SendableCheckReason refKind,
-    llvm::Optional<ActorIsolation> knownIsolation = llvm::None,
-    FunctionCheckOptions funcCheckOptions =
-        (FunctionCheckOptions() |
-         FunctionCheckKind::Params |
-         FunctionCheckKind::Results),
+    Expr *base, ConcreteDeclRef declRef, const DeclContext *fromDC,
+    SourceLoc refLoc, SendableCheckReason refKind,
+    std::optional<ActorIsolation> knownIsolation = std::nullopt,
+    FunctionCheckOptions funcCheckOptions = (FunctionCheckOptions() |
+                                             FunctionCheckKind::Params |
+                                             FunctionCheckKind::Results),
     SourceLoc diagnoseLoc = SourceLoc());
 
 /// Produce a diagnostic for a missing conformance to Sendable.
@@ -323,6 +332,14 @@ void diagnoseMissingExplicitSendable(NominalTypeDecl *nominal);
 
 /// Warn about deprecated `Executor.enqueue` implementations.
 void tryDiagnoseExecutorConformance(ASTContext &C, const NominalTypeDecl *nominal, ProtocolDecl *proto);
+
+/// Whether to suppress deprecation diagnostics for \p decl in \p declContext
+/// because \p decl is a deprecated decl from the `_Concurrency` module and is
+/// being referenced from the implementation of the `_Concurrency` module. This
+/// prevents unaddressable warnings in the standard library build. Ideally, a
+/// language feature would obviate the need for this.
+bool shouldIgnoreDeprecationOfConcurrencyDecl(const Decl *decl,
+                                              DeclContext *declContext);
 
 // Get a concrete reference to a declaration
 ConcreteDeclRef getDeclRefInContext(ValueDecl *value);
@@ -361,11 +378,11 @@ static inline bool isImplicitSendableCheck(SendableCheck check) {
 /// Describes the context in which a \c Sendable check occurs.
 struct SendableCheckContext {
   const DeclContext * const fromDC;
-  const llvm::Optional<SendableCheck> conformanceCheck;
+  const std::optional<SendableCheck> conformanceCheck;
 
   SendableCheckContext(
       const DeclContext *fromDC,
-      llvm::Optional<SendableCheck> conformanceCheck = llvm::None)
+      std::optional<SendableCheck> conformanceCheck = std::nullopt)
       : fromDC(fromDC), conformanceCheck(conformanceCheck) {}
 
   /// Determine the default diagnostic behavior for a missing/unavailable
@@ -378,6 +395,10 @@ struct SendableCheckContext {
   /// Determine the diagnostic behavior when referencing the given nominal
   /// type in this context.
   DiagnosticBehavior diagnosticBehavior(NominalTypeDecl *nominal) const;
+
+  std::optional<DiagnosticBehavior> preconcurrencyBehavior(
+      Decl *decl,
+      bool ignoreExplicitConformance = false) const;
 
   /// Whether we are in an explicit conformance to Sendable.
   bool isExplicitSendableConformance() const;
@@ -422,18 +443,64 @@ bool diagnoseNonSendableTypes(
     Diag<Type, DiagArgs...> diag,
     typename detail::Identity<DiagArgs>::type ...diagArgs) {
 
-    ASTContext &ctx = fromContext.fromDC->getASTContext();
-    return diagnoseNonSendableTypes(
-        type, fromContext, derivedConformance, typeLoc,
-        [&](Type specificType, DiagnosticBehavior behavior) {
+  ASTContext &ctx = fromContext.fromDC->getASTContext();
+  return diagnoseNonSendableTypes(
+      type, fromContext, derivedConformance, typeLoc,
+      [&](Type specificType, DiagnosticBehavior behavior) {
+        auto preconcurrency =
+          fromContext.preconcurrencyBehavior(specificType->getAnyNominal());
 
-          if (behavior != DiagnosticBehavior::Ignore) {
-            ctx.Diags.diagnose(diagnoseLoc, diag, type, diagArgs...)
-                .limitBehavior(behavior);
-          }
+        ctx.Diags.diagnose(diagnoseLoc, diag, type, diagArgs...)
+            .limitBehaviorUntilSwiftVersion(behavior, 6)
+            .limitBehaviorIf(preconcurrency);
 
-          return false;
-        });
+        return (behavior == DiagnosticBehavior::Ignore ||
+                preconcurrency == DiagnosticBehavior::Ignore);
+      });
+}
+
+/// Emit a diagnostic if there are any non-Sendable types for which
+/// the Sendable diagnostic wasn't suppressed. This diagnostic will
+/// only be emitted once, but there might be additional notes for the
+/// various occurrences of Sendable types.
+///
+/// \param typeLoc is the source location of the type being diagnosed
+///
+/// \param diagnoseLoc is the source location at which the main diagnostic should
+/// be reported, which can differ from typeLoc
+///
+/// \returns \c true if any diagnostics.
+template<typename ...DiagArgs>
+bool diagnoseIfAnyNonSendableTypes(
+    Type type, SendableCheckContext fromContext,
+    Type derivedConformance,
+    SourceLoc typeLoc, SourceLoc diagnoseLoc,
+    Diag<Type, DiagArgs...> diag,
+    typename detail::Identity<DiagArgs>::type ...diagArgs) {
+
+  ASTContext &ctx = fromContext.fromDC->getASTContext();
+  bool diagnosed = false;
+  diagnoseNonSendableTypes(
+      type, fromContext, derivedConformance, typeLoc,
+      [&](Type specificType, DiagnosticBehavior behavior) {
+        auto preconcurrency =
+          fromContext.preconcurrencyBehavior(specificType->getAnyNominal());
+
+        if (behavior == DiagnosticBehavior::Ignore ||
+            preconcurrency == DiagnosticBehavior::Ignore)
+          return true;
+
+        if (!diagnosed) {
+          ctx.Diags.diagnose(diagnoseLoc, diag, type, diagArgs...)
+              .limitBehaviorUntilSwiftVersion(behavior, 6)
+              .limitBehaviorIf(preconcurrency);
+          diagnosed = true;
+        }
+
+        return false;
+      });
+
+  return diagnosed;
 }
 
 /// Diagnose any non-Sendable types that occur within the given type, using
@@ -473,15 +540,10 @@ bool diagnoseSendabilityErrorBasedOn(
     NominalTypeDecl *nominal, SendableCheckContext fromContext,
     llvm::function_ref<bool(DiagnosticBehavior)> diagnose);
 
-/// If any of the imports in this source file was @preconcurrency but
-/// there were no diagnostics downgraded or suppressed due to that
-/// @preconcurrency, suggest that the attribute be removed.
-void diagnoseUnnecessaryPreconcurrencyImports(SourceFile &sf);
-
 /// Given a set of custom attributes, pick out the global actor attributes
 /// and perform any necessary resolution and diagnostics, returning the
-/// global actor attribute and type it refers to (or \c llvm::None).
-llvm::Optional<std::pair<CustomAttr *, NominalTypeDecl *>>
+/// global actor attribute and type it refers to (or \c std::nullopt).
+std::optional<std::pair<CustomAttr *, NominalTypeDecl *>>
 checkGlobalActorAttributes(SourceLoc loc, DeclContext *dc,
                            ArrayRef<CustomAttr *> attrs);
 
@@ -516,7 +578,7 @@ enum class DispatchQueueOperation {
 
 /// Determine whether the given name is that of a DispatchQueue operation that
 /// takes a closure to be executed on the queue.
-llvm::Optional<DispatchQueueOperation>
+std::optional<DispatchQueueOperation>
 isDispatchQueueOperationName(StringRef name);
 
 /// Check the correctness of the given Sendable conformance.
@@ -534,9 +596,7 @@ ProtocolConformance *deriveImplicitSendableConformance(Evaluator &evaluator,
 /// Check whether we are in an actor's initializer or deinitializer.
 /// \returns nullptr iff we are not in such a declaration. Otherwise,
 ///          returns a pointer to the declaration.
-AbstractFunctionDecl const *isActorInitOrDeInitContext(
-    const DeclContext *dc,
-    llvm::function_ref<bool(const AbstractClosureExpr *)> isSendable);
+const AbstractFunctionDecl *isActorInitOrDeInitContext(const DeclContext *dc);
 
 /// Determine whether this declaration is always accessed asynchronously.
 bool isAsyncDecl(ConcreteDeclRef declRef);
@@ -548,7 +608,8 @@ bool isThrowsDecl(ConcreteDeclRef declRef);
 /// for the given expression.
 VarDecl *getReferencedParamOrCapture(
     Expr *expr,
-    llvm::function_ref<Expr *(OpaqueValueExpr *)> getExistentialValue);
+    llvm::function_ref<Expr *(OpaqueValueExpr *)> getExistentialValue,
+    llvm::function_ref<VarDecl *()> getCurrentIsolatedVar);
 
 /// Determine whether the given value can be accessed across actors
 /// without from normal synchronous code.
@@ -560,9 +621,8 @@ VarDecl *getReferencedParamOrCapture(
 /// violations should be downgraded to warnings prior to Swift 6.
 bool isAccessibleAcrossActors(
     ValueDecl *value, const ActorIsolation &isolation,
-    const DeclContext *fromDC,
-    ActorReferenceResult::Options &options,
-    llvm::Optional<ReferencedActor> actorInstance = llvm::None);
+    const DeclContext *fromDC, ActorReferenceResult::Options &options,
+    std::optional<ReferencedActor> actorInstance = std::nullopt);
 
 /// Determine whether the given value can be accessed across actors
 /// without from normal synchronous code.
@@ -573,7 +633,7 @@ bool isAccessibleAcrossActors(
 bool isAccessibleAcrossActors(
     ValueDecl *value, const ActorIsolation &isolation,
     const DeclContext *fromDC,
-    llvm::Optional<ReferencedActor> actorInstance = llvm::None);
+    std::optional<ReferencedActor> actorInstance = std::nullopt);
 
 /// Determines if the 'let' can be read from anywhere within the given module,
 /// regardless of the isolation or async-ness of the context in which
@@ -588,10 +648,37 @@ bool isPotentiallyIsolatedActor(
     VarDecl *var, llvm::function_ref<bool(ParamDecl *)> isIsolated =
                       [](ParamDecl *P) { return P->isIsolated(); });
 
-/// Check whether the given ApplyExpr makes an unsatisfied isolation jump
-/// and if so, emit diagnostics for any nonsendable arguments to the apply
-bool diagnoseApplyArgSendability(
-    swift::ApplyExpr *apply, const DeclContext *declContext);
+/// If the enclosing function has @_unsafeInheritExecutorAttr, return it.
+AbstractFunctionDecl *enclosingUnsafeInheritsExecutor(const DeclContext *dc);
+
+/// Add Fix-Its to the given function to replace the @_unsafeInheritExecutor
+/// attribute with a defaulted isolation parameter.
+void replaceUnsafeInheritExecutorWithDefaultedIsolationParam(
+    AbstractFunctionDecl *func, InFlightDiagnostic &diag);
+
+/// Replace any functions in this list that were found in the _Concurrency
+/// module and have _unsafeInheritExecutor_-prefixed versions with those
+/// _unsafeInheritExecutor_-prefixed versions.
+///
+/// This function is an egregious hack that allows us to introduce the
+/// #isolation-based versions of functions into the concurrency library
+/// without breaking clients that use @_unsafeInheritExecutor. Since those
+/// clients can't use #isolation (it doesn't work with @_unsafeInheritExecutor),
+/// we route them to the @_unsafeInheritExecutor versions implicitly.
+void introduceUnsafeInheritExecutorReplacements(
+    const DeclContext *dc, SourceLoc loc, SmallVectorImpl<ValueDecl *> &decls);
+
+/// Replace any functions in this list that were found in the _Concurrency
+/// module as a member on "base" and have _unsafeInheritExecutor_-prefixed
+/// versions with those _unsafeInheritExecutor_-prefixed versions.
+///
+/// This function is an egregious hack that allows us to introduce the
+/// #isolation-based versions of functions into the concurrency library
+/// without breaking clients that use @_unsafeInheritExecutor. Since those
+/// clients can't use #isolation (it doesn't work with @_unsafeInheritExecutor),
+/// we route them to the @_unsafeInheritExecutor versions implicitly.
+void introduceUnsafeInheritExecutorReplacements(
+    const DeclContext *dc, Type base, SourceLoc loc, LookupResult &result);
 
 } // end namespace swift
 
@@ -631,7 +718,7 @@ struct DenseMapInfo<swift::ReferencedActor::Kind> {
     }
 
     static unsigned getHashValue(RefActor Val) {
-     return static_cast<unsigned>(Val.getKind());
+     return hash_value(Val);
     }
 
     static bool isEqual(const RefActor &LHS, const RefActor &RHS) {

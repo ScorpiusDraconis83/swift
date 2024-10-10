@@ -16,9 +16,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/AST/DiagnosticEngine.h"
+#include "swift/AST/DiagnosticsFrontend.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ASTPrinter.h"
 #include "swift/AST/Decl.h"
+#include "swift/AST/DiagnosticGroups.h"
 #include "swift/AST/DiagnosticSuppression.h"
 #include "swift/AST/DiagnosticsCommon.h"
 #include "swift/AST/Expr.h"
@@ -27,7 +29,9 @@
 #include "swift/AST/PrintOptions.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/Stmt.h"
+#include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/TypeRepr.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Config.h"
 #include "swift/Localization/LocalizationFormat.h"
@@ -77,26 +81,29 @@ struct StoredDiagnosticInfo {
   bool isAPIDigesterBreakage : 1;
   bool isDeprecation : 1;
   bool isNoUsage : 1;
+  DiagGroupID groupID;
 
   constexpr StoredDiagnosticInfo(DiagnosticKind k, bool firstBadToken,
                                  bool fatal, bool isAPIDigesterBreakage,
-                                 bool deprecation, bool noUsage)
+                                 bool deprecation, bool noUsage,
+                                 DiagGroupID groupID)
       : kind(k), pointsToFirstBadToken(firstBadToken), isFatal(fatal),
-        isAPIDigesterBreakage(isAPIDigesterBreakage), isDeprecation(deprecation),
-        isNoUsage(noUsage) {}
-  constexpr StoredDiagnosticInfo(DiagnosticKind k, DiagnosticOptions opts)
+        isAPIDigesterBreakage(isAPIDigesterBreakage),
+        isDeprecation(deprecation), isNoUsage(noUsage), groupID(groupID) {}
+  constexpr StoredDiagnosticInfo(DiagnosticKind k, DiagnosticOptions opts,
+                                 DiagGroupID groupID)
       : StoredDiagnosticInfo(k,
                              opts == DiagnosticOptions::PointsToFirstBadToken,
                              opts == DiagnosticOptions::Fatal,
                              opts == DiagnosticOptions::APIDigesterBreakage,
                              opts == DiagnosticOptions::Deprecation,
-                             opts == DiagnosticOptions::NoUsage) {}
+                             opts == DiagnosticOptions::NoUsage, groupID) {}
 };
 
 // Reproduce the DiagIDs, as we want both the size and access to the raw ids
 // themselves.
 enum LocalDiagID : uint32_t {
-#define DIAG(KIND, ID, Options, Text, Signature) ID,
+#define DIAG(KIND, ID, Group, Options, Text, Signature) ID,
 #include "swift/AST/DiagnosticsAll.def"
   NumDiags
 };
@@ -104,14 +111,18 @@ enum LocalDiagID : uint32_t {
 
 // TODO: categorization
 static const constexpr StoredDiagnosticInfo storedDiagnosticInfos[] = {
-#define ERROR(ID, Options, Text, Signature)                                    \
-  StoredDiagnosticInfo(DiagnosticKind::Error, DiagnosticOptions::Options),
-#define WARNING(ID, Options, Text, Signature)                                  \
-  StoredDiagnosticInfo(DiagnosticKind::Warning, DiagnosticOptions::Options),
+#define GROUPED_ERROR(ID, Group, Options, Text, Signature)                     \
+  StoredDiagnosticInfo(DiagnosticKind::Error, DiagnosticOptions::Options,      \
+                       DiagGroupID::Group),
+#define GROUPED_WARNING(ID, Group, Options, Text, Signature)                   \
+  StoredDiagnosticInfo(DiagnosticKind::Warning, DiagnosticOptions::Options,    \
+                       DiagGroupID::Group),
 #define NOTE(ID, Options, Text, Signature)                                     \
-  StoredDiagnosticInfo(DiagnosticKind::Note, DiagnosticOptions::Options),
+  StoredDiagnosticInfo(DiagnosticKind::Note, DiagnosticOptions::Options,       \
+                       DiagGroupID::no_group),
 #define REMARK(ID, Options, Text, Signature)                                   \
-  StoredDiagnosticInfo(DiagnosticKind::Remark, DiagnosticOptions::Options),
+  StoredDiagnosticInfo(DiagnosticKind::Remark, DiagnosticOptions::Options,     \
+                       DiagGroupID::no_group),
 #include "swift/AST/DiagnosticsAll.def"
 };
 static_assert(sizeof(storedDiagnosticInfos) / sizeof(StoredDiagnosticInfo) ==
@@ -119,25 +130,19 @@ static_assert(sizeof(storedDiagnosticInfos) / sizeof(StoredDiagnosticInfo) ==
               "array size mismatch");
 
 static constexpr const char * const diagnosticStrings[] = {
-#define DIAG(KIND, ID, Options, Text, Signature) Text,
-#include "swift/AST/DiagnosticsAll.def"
-    "<not a diagnostic>",
-};
-
-static constexpr const char *const debugDiagnosticStrings[] = {
-#define DIAG(KIND, ID, Options, Text, Signature) Text " [" #ID "]",
+#define DIAG(KIND, ID, Group, Options, Text, Signature) Text,
 #include "swift/AST/DiagnosticsAll.def"
     "<not a diagnostic>",
 };
 
 static constexpr const char *const diagnosticIDStrings[] = {
-#define DIAG(KIND, ID, Options, Text, Signature) #ID,
+#define DIAG(KIND, ID, Group, Options, Text, Signature) #ID,
 #include "swift/AST/DiagnosticsAll.def"
     "<not a diagnostic>",
 };
 
 static constexpr const char *const fixItStrings[] = {
-#define DIAG(KIND, ID, Options, Text, Signature)
+#define DIAG(KIND, ID, Group, Options, Text, Signature)
 #define FIXIT(ID, Text, Signature) Text,
 #include "swift/AST/DiagnosticsAll.def"
     "<not a fix-it>",
@@ -170,6 +175,8 @@ static constexpr auto educationalNotes = _EducationalNotes.value;
 DiagnosticState::DiagnosticState() {
   // Initialize our ignored diagnostics to default
   ignoredDiagnostics.resize(LocalDiagID::NumDiags);
+  // Initialize warningsAsErrors to default
+  warningsAsErrors.resize(LocalDiagID::NumDiags);
 }
 
 static CharSourceRange toCharSourceRange(SourceManager &SM, SourceRange SR) {
@@ -302,6 +309,75 @@ InFlightDiagnostic::fixItReplaceChars(SourceLoc Start, SourceLoc End,
   return *this;
 }
 
+SourceLoc
+DiagnosticEngine::getBestAddImportFixItLoc(const Decl *Member,
+                                           SourceFile *sourceFile) const {
+  auto &SM = SourceMgr;
+
+  SourceLoc bestLoc;
+
+  auto SF =
+      sourceFile ? sourceFile : Member->getDeclContext()->getParentSourceFile();
+  if (!SF) {
+    return bestLoc;
+  }
+
+  for (auto item : SF->getTopLevelItems()) {
+    // If we found an import declaration, we want to insert after it.
+    if (auto importDecl =
+            dyn_cast_or_null<ImportDecl>(item.dyn_cast<Decl *>())) {
+      SourceLoc loc = importDecl->getEndLoc();
+      if (loc.isValid()) {
+        bestLoc = Lexer::getLocForEndOfLine(SM, loc);
+      }
+
+      // Keep looking for more import declarations.
+      continue;
+    }
+
+    // If we got a location based on import declarations, we're done.
+    if (bestLoc.isValid())
+      break;
+
+    // For any other item, we want to insert before it.
+    SourceLoc loc = item.getStartLoc();
+    if (loc.isValid()) {
+      bestLoc = Lexer::getLocForStartOfLine(SM, loc);
+      break;
+    }
+  }
+
+  return bestLoc;
+}
+
+InFlightDiagnostic &InFlightDiagnostic::fixItAddImport(StringRef ModuleName) {
+  assert(IsActive && "Cannot modify an inactive diagnostic");
+  auto Member = Engine->ActiveDiagnostic->getDecl();
+  SourceLoc bestLoc = Engine->getBestAddImportFixItLoc(Member);
+
+  if (bestLoc.isValid()) {
+    llvm::SmallString<64> importText;
+
+    // @_spi imports.
+    if (Member->isSPI()) {
+      auto spiGroups = Member->getSPIGroups();
+      if (!spiGroups.empty()) {
+        importText += "@_spi(";
+        importText += spiGroups[0].str();
+        importText += ") ";
+      }
+    }
+
+    importText += "import ";
+    importText += ModuleName;
+    importText += "\n";
+
+    return fixItInsert(bestLoc, importText);
+  }
+
+  return *this;
+}
+
 InFlightDiagnostic &InFlightDiagnostic::fixItExchange(SourceRange R1,
                                                       SourceRange R2) {
   assert(IsActive && "Cannot modify an inactive diagnostic");
@@ -328,13 +404,37 @@ InFlightDiagnostic::limitBehavior(DiagnosticBehavior limit) {
 }
 
 InFlightDiagnostic &
-InFlightDiagnostic::warnUntilSwiftVersion(unsigned majorVersion) {
+InFlightDiagnostic::limitBehaviorUntilSwiftVersion(
+    DiagnosticBehavior limit, unsigned majorVersion) {
   if (!Engine->languageVersion.isVersionAtLeast(majorVersion)) {
-    limitBehavior(DiagnosticBehavior::Warning)
-      .wrapIn(diag::error_in_future_swift_version, majorVersion);
+    // If the behavior limit is a warning or less, wrap the diagnostic
+    // in a message that this will become an error in a later Swift
+    // version. We do this before limiting the behavior, because
+    // wrapIn will result in the behavior of the wrapping diagnostic.
+    if (limit >= DiagnosticBehavior::Warning) {
+      if (majorVersion > 6) {
+        wrapIn(diag::error_in_a_future_swift_version);
+      } else {
+        wrapIn(diag::error_in_future_swift_version, majorVersion);
+      }
+    }
+
+    limitBehavior(limit);
+  }
+
+  if (majorVersion == 6) {
+    if (auto stats = Engine->statsReporter) {
+      ++stats->getFrontendCounters().NumSwift6Errors;
+    }
   }
 
   return *this;
+}
+
+InFlightDiagnostic &
+InFlightDiagnostic::warnUntilSwiftVersion(unsigned majorVersion) {
+  return limitBehaviorUntilSwiftVersion(DiagnosticBehavior::Warning,
+                                        majorVersion);
 }
 
 InFlightDiagnostic &
@@ -418,6 +518,44 @@ bool DiagnosticEngine::finishProcessing() {
     hadError |= Consumer->finishProcessing();
   }
   return hadError;
+}
+
+void DiagnosticEngine::setWarningsAsErrorsRules(
+    const std::vector<WarningAsErrorRule> &rules) {
+  std::vector<std::string> unknownGroups;
+  for (const auto &rule : rules) {
+    bool isEnabled = [&] {
+      switch (rule.getAction()) {
+      case WarningAsErrorRule::Action::Enable:
+        return true;
+      case WarningAsErrorRule::Action::Disable:
+        return false;
+      }
+    }();
+    auto target = rule.getTarget();
+    if (auto group = std::get_if<WarningAsErrorRule::TargetGroup>(&target)) {
+      auto name = std::string_view(group->name);
+      // Validate the group name and set the new behavior for each diagnostic
+      // associated with the group and all its subgroups.
+      if (auto groupID = getDiagGroupIDByName(name);
+          groupID && *groupID != DiagGroupID::no_group) {
+        getDiagGroupInfoByID(*groupID).traverseDepthFirst([&](auto group) {
+          for (DiagID diagID : group.diagnostics) {
+            state.setWarningAsErrorForDiagID(diagID, isEnabled);
+          }
+        });
+      } else {
+        unknownGroups.push_back(std::string(name));
+      }
+    } else if (std::holds_alternative<WarningAsErrorRule::TargetAll>(target)) {
+      state.setAllWarningsAsErrors(isEnabled);
+    } else {
+      llvm_unreachable("unhandled WarningAsErrorRule::Target");
+    }
+  }
+  for (const auto &unknownGroup : unknownGroups) {
+    diagnose(SourceLoc(), diag::unknown_warning_group, unknownGroup);
+  }
 }
 
 /// Skip forward to one of the given delimiters.
@@ -524,11 +662,11 @@ static bool isInterestingTypealias(Type type) {
 /// declaration and end up presenting the parameter in τ_0_0 format on
 /// diagnostic.
 static Type getAkaTypeForDisplay(Type type) {
-  return type.transform([](Type visitTy) -> Type {
-    if (isa<SugarType>(visitTy.getPointer()) &&
-        !isa<GenericTypeParamType>(visitTy.getPointer()))
+  return type.transformRec([&](TypeBase *visitTy) -> std::optional<Type> {
+    if (isa<SugarType>(visitTy) &&
+        !isa<GenericTypeParamType>(visitTy))
       return getAkaTypeForDisplay(visitTy->getDesugaredType());
-    return visitTy;
+    return std::nullopt;
   });
 }
 
@@ -705,7 +843,9 @@ static void formatDiagnosticArgument(StringRef Modifier,
     // Figure out the name we want to print.
     DeclName name;
     if (includeName) {
-      if (auto VD = dyn_cast<ValueDecl>(D))
+      if (auto MD = dyn_cast<ModuleDecl>(D))
+        name = MD->getPublicModuleName(/*onlyIfImported=*/true);
+      else if (auto VD = dyn_cast<ValueDecl>(D))
         name = VD->getName();
       else if (auto PGD = dyn_cast<PrecedenceGroupDecl>(D))
         name = PGD->getName();
@@ -736,8 +876,15 @@ static void formatDiagnosticArgument(StringRef Modifier,
   }
 
   case DiagnosticArgumentKind::FullyQualifiedType:
-  case DiagnosticArgumentKind::Type: {
-    assert(Modifier.empty() && "Improper modifier for Type argument");
+  case DiagnosticArgumentKind::Type:
+  case DiagnosticArgumentKind::WitnessType: {
+    std::optional<DiagnosticFormatOptions> TypeFormatOpts;
+    if (Modifier == "noformat") {
+      TypeFormatOpts.emplace(DiagnosticFormatOptions::formatForFixIts());
+    } else {
+      assert(Modifier.empty() && "Improper modifier for Type argument");
+      TypeFormatOpts.emplace(FormatOpts);
+    }
     
     // Strip extraneous parentheses; they add no value.
     Type type;
@@ -758,8 +905,7 @@ static void formatDiagnosticArgument(StringRef Modifier,
         printOptions.PrintFunctionRepresentationAttrs =
             PrintOptions::FunctionRepresentationMode::Full;
       needsQualification = typeSpellingIsAmbiguous(type, Args, printOptions);
-    } else {
-      assert(Arg.getKind() == DiagnosticArgumentKind::FullyQualifiedType);
+    } else if (Arg.getKind() == DiagnosticArgumentKind::FullyQualifiedType) {
       type = Arg.getAsFullyQualifiedType().getType()->getWithoutParens();
       if (type.isNull()) {
         // FIXME: We should never receive a nullptr here, but this is causing
@@ -772,6 +918,19 @@ static void formatDiagnosticArgument(StringRef Modifier,
         printOptions.PrintFunctionRepresentationAttrs =
             PrintOptions::FunctionRepresentationMode::Full;
       needsQualification = true;
+    } else {
+      assert(Arg.getKind() == DiagnosticArgumentKind::WitnessType);
+      type = Arg.getAsWitnessType().getType()->getWithoutParens();
+      if (type.isNull()) {
+        // FIXME: We should never receive a nullptr here, but this is causing
+        // crashes (rdar://75740683). Remove once ParenType never contains
+        // nullptr as the underlying type.
+        Out << "<null>";
+        break;
+      }
+      printOptions.PrintGenericRequirements = false;
+      printOptions.PrintInverseRequirements = false;
+      needsQualification = typeSpellingIsAmbiguous(type, Args, printOptions);
     }
 
     // If a type has an unresolved type, print it with syntax sugar removed for
@@ -797,7 +956,7 @@ static void formatDiagnosticArgument(StringRef Modifier,
 
       auto descriptiveKind = opaqueTypeDecl->getDescriptiveKind();
 
-      Out << llvm::format(FormatOpts.OpaqueResultFormatString.c_str(),
+      Out << llvm::format(TypeFormatOpts->OpaqueResultFormatString.c_str(),
                           type->getString(printOptions).c_str(),
                           Decl::getDescriptiveKindName(descriptiveKind).data(),
                           NamingDeclText.c_str());
@@ -811,11 +970,11 @@ static void formatDiagnosticArgument(StringRef Modifier,
         llvm::raw_svector_ostream OutAka(AkaText);
 
         getAkaTypeForDisplay(type)->print(OutAka, printOptions);
-        Out << llvm::format(FormatOpts.AKAFormatString.c_str(),
+        Out << llvm::format(TypeFormatOpts->AKAFormatString.c_str(),
                             typeName.c_str(), AkaText.c_str());
       } else {
-        Out << FormatOpts.OpeningQuotationMark << typeName
-            << FormatOpts.ClosingQuotationMark;
+        Out << TypeFormatOpts->OpeningQuotationMark << typeName
+            << TypeFormatOpts->ClosingQuotationMark;
       }
     }
     break;
@@ -903,37 +1062,20 @@ static void formatDiagnosticArgument(StringRef Modifier,
     Out << FormatOpts.OpeningQuotationMark << Arg.getAsLayoutConstraint()
         << FormatOpts.ClosingQuotationMark;
     break;
-  case DiagnosticArgumentKind::ActorIsolation:
-    assert(Modifier.empty() && "Improper modifier for ActorIsolation argument");
-    switch (auto isolation = Arg.getAsActorIsolation()) {
-    case ActorIsolation::ActorInstance:
-      Out << "actor-isolated";
-      break;
-
-    case ActorIsolation::GlobalActor:
-    case ActorIsolation::GlobalActorUnsafe: {
-      if (isolation.isMainActor()) {
-        Out << "main actor-isolated";
-      } else {
-        Type globalActor = isolation.getGlobalActor();
-        Out << "global actor " << FormatOpts.OpeningQuotationMark
-          << globalActor.getString()
-          << FormatOpts.ClosingQuotationMark << "-isolated";
-      }
-      break;
-    }
-
-    case ActorIsolation::Nonisolated:
-    case ActorIsolation::NonisolatedUnsafe:
-    case ActorIsolation::Unspecified:
-      Out << "nonisolated";
-      if (isolation == ActorIsolation::NonisolatedUnsafe) {
-        Out << "(unsafe)";
-      }
-      break;
-    }
+  case DiagnosticArgumentKind::ActorIsolation: {
+    assert((Modifier.empty() || Modifier == "noun") &&
+           "Improper modifier for ActorIsolation argument");
+    auto isolation = Arg.getAsActorIsolation();
+    isolation.printForDiagnostics(Out, FormatOpts.OpeningQuotationMark,
+                                  /*asNoun*/ Modifier == "noun");
     break;
-
+  }
+  case DiagnosticArgumentKind::IsolationSource: {
+    assert(Modifier.empty() && "Improper modifier for IsolationSource argument");
+    auto isolation = Arg.getAsIsolationSource();
+    isolation.printForDiagnostics(Out, FormatOpts.OpeningQuotationMark);
+    break;
+  }
   case DiagnosticArgumentKind::Diagnostic: {
     assert(Modifier.empty() && "Improper modifier for Diagnostic argument");
     auto diagArg = Arg.getAsDiagnostic();
@@ -1100,7 +1242,7 @@ DiagnosticBehavior DiagnosticState::determineBehavior(const Diagnostic &diag) {
   //   4) If the user substituted a different behavior for this behavior, apply
   //      that change
   if (lvl == DiagnosticBehavior::Warning) {
-    if (warningsAsErrors)
+    if (getWarningAsErrorForDiagID(diag.getID()))
       lvl = DiagnosticBehavior::Error;
     if (suppressWarnings)
       lvl = DiagnosticBehavior::Ignore;
@@ -1165,25 +1307,11 @@ void DiagnosticEngine::forwardTentativeDiagnosticsTo(
   clearTentativeDiagnostics();
 }
 
-/// Returns the access level of the least accessible PrettyPrintedDeclarations
-/// buffer that \p decl should appear in.
-///
-/// This is always \c Public unless \p decl is a \c ValueDecl and its
-/// access level is below \c Public. (That can happen with @testable and
-/// @_private imports.)
-static AccessLevel getBufferAccessLevel(const Decl *decl) {
-  AccessLevel level = AccessLevel::Public;
-  if (auto *VD = dyn_cast<ValueDecl>(decl))
-    level = VD->getFormalAccessScope().accessLevelForDiagnostics();
-  if (level > AccessLevel::Public) level = AccessLevel::Public;
-  return level;
-}
-
-llvm::Optional<DiagnosticInfo>
+std::optional<DiagnosticInfo>
 DiagnosticEngine::diagnosticInfoForDiagnostic(const Diagnostic &diagnostic) {
   auto behavior = state.determineBehavior(diagnostic);
   if (behavior == DiagnosticBehavior::Ignore)
-    return llvm::None;
+    return std::nullopt;
 
   // Figure out the source location.
   SourceLoc loc = diagnostic.getLoc();
@@ -1193,151 +1321,12 @@ DiagnosticEngine::diagnosticInfoForDiagnostic(const Diagnostic &diagnostic) {
     // has a location we can point to, use that location.
     loc = decl->getLoc();
 
+    // If the location of the decl is invalid still, try to pretty-print the
+    // declaration into a buffer and capture the source location there.
     if (loc.isInvalid()) {
-      // There is no location we can point to. Pretty-print the declaration
-      // so we can point to it.
-      SourceLoc ppLoc = PrettyPrintedDeclarations[decl];
-      if (ppLoc.isInvalid()) {
-        class TrackingPrinter : public StreamPrinter {
-          SmallVectorImpl<std::pair<const Decl *, uint64_t>> &Entries;
-          AccessLevel bufferAccessLevel;
-
-        public:
-          TrackingPrinter(
-              SmallVectorImpl<std::pair<const Decl *, uint64_t>> &Entries,
-              raw_ostream &OS, AccessLevel bufferAccessLevel) :
-            StreamPrinter(OS), Entries(Entries),
-            bufferAccessLevel(bufferAccessLevel) {}
-
-          void printDeclLoc(const Decl *D) override {
-            if (getBufferAccessLevel(D) == bufferAccessLevel)
-              Entries.push_back({ D, OS.tell() });
-          }
-        };
-        SmallVector<std::pair<const Decl *, uint64_t>, 8> entries;
-        llvm::SmallString<128> buffer;
-        llvm::SmallString<128> bufferName;
-        const Decl *ppDecl = decl;
-        {
-          // The access level of the buffer we want to print. Declarations below
-          // this access level will be omitted from the buffer; declarations
-          // above it will be printed, but (except for Open declarations in the
-          // Public buffer) will not be recorded in PrettyPrintedDeclarations as
-          // the "true" SourceLoc for the declaration.
-          AccessLevel bufferAccessLevel = getBufferAccessLevel(decl);
-
-          // Figure out which declaration to print. It's the top-most
-          // declaration (not a module).
-          auto dc = decl->getDeclContext();
-
-          // FIXME: Horrible, horrible hackaround. We're not getting a
-          // DeclContext everywhere we should.
-          if (!dc) {
-            return llvm::None;
-          }
-
-          while (!dc->isModuleContext()) {
-            switch (dc->getContextKind()) {
-            case DeclContextKind::Package:
-              llvm_unreachable("Not in a package context!");
-              break;
-            case DeclContextKind::Module:
-              llvm_unreachable("Not in a module context!");
-              break;
-
-            case DeclContextKind::FileUnit:
-            case DeclContextKind::TopLevelCodeDecl:
-              break;
-
-            case DeclContextKind::ExtensionDecl:
-              ppDecl = cast<ExtensionDecl>(dc);
-              break;
-
-            case DeclContextKind::GenericTypeDecl:
-              ppDecl = cast<GenericTypeDecl>(dc);
-              break;
-
-            case DeclContextKind::SerializedLocal:
-            case DeclContextKind::Initializer:
-            case DeclContextKind::AbstractClosureExpr:
-            case DeclContextKind::AbstractFunctionDecl:
-            case DeclContextKind::SubscriptDecl:
-            case DeclContextKind::EnumElementDecl:
-            case DeclContextKind::MacroDecl:
-              break;
-            }
-
-            dc = dc->getParent();
-          }
-
-          // Build the module name path (in reverse), which we use to
-          // build the name of the buffer.
-          SmallVector<StringRef, 4> nameComponents;
-          while (dc) {
-            nameComponents.push_back(cast<ModuleDecl>(dc)->getName().str());
-            dc = dc->getParent();
-          }
-
-          for (unsigned i = nameComponents.size(); i; --i) {
-            bufferName += nameComponents[i-1];
-            bufferName += '.';
-          }
-
-          if (auto value = dyn_cast<ValueDecl>(ppDecl)) {
-            bufferName += value->getBaseName().userFacingName();
-          } else if (auto ext = dyn_cast<ExtensionDecl>(ppDecl)) {
-            bufferName += ext->getExtendedType().getString();
-          }
-
-          // If we're using a lowered access level, give the buffer a distinct
-          // name.
-          if (bufferAccessLevel != AccessLevel::Public) {
-            assert(bufferAccessLevel < AccessLevel::Public
-                   && "Above-public access levels should use public buffer");
-            bufferName += " (";
-            bufferName += getAccessLevelSpelling(bufferAccessLevel);
-            bufferName += ")";
-          }
-
-          // Pretty-print the declaration we've picked.
-          llvm::raw_svector_ostream out(buffer);
-          TrackingPrinter printer(entries, out, bufferAccessLevel);
-          llvm::SaveAndRestore<bool> isPrettyPrinting(
-              IsPrettyPrintingDecl, true);
-          ppDecl->print(
-              printer,
-              PrintOptions::printForDiagnostics(
-                  bufferAccessLevel,
-                  decl->getASTContext().TypeCheckerOpts.PrintFullConvention));
-        }
-
-        // Build a buffer with the pretty-printed declaration.
-        auto bufferID = SourceMgr.addMemBufferCopy(buffer, bufferName);
-        auto memBufferStartLoc = SourceMgr.getLocForBufferStart(bufferID);
-
-        SourceMgr.setGeneratedSourceInfo(
-            bufferID,
-            GeneratedSourceInfo{
-              GeneratedSourceInfo::PrettyPrinted,
-              CharSourceRange(),
-              CharSourceRange(memBufferStartLoc, buffer.size()),
-              ASTNode(const_cast<Decl *>(ppDecl)).getOpaqueValue(),
-              nullptr
-            }
-        );
-
-        // Go through all of the pretty-printed entries and record their
-        // locations.
-        for (auto entry : entries) {
-          PrettyPrintedDeclarations[entry.first] =
-              memBufferStartLoc.getAdvancedLoc(entry.second);
-        }
-
-        // Grab the pretty-printed location.
-        ppLoc = PrettyPrintedDeclarations[decl];
-      }
-
-      loc = ppLoc;
+      loc = evaluateOrDefault(
+          decl->getASTContext().evaluator, PrettyPrintDeclRequest{decl},
+          SourceLoc());
     }
   }
 
@@ -1360,6 +1349,7 @@ DiagnosticEngine::diagnosticInfoForDiagnostic(const Diagnostic &diagnostic) {
       case GeneratedSourceInfo::Name##MacroExpansion:
 #include "swift/Basic/MacroRoles.def"
       case GeneratedSourceInfo::PrettyPrinted:
+      case GeneratedSourceInfo::DefaultArgument:
         fixIts = {};
         break;
       case GeneratedSourceInfo::ReplacedFunctionBody:
@@ -1372,10 +1362,41 @@ DiagnosticEngine::diagnosticInfoForDiagnostic(const Diagnostic &diagnostic) {
 
   return DiagnosticInfo(
       diagnostic.getID(), loc, toDiagnosticKind(behavior),
-      diagnosticStringFor(diagnostic.getID(), getPrintDiagnosticNames()),
+      diagnosticStringFor(diagnostic.getID(), getPrintDiagnosticNamesMode()),
       diagnostic.getArgs(), Category, getDefaultDiagnosticLoc(),
       /*child note info*/ {}, diagnostic.getRanges(), fixIts,
       diagnostic.isChildNote());
+}
+
+static DeclName
+getGeneratedSourceInfoMacroName(const GeneratedSourceInfo &info) {
+  ASTNode expansionNode = ASTNode::getFromOpaqueValue(info.astNode);
+  switch (info.kind) {
+#define MACRO_ROLE(Name, Description)                                          \
+  case GeneratedSourceInfo::Name##MacroExpansion:
+#include "swift/Basic/MacroRoles.def"
+    {
+      if (auto customAttr = info.attachedMacroCustomAttr) {
+        // FIXME: How will we handle deserialized custom attributes like this?
+        auto declRefType = cast<DeclRefTypeRepr>(customAttr->getTypeRepr());
+        return declRefType->getNameRef().getFullName();
+      }
+
+      if (auto expansionExpr = dyn_cast_or_null<MacroExpansionExpr>(
+              expansionNode.dyn_cast<Expr *>())) {
+        return expansionExpr->getMacroName().getFullName();
+      }
+
+      auto expansionDecl =
+          cast<MacroExpansionDecl>(expansionNode.get<Decl *>());
+      return expansionDecl->getMacroName().getFullName();
+    }
+
+  case GeneratedSourceInfo::PrettyPrinted:
+  case GeneratedSourceInfo::ReplacedFunctionBody:
+  case GeneratedSourceInfo::DefaultArgument:
+    return DeclName();
+  }
 }
 
 std::vector<Diagnostic>
@@ -1433,6 +1454,7 @@ DiagnosticEngine::getGeneratedSourceBufferNotes(SourceLoc loc) {
     case GeneratedSourceInfo::PrettyPrinted:
       break;
 
+    case GeneratedSourceInfo::DefaultArgument:
     case GeneratedSourceInfo::ReplacedFunctionBody:
       return childNotes;
     }
@@ -1505,18 +1527,38 @@ DiagnosticKind DiagnosticEngine::declaredDiagnosticKindFor(const DiagID id) {
   return storedDiagnosticInfos[(unsigned)id].kind;
 }
 
-llvm::StringRef
-DiagnosticEngine::diagnosticStringFor(const DiagID id,
-                                      bool printDiagnosticNames) {
-  auto defaultMessage = printDiagnosticNames
-                            ? debugDiagnosticStrings[(unsigned)id]
-                            : diagnosticStrings[(unsigned)id];
-
-  if (auto producer = localization.get()) {
-    auto localizedMessage = producer->getMessageOr(id, defaultMessage);
-    return localizedMessage;
+llvm::StringRef DiagnosticEngine::diagnosticStringFor(
+    const DiagID id, PrintDiagnosticNamesMode printDiagnosticNamesMode) {
+  llvm::StringRef message = diagnosticStrings[(unsigned)id];
+  if (auto localizationProducer = localization.get()) {
+    message = localizationProducer->getMessageOr(id, message);
   }
-  return defaultMessage;
+  auto formatMessageWithName = [&](StringRef message, StringRef name) {
+    const int additionalCharsLength = 3; // ' ', '[', ']'
+    std::string messageWithName;
+    messageWithName.reserve(message.size() + name.size() +
+                            additionalCharsLength);
+    messageWithName += message;
+    messageWithName += " [";
+    messageWithName += name;
+    messageWithName += "]";
+    return DiagnosticStringsSaver.save(messageWithName);
+  };
+  switch (printDiagnosticNamesMode) {
+  case PrintDiagnosticNamesMode::None:
+    break;
+  case PrintDiagnosticNamesMode::Identifier:
+    message = formatMessageWithName(message, diagnosticIDStringFor(id));
+    break;
+  case PrintDiagnosticNamesMode::Group:
+    auto groupID = storedDiagnosticInfos[(unsigned)id].groupID;
+    if (groupID != DiagGroupID::no_group) {
+      message =
+          formatMessageWithName(message, getDiagGroupInfoByID(groupID).name);
+    }
+    break;
+  }
+  return message;
 }
 
 llvm::StringRef
@@ -1563,9 +1605,7 @@ BufferIndirectlyCausingDiagnosticRAII::BufferIndirectlyCausingDiagnosticRAII(
     const SourceFile &SF)
     : Diags(SF.getASTContext().Diags) {
   auto id = SF.getBufferID();
-  if (!id)
-    return;
-  auto loc = SF.getASTContext().SourceMgr.getLocForBufferStart(*id);
+  auto loc = SF.getASTContext().SourceMgr.getLocForBufferStart(id);
   if (loc.isValid())
     Diags.setBufferIndirectlyCausingDiagnosticToInput(loc);
 }
@@ -1588,34 +1628,3 @@ EncodedDiagnosticMessage::EncodedDiagnosticMessage(StringRef S)
     : Message(Lexer::getEncodedStringSegment(S, Buf, /*IsFirstSegment=*/true,
                                              /*IsLastSegment=*/true,
                                              /*IndentToStrip=*/~0U)) {}
-
-DeclName
-swift::getGeneratedSourceInfoMacroName(const GeneratedSourceInfo &info) {
-  ASTNode expansionNode = ASTNode::getFromOpaqueValue(info.astNode);
-  switch (info.kind) {
-#define MACRO_ROLE(Name, Description)  \
-    case GeneratedSourceInfo::Name##MacroExpansion:
-#include "swift/Basic/MacroRoles.def"
-  {
-    DeclName macroName;
-    if (auto customAttr = info.attachedMacroCustomAttr) {
-      // FIXME: How will we handle deserialized custom attributes like this?
-      auto declRefType = cast<DeclRefTypeRepr>(customAttr->getTypeRepr());
-      return declRefType->getNameRef().getFullName();
-    }
-
-    if (auto expansionExpr = dyn_cast_or_null<MacroExpansionExpr>(
-            expansionNode.dyn_cast<Expr *>())) {
-      return expansionExpr->getMacroName().getFullName();
-    }
-
-    auto expansionDecl =
-        cast<MacroExpansionDecl>(expansionNode.get<Decl *>());
-      return expansionDecl->getMacroName().getFullName();
-  }
-
-  case GeneratedSourceInfo::PrettyPrinted:
-  case GeneratedSourceInfo::ReplacedFunctionBody:
-    return DeclName();
-  }
-}

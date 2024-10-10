@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2024 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -102,7 +102,7 @@ internal let _countGPRegisters = 16
 @usableFromInline
 internal let _registerSaveWords = _countGPRegisters
 
-#elseif arch(arm64) && !(os(macOS) || os(iOS) || os(tvOS) || os(watchOS) || os(Windows))
+#elseif arch(arm64) && !(os(macOS) || os(iOS) || os(tvOS) || os(watchOS) || os(visionOS) || os(Windows))
 // ARM Procedure Call Standard for aarch64. (IHI0055B)
 // The va_list type may refer to any parameter in a parameter list may be in one
 // of three memory locations depending on its type and position in the argument
@@ -350,19 +350,23 @@ extension OpaquePointer: CVarArg {
   }
 }
 
-extension UnsafePointer: CVarArg {
+@_preInverseGenerics
+extension UnsafePointer: CVarArg where Pointee: ~Copyable {
   /// Transform `self` into a series of machine words that can be
   /// appropriately interpreted by C varargs.
   @inlinable // c-abi
+  @_preInverseGenerics
   public var _cVarArgEncoding: [Int] {
     return _encodeBitsAsWords(self)
   }
 }
 
-extension UnsafeMutablePointer: CVarArg {
+@_preInverseGenerics
+extension UnsafeMutablePointer: CVarArg where Pointee: ~Copyable {
   /// Transform `self` into a series of machine words that can be
   /// appropriately interpreted by C varargs.
   @inlinable // c-abi
+  @_preInverseGenerics
   public var _cVarArgEncoding: [Int] {
     return _encodeBitsAsWords(self)
   }
@@ -413,7 +417,7 @@ extension Double: _CVarArgPassedAsDouble, _CVarArgAligned {
   }
 }
 
-#if !(os(Windows) || os(Android)) && (arch(i386) || arch(x86_64))
+#if !(os(Windows) || os(Android) || ($Embedded && !os(Linux) && !(os(macOS) || os(iOS) || os(watchOS) || os(tvOS)))) && (arch(i386) || arch(x86_64))
 extension Float80: CVarArg, _CVarArgAligned {
   /// Transform `self` into a series of machine words that can be
   /// appropriately interpreted by C varargs.
@@ -432,7 +436,7 @@ extension Float80: CVarArg, _CVarArgAligned {
 }
 #endif
 
-#if (arch(x86_64) && !os(Windows)) || arch(s390x) || (arch(arm64) && !(os(macOS) || os(iOS) || os(tvOS) || os(watchOS) || os(Windows)))
+#if (arch(x86_64) && !os(Windows)) || arch(s390x) || (arch(arm64) && !(os(macOS) || os(iOS) || os(tvOS) || os(watchOS) || os(visionOS) || os(Windows)))
 
 /// An object that can manage the lifetime of storage backing a
 /// `CVaListPointer`.
@@ -712,3 +716,6 @@ final internal class __VaListBuilder {
 }
 
 #endif
+
+@available(*, unavailable)
+extension __VaListBuilder: Sendable {}

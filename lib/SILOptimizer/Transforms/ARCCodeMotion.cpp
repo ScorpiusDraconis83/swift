@@ -70,6 +70,7 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "sil-rr-code-motion"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/BasicBlockDatastructures.h"
@@ -186,7 +187,7 @@ protected:
 #ifndef NDEBUG
   // SILPrintContext is used to print block IDs in RPO order.
   // It is optional so only the final insertion point interference is printed.
-  llvm::Optional<SILPrintContext> printCtx;
+  std::optional<SILPrintContext> printCtx;
 #endif
 
   /// Return the rc-identity root of the SILValue.

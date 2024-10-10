@@ -79,7 +79,7 @@ internal struct _SmallString {
 extension _SmallString {
   @inlinable @inline(__always)
   internal static var capacity: Int {
-#if _pointerBitWidth(_32)
+#if _pointerBitWidth(_32) || _pointerBitWidth(_16)
     return 10
 #elseif os(Android) && arch(arm64)
     return 14
@@ -263,7 +263,7 @@ extension _SmallString {
   ) {
     _internalInvariant(index > 0)
     _internalInvariant(index <= _SmallString.capacity)
-    //FIXME: Verify this on big-endian architecture
+    // FIXME: Verify this on big-endian architecture
     let mask0 = (UInt64(bitPattern: ~0) &>> (8 &* ( 8 &- Swift.min(index, 8))))
     let mask1 = (UInt64(bitPattern: ~0) &>> (8 &* (16 &- Swift.max(index, 8))))
     storage.0 &= (index <= 0) ? 0 : mask0.littleEndian

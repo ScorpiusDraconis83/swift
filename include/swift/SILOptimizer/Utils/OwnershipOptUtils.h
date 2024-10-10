@@ -28,6 +28,8 @@
 
 namespace swift {
 
+class SILPassManager;
+
 /// Returns true if this value requires OSSA cleanups.
 inline bool requiresOSSACleanup(SILValue v) {
   return v->getFunction()->hasOwnership() &&
@@ -157,7 +159,7 @@ public:
 /// "ownership fixup" utilities. Please do not put actual methods on this, it is
 /// meant to be composed with.
 struct OwnershipFixupContext {
-  llvm::Optional<InstModCallbacks> inlineCallbacks;
+  std::optional<InstModCallbacks> inlineCallbacks;
   InstModCallbacks &callbacks;
   DeadEndBlocks &deBlocks;
 
@@ -354,6 +356,10 @@ bool extendStoreBorrow(StoreBorrowInst *sbi,
                        SmallVectorImpl<Operand *> &newUses,
                        DeadEndBlocks *deadEndBlocks,
                        InstModCallbacks callbacks = InstModCallbacks());
+
+void updateBorrowedFrom(SILPassManager *pm, SILFunction *f);
+
+void updateBorrowedFromPhis(SILPassManager *pm, ArrayRef<SILPhiArgument *> phis);
 
 } // namespace swift
 

@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Statistic.h"
 #include "swift/Config.h"
 #include "clang/Basic/SourceLocation.h"
@@ -154,7 +155,7 @@ auxName(StringRef ModuleName,
 
 class UnifiedStatsReporter::RecursionSafeTimers {
   struct RecursionSafeTimer {
-    llvm::Optional<llvm::NamedRegionTimer> Timer;
+    std::optional<llvm::NamedRegionTimer> Timer;
     size_t RecursionDepth;
   };
 
@@ -318,6 +319,7 @@ UnifiedStatsReporter::UnifiedStatsReporter(StringRef ProgramName,
                                            StringRef Directory,
                                            SourceManager *SM,
                                            clang::SourceManager *CSM,
+                                           bool FineGrainedTimers,
                                            bool TraceEvents,
                                            bool ProfileEvents,
                                            bool ProfileEntities)
@@ -328,7 +330,7 @@ UnifiedStatsReporter::UnifiedStatsReporter(StringRef ProgramName,
                                  OutputType,
                                  OptType),
                          Directory,
-                         SM, CSM,
+                         SM, CSM, FineGrainedTimers,
                          TraceEvents, ProfileEvents, ProfileEntities)
 {
 }
@@ -338,6 +340,7 @@ UnifiedStatsReporter::UnifiedStatsReporter(StringRef ProgramName,
                                            StringRef Directory,
                                            SourceManager *SM,
                                            clang::SourceManager *CSM,
+                                           bool FineGrainedTimers,
                                            bool TraceEvents,
                                            bool ProfileEvents,
                                            bool ProfileEntities)
@@ -354,6 +357,7 @@ UnifiedStatsReporter::UnifiedStatsReporter(StringRef ProgramName,
     SourceMgr(SM),
     ClangSourceMgr(CSM),
     RecursiveTimers(std::make_unique<RecursionSafeTimers>()),
+    FineGrainedTimers(FineGrainedTimers),
     IsFlushingTracesAndProfiles(false)
 {
   path::append(StatsFilename, makeStatsFileName(ProgramName, AuxName));
@@ -452,20 +456,24 @@ UnifiedStatsReporter::printAlwaysOnStatsAndTimers(raw_ostream &OS) {
   const char *delim = "";
   if (FrontendCounters) {
     auto &C = getFrontendCounters();
-#define FRONTEND_STATISTIC(TY, NAME)                        \
-    do {                                                    \
-      OS << delim << "\t\"" #TY "." #NAME "\": " << C.NAME; \
-      delim = ",\n";                                        \
+#define FRONTEND_STATISTIC(TY, NAME)                          \
+    do {                                                      \
+      if (C.NAME) {                                           \
+        OS << delim << "\t\"" #TY "." #NAME "\": " << C.NAME; \
+        delim = ",\n";                                        \
+      }                                                       \
     } while (0);
 #include "swift/Basic/Statistics.def"
 #undef FRONTEND_STATISTIC
   }
   if (DriverCounters) {
     auto &C = getDriverCounters();
-#define DRIVER_STATISTIC(NAME)                              \
-    do {                                                    \
-      OS << delim << "\t\"Driver." #NAME "\": " << C.NAME;  \
-      delim = ",\n";                                        \
+#define DRIVER_STATISTIC(NAME)                                \
+    do {                                                      \
+      if (C.NAME) {                                           \
+        OS << delim << "\t\"Driver." #NAME "\": " << C.NAME;  \
+        delim = ",\n";                                        \
+      }                                                       \
     } while (0);
 #include "swift/Basic/Statistics.def"
 #undef DRIVER_STATISTIC

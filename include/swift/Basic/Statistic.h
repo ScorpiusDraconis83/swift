@@ -13,11 +13,11 @@
 #ifndef SWIFT_BASIC_STATISTIC_H
 #define SWIFT_BASIC_STATISTIC_H
 
-#include "llvm/ADT/Optional.h"
+#include "swift/Basic/LLVM.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Support/Timer.h"
-#include "swift/Basic/LLVM.h"
+#include <optional>
 
 #include <thread>
 #include <tuple>
@@ -157,15 +157,19 @@ private:
 
   SourceManager *SourceMgr;
   clang::SourceManager *ClangSourceMgr;
-  llvm::Optional<AlwaysOnDriverCounters> DriverCounters;
-  llvm::Optional<AlwaysOnFrontendCounters> FrontendCounters;
-  llvm::Optional<AlwaysOnFrontendCounters> LastTracedFrontendCounters;
-  llvm::Optional<std::vector<FrontendStatsEvent>> FrontendStatsEvents;
+  std::optional<AlwaysOnDriverCounters> DriverCounters;
+  std::optional<AlwaysOnFrontendCounters> FrontendCounters;
+  std::optional<AlwaysOnFrontendCounters> LastTracedFrontendCounters;
+  std::optional<std::vector<FrontendStatsEvent>> FrontendStatsEvents;
 
   // These are unique_ptr so we can use incomplete types here.
   std::unique_ptr<RecursionSafeTimers> RecursiveTimers;
   std::unique_ptr<StatsProfilers> EventProfilers;
   std::unique_ptr<StatsProfilers> EntityProfilers;
+
+  /// Whether fine-grained timers are enabled. In practice, this means request
+  /// evaluator requests. This will have a runtime performance impact.
+  bool FineGrainedTimers;
 
   /// Whether we are currently flushing statistics and should not therefore
   /// record any additional stats until we've finished.
@@ -179,6 +183,7 @@ private:
                        StringRef Directory,
                        SourceManager *SM,
                        clang::SourceManager *CSM,
+                       bool FineGrainedTimers,
                        bool TraceEvents,
                        bool ProfileEvents,
                        bool ProfileEntities);
@@ -190,12 +195,15 @@ public:
                        StringRef OutputType,
                        StringRef OptType,
                        StringRef Directory,
-                       SourceManager *SM=nullptr,
-                       clang::SourceManager *CSM=nullptr,
-                       bool TraceEvents=false,
-                       bool ProfileEvents=false,
-                       bool ProfileEntities=false);
+                       SourceManager *SM,
+                       clang::SourceManager *CSM,
+                       bool FineGrainedTimers,
+                       bool TraceEvents,
+                       bool ProfileEvents,
+                       bool ProfileEntities);
   ~UnifiedStatsReporter();
+
+  bool fineGrainedTimers() const { return FineGrainedTimers; }
 
   AlwaysOnDriverCounters &getDriverCounters();
   AlwaysOnFrontendCounters &getFrontendCounters();

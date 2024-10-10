@@ -38,6 +38,7 @@
 #include "Signature.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/PrettyStackTrace.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/IRGen/Linking.h"
 #include "swift/SIL/SILDeclRef.h"
 #include "llvm/IR/Function.h"
@@ -79,7 +80,7 @@ class IRGenThunk {
   bool isCoroutine;
   bool isWitnessMethod;
 
-  llvm::Optional<AsyncContextLayout> asyncLayout;
+  std::optional<AsyncContextLayout> asyncLayout;
 
   // Initialized by prepareArguments()
   llvm::Value *indirectReturnSlot = nullptr;
@@ -254,11 +255,8 @@ Callee IRGenThunk::lookupMethod() {
   if (selfTy.is<MetatypeType>()) {
     metadata = selfValue;
   } else {
-    auto &Types = IGF.IGM.getSILModule().Types;
-    auto *env = Types.getConstantGenericEnvironment(declRef);
-    auto sig = env ? env->getGenericSignature() : GenericSignature();
     metadata = emitHeapMetadataRefForHeapObject(IGF, selfValue, selfTy,
-                                                sig, /*suppress cast*/ true);
+                                                /*suppress cast*/ true);
   }
 
   // Find the method we're interested in.

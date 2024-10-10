@@ -67,7 +67,7 @@ bool CodeCompletionDiagnostics::getDiagnostics(
     typename swift::detail::PassArgument<ArgTypes>::type... VArgs) {
   DiagID id = ID.ID;
   std::vector<DiagnosticArgument> DiagArgs{std::move(VArgs)...};
-  auto format = Engine.diagnosticStringFor(id, /*printDiagnosticNames=*/false);
+  auto format = Engine.diagnosticStringFor(id, PrintDiagnosticNamesMode::None);
   DiagnosticEngine::formatDiagnosticText(Out, format, DiagArgs);
   severity = getSeverity(Engine.declaredDiagnosticKindFor(id));
 
@@ -93,6 +93,11 @@ bool CodeCompletionDiagnostics::getDiagnosticForDeprecated(
   llvm::VersionTuple DeprecatedVersion;
   if (Attr->Deprecated)
     DeprecatedVersion = Attr->Deprecated.value();
+
+  llvm::VersionTuple RemappedDeprecatedVersion;
+  if (AvailabilityInference::updateDeprecatedPlatformForFallback(
+      Attr, Ctx, Platform, RemappedDeprecatedVersion))
+    DeprecatedVersion = RemappedDeprecatedVersion;
 
   if (!isSoftDeprecated) {
     if (Attr->Message.empty() && Attr->Rename.empty()) {
@@ -161,14 +166,6 @@ bool swift::ide::getContextualCompletionDiagnostics(
     const ASTContext &Ctx) {
   CodeCompletionDiagnostics Diag(Ctx);
   switch (Reason) {
-  case ContextualNotRecommendedReason::InvalidAsyncContext:
-    // FIXME: Could we use 'diag::async_in_nonasync_function'?
-    return Diag.getDiagnostics(
-        Severity, Out, diag::ide_async_in_nonasync_context, NameForDiagnostics);
-  case ContextualNotRecommendedReason::CrossActorReference:
-    return Diag.getDiagnostics(Severity, Out,
-                               diag::ide_cross_actor_reference_swift5,
-                               NameForDiagnostics);
   case ContextualNotRecommendedReason::RedundantImport:
     return Diag.getDiagnostics(Severity, Out, diag::ide_redundant_import,
                                NameForDiagnostics);

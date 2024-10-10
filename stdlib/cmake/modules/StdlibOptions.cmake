@@ -101,7 +101,7 @@ option(SWIFT_STDLIB_EMIT_API_DESCRIPTORS
 
 option(SWIFT_STDLIB_BUILD_ONLY_CORE_MODULES
        "Build only the core subset of the standard library,
-       ignoring additional libraries such as Concurrency, Distributed and StringProcessing.
+       ignoring additional libraries such as Distributed, Observation and Synchronization.
        This is an option meant for internal configurations inside Apple
        that need to build the standard libraries in chunks when constructing an SDK"
        FALSE)
@@ -175,10 +175,6 @@ option(SWIFT_STDLIB_EXPERIMENTAL_HERMETIC_SEAL_AT_LINK
        "Should stdlib be built with -experimental-hermetic-seal-at-link"
        FALSE)
 
-option(SWIFT_STDLIB_EXPERIMENTAL_NONCOPYABLE_GENERICS
-      "Should stdlib be built with -experimental-feature NoncopyableGenerics"
-      FALSE)
-
 option(SWIFT_STDLIB_PASSTHROUGH_METADATA_ALLOCATOR
        "Build stdlib without a custom implementation of MetadataAllocator, relying on malloc+free instead."
        FALSE)
@@ -200,7 +196,7 @@ set(SWIFT_STDLIB_REFLECTION_METADATA "enabled" CACHE STRING
 
 option(SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
        "Should concurrency use the task-to-thread model."
-       "${SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY_default}")
+       FALSE)
 
 option(SWIFT_STDLIB_HAS_STDIN
        "Build stdlib assuming the platform supports stdin and getline API."
@@ -212,6 +208,10 @@ option(SWIFT_STDLIB_HAS_ENVIRON
 
 option(SWIFT_STDLIB_SINGLE_THREADED_CONCURRENCY
        "Build the standard libraries assuming that they will be used in an environment with only a single thread."
+       FALSE)
+
+option(SWIFT_USE_OS_TRACE_LAZY_INIT
+       "Use the os_trace call to check if lazy init has been completed before making os_signpost calls."
        FALSE)
 
 # Use dispatch as the system scheduler by default.
@@ -272,6 +272,10 @@ option(SWIFT_STDLIB_CONCURRENCY_TRACING
 
 option(SWIFT_STDLIB_USE_RELATIVE_PROTOCOL_WITNESS_TABLES
        "Use relative protocol witness tables"
+       FALSE)
+
+option(SWIFT_STDLIB_USE_FRAGILE_RESILIENT_PROTOCOL_WITNESS_TABLES
+       "Use fragile protocol witness tables for resilient protocols"
        FALSE)
 
 if("${SWIFT_HOST_VARIANT_SDK}" IN_LIST SWIFT_DARWIN_PLATFORMS)

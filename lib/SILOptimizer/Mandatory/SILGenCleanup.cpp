@@ -16,12 +16,14 @@
 
 #define DEBUG_TYPE "silgen-cleanup"
 
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/SIL/BasicBlockUtils.h"
 #include "swift/SIL/OSSALifetimeCompletion.h"
 #include "swift/SIL/PrettyStackTrace.h"
 #include "swift/SIL/PrunedLiveness.h"
 #include "swift/SIL/SILInstruction.h"
+#include "swift/SILOptimizer/Analysis/DeadEndBlocksAnalysis.h"
 #include "swift/SILOptimizer/Analysis/PostOrderAnalysis.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SILOptimizer/Utils/CanonicalizeInstruction.h"
@@ -113,11 +115,13 @@ bool SILGenCleanup::completeOSSALifetimes(SILFunction *function) {
   // Lifetimes must be completed inside out (bottom-up in the CFG).
   PostOrderFunctionInfo *postOrder =
       getAnalysis<PostOrderAnalysis>()->get(function);
-  OSSALifetimeCompletion completion(function, /*DomInfo*/nullptr);
+  DeadEndBlocks *deb = getAnalysis<DeadEndBlocksAnalysis>()->get(function);
+  OSSALifetimeCompletion completion(function, /*DomInfo*/ nullptr, *deb);
   for (auto *block : postOrder->getPostOrder()) {
     for (SILInstruction &inst : reverse(*block)) {
       for (auto result : inst.getResults()) {
-        if (completion.completeOSSALifetime(result) ==
+        if (completion.completeOSSALifetime(
+                result, OSSALifetimeCompletion::Boundary::Availability) ==
             LifetimeCompletion::WasCompleted) {
           changed = true;
         }
@@ -125,7 +129,8 @@ bool SILGenCleanup::completeOSSALifetimes(SILFunction *function) {
     }
     for (SILArgument *arg : block->getArguments()) {
       assert(!arg->isReborrow() && "reborrows not legal at this SIL stage");
-      if (completion.completeOSSALifetime(arg) ==
+      if (completion.completeOSSALifetime(
+              arg, OSSALifetimeCompletion::Boundary::Availability) ==
           LifetimeCompletion::WasCompleted) {
         changed = true;
       }

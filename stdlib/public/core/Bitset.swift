@@ -33,6 +33,9 @@ internal struct _UnsafeBitset {
   }
 }
 
+@available(*, unavailable)
+extension _UnsafeBitset: Sendable {}
+
 extension _UnsafeBitset {
   @inlinable
   @inline(__always)
@@ -179,6 +182,9 @@ extension _UnsafeBitset: Sequence {
   }
 }
 
+@available(*, unavailable)
+extension _UnsafeBitset.Iterator: Sendable {}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 extension _UnsafeBitset {
@@ -310,10 +316,8 @@ extension _UnsafeBitset.Word {
 // iterator, not the original word.
 extension _UnsafeBitset.Word: Sequence, IteratorProtocol {
 
-#if $NoncopyableGenerics
   @usableFromInline
   typealias Element = Int
-#endif
 
   @inlinable
   internal var count: Int {

@@ -54,7 +54,6 @@ namespace irgen {
                              SILType targetLoweredType,
                              CanType targetFormalType,
                              CheckedCastMode mode,
-                             GenericSignature fnSig,
                              Explosion &out);
 
   llvm::Value *emitFastClassCastIfPossible(
@@ -81,8 +80,7 @@ namespace irgen {
   FailableCastResult emitClassIdenticalCast(IRGenFunction &IGF,
                                             llvm::Value *from,
                                             SILType fromType,
-                                            SILType toType,
-                                            GenericSignature fnSig);
+                                            SILType toType);
 
   /// Emit a checked cast of a metatype.
   void emitMetatypeDowncast(IRGenFunction &IGF,
@@ -98,8 +96,8 @@ namespace irgen {
   /// not, the cast is done as a class instance cast.
   void emitScalarExistentialDowncast(
       IRGenFunction &IGF, llvm::Value *orig, SILType srcType, SILType destType,
-      CheckedCastMode mode, llvm::Optional<MetatypeRepresentation> metatypeKind,
-      GenericSignature fnSig, Explosion &ex);
+      CheckedCastMode mode, std::optional<MetatypeRepresentation> metatypeKind,
+      Explosion &ex);
 
   /// Emit a checked cast from a metatype to AnyObject.
   llvm::Value *emitMetatypeToAnyObjectDowncast(IRGenFunction &IGF,

@@ -171,12 +171,12 @@ private:
 
   /// A canonical availability info for this context, computed top-down from the
   /// root context.
-  AvailabilityContext AvailabilityInfo;
+  AvailabilityRange AvailabilityInfo;
 
   /// If this context was annotated with an availability attribute, this property captures that.
   /// It differs from the above `AvailabilityInfo` by being independent of the deployment target,
   /// and is used for providing availability attribute redundancy warning diagnostics.
-  AvailabilityContext ExplicitAvailabilityInfo;
+  AvailabilityRange ExplicitAvailabilityInfo;
 
   std::vector<TypeRefinementContext *> Children;
 
@@ -185,38 +185,39 @@ private:
     unsigned needsExpansion : 1;
   } LazyInfo = {};
 
+  void verify(const TypeRefinementContext *parent, ASTContext &ctx) const;
+
   TypeRefinementContext(ASTContext &Ctx, IntroNode Node,
                         TypeRefinementContext *Parent, SourceRange SrcRange,
-                        const AvailabilityContext &Info,
-                        const AvailabilityContext &ExplicitInfo);
+                        const AvailabilityRange &Info,
+                        const AvailabilityRange &ExplicitInfo);
 
 public:
   
   /// Create the root refinement context for the given SourceFile.
-  static TypeRefinementContext *createRoot(SourceFile *SF,
-                                           const AvailabilityContext &Info);
+  static TypeRefinementContext *
+  createForSourceFile(SourceFile *SF, const AvailabilityRange &Info);
 
   /// Create a refinement context for the given declaration.
-  static TypeRefinementContext *createForDecl(ASTContext &Ctx, Decl *D,
-                                              TypeRefinementContext *Parent,
-                                              const AvailabilityContext &Info,
-                                              const AvailabilityContext &ExplicitInfo,
-                                              SourceRange SrcRange);
+  static TypeRefinementContext *
+  createForDecl(ASTContext &Ctx, Decl *D, TypeRefinementContext *Parent,
+                const AvailabilityRange &Info,
+                const AvailabilityRange &ExplicitInfo, SourceRange SrcRange);
 
   /// Create a refinement context for the given declaration.
   static TypeRefinementContext *
   createForDeclImplicit(ASTContext &Ctx, Decl *D, TypeRefinementContext *Parent,
-                        const AvailabilityContext &Info, SourceRange SrcRange);
+                        const AvailabilityRange &Info, SourceRange SrcRange);
 
   /// Create a refinement context for the Then branch of the given IfStmt.
   static TypeRefinementContext *
   createForIfStmtThen(ASTContext &Ctx, IfStmt *S, TypeRefinementContext *Parent,
-                      const AvailabilityContext &Info);
+                      const AvailabilityRange &Info);
 
   /// Create a refinement context for the Else branch of the given IfStmt.
   static TypeRefinementContext *
   createForIfStmtElse(ASTContext &Ctx, IfStmt *S, TypeRefinementContext *Parent,
-                      const AvailabilityContext &Info);
+                      const AvailabilityRange &Info);
 
   /// Create a refinement context for the true-branch control flow to
   /// further StmtConditionElements following a #available() query in
@@ -225,26 +226,24 @@ public:
   createForConditionFollowingQuery(ASTContext &Ctx, PoundAvailableInfo *PAI,
                                    const StmtConditionElement &LastElement,
                                    TypeRefinementContext *Parent,
-                                   const AvailabilityContext &Info);
+                                   const AvailabilityRange &Info);
 
   /// Create a refinement context for the fallthrough of a GuardStmt.
-  static TypeRefinementContext *
-  createForGuardStmtFallthrough(ASTContext &Ctx, GuardStmt *RS,
-                                  BraceStmt *ContainingBraceStmt,
-                                  TypeRefinementContext *Parent,
-                                  const AvailabilityContext &Info);
+  static TypeRefinementContext *createForGuardStmtFallthrough(
+      ASTContext &Ctx, GuardStmt *RS, BraceStmt *ContainingBraceStmt,
+      TypeRefinementContext *Parent, const AvailabilityRange &Info);
 
   /// Create a refinement context for the else branch of a GuardStmt.
   static TypeRefinementContext *
   createForGuardStmtElse(ASTContext &Ctx, GuardStmt *RS,
                          TypeRefinementContext *Parent,
-                         const AvailabilityContext &Info);
+                         const AvailabilityRange &Info);
 
   /// Create a refinement context for the body of a WhileStmt.
   static TypeRefinementContext *
   createForWhileStmtBody(ASTContext &Ctx, WhileStmt *WS,
                          TypeRefinementContext *Parent,
-                         const AvailabilityContext &Info);
+                         const AvailabilityRange &Info);
 
   Decl *getDeclOrNull() const {
     auto IntroReason = getReason();
@@ -282,21 +281,18 @@ public:
 
   /// Returns the information on what can be assumed present at run time when
   /// running code contained in this context.
-  const AvailabilityContext &getAvailabilityInfo() const {
+  const AvailabilityRange &getAvailabilityInfo() const {
     return AvailabilityInfo;
   }
 
   /// Returns the information on what availability was specified by the programmer
   /// on this context (if any).
-  const AvailabilityContext &getExplicitAvailabilityInfo() const {
+  const AvailabilityRange &getExplicitAvailabilityInfo() const {
     return ExplicitAvailabilityInfo;
   }
 
   /// Adds a child refinement context.
-  void addChild(TypeRefinementContext *Child) {
-    assert(Child->getSourceRange().isValid());
-    Children.push_back(Child);
-  }
+  void addChild(TypeRefinementContext *Child, ASTContext &Ctx);
 
   /// Returns the inner-most TypeRefinementContext descendant of this context
   /// for the given source location.
@@ -308,6 +304,10 @@ public:
   void setNeedsExpansion(bool needsExpansion) {
     LazyInfo.needsExpansion = needsExpansion;
   }
+
+  /// Recursively check the tree for integrity. If any errors are found, emits
+  /// diagnosticts to stderr and aborts.
+  void verify(ASTContext &ctx);
 
   SWIFT_DEBUG_DUMPER(dump(SourceManager &SrcMgr));
   void dump(raw_ostream &OS, SourceManager &SrcMgr) const;

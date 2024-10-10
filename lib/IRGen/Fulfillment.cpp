@@ -24,6 +24,7 @@
 #include "swift/AST/Decl.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SubstitutionMap.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/SILWitnessTable.h"
 #include "swift/SIL/TypeLowering.h"
 
@@ -117,6 +118,10 @@ static bool isLeafTypeMetadata(CanType type) {
   case TypeKind::Metatype:
   case TypeKind::ExistentialMetatype:
     return false;
+
+  // Integer types are leaves.
+  case TypeKind::Integer:
+    return true;
   }
   llvm_unreachable("bad type kind");
 }
@@ -208,7 +213,7 @@ bool FulfillmentMap::searchTypeMetadata(IRGenModule &IGM, CanType type,
 
 static CanType getSingletonPackExpansionParameter(
     CanPackType packType, const FulfillmentMap::InterestingKeysCallback &keys,
-    llvm::Optional<unsigned> &packExpansionComponent) {
+    std::optional<unsigned> &packExpansionComponent) {
   if (auto expansion = packType.unwrapSingletonPackExpansion()) {
     if (keys.isInterestingPackExpansion(expansion)) {
       packExpansionComponent = 0;
@@ -230,7 +235,7 @@ bool FulfillmentMap::searchTypeMetadataPack(IRGenModule &IGM,
   // expansion over one.
   // TODO: we can also fulfill pack expansions if we can slice away
   // constant-sized prefixes and suffixes.
-  llvm::Optional<unsigned> packExpansionComponent;
+  std::optional<unsigned> packExpansionComponent;
   if (auto parameter = getSingletonPackExpansionParameter(packType, keys,
                                                     packExpansionComponent)) {
     MetadataPath singletonPath = path;
@@ -254,7 +259,7 @@ bool FulfillmentMap::searchConformance(
 
   SILWitnessTable::enumerateWitnessTableConditionalConformances(
       conformance, [&](unsigned index, CanType type, ProtocolDecl *protocol) {
-        llvm::Optional<unsigned> packExpansionComponent;
+        std::optional<unsigned> packExpansionComponent;
 
         if (auto packType = dyn_cast<PackType>(type)) {
           auto param =
@@ -360,7 +365,7 @@ bool FulfillmentMap::searchNominalTypeMetadata(IRGenModule &IGM,
 
   bool hadFulfillment = false;
 
-  auto subs = type->getContextSubstitutionMap(IGM.getSwiftModule(), nominal);
+  auto subs = type->getContextSubstitutionMap();
 
   GenericTypeRequirements requirements(IGM, nominal);
 
@@ -402,7 +407,7 @@ bool FulfillmentMap::searchNominalTypeMetadata(IRGenModule &IGM,
     }
     case GenericRequirement::Kind::WitnessTablePack:
     case GenericRequirement::Kind::WitnessTable: {
-      llvm::Optional<unsigned> packExpansionComponent;
+      std::optional<unsigned> packExpansionComponent;
       if (requirement.getKind() == GenericRequirement::Kind::WitnessTable) {
         // Ignore it unless the type itself is interesting.
         if (!keys.isInterestingType(arg))
@@ -427,6 +432,17 @@ bool FulfillmentMap::searchNominalTypeMetadata(IRGenModule &IGM,
       hadFulfillment |=
         searchWitnessTable(IGM, arg, requirement.getProtocol(),
                            source, std::move(argPath), keys);
+      break;
+    }
+    case GenericRequirement::Kind::Value: {
+      // Refine the path.
+      MetadataPath argPath = path;
+      argPath.addNominalValueArgumentComponent(reqtIndex);
+
+      hadFulfillment |=
+        addFulfillment(GenericRequirement::forValue(arg), source,
+                       std::move(argPath), MetadataState::Complete);
+
       break;
     }
     }

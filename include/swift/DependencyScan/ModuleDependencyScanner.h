@@ -51,8 +51,12 @@ private:
   scanFilesystemForSwiftModuleDependency(Identifier moduleName,
                                          const ModuleDependenciesCache &cache);
 
+  // Worker-specific instance of CompilerInvocation
+  std::unique_ptr<CompilerInvocation> workerCompilerInvocation;
+  // Worker-specific instance of ASTContext
+  std::unique_ptr<ASTContext> workerASTContext;
   // An AST delegate for interface scanning.
-  std::unique_ptr<InterfaceSubContextDelegateImpl> ScanningASTDelegate;
+  std::unique_ptr<InterfaceSubContextDelegateImpl> scanningASTDelegate;
   // The Clang scanner tool used by this worker.
   clang::tooling::dependencies::DependencyScanningTool clangScanningTool;
   // Swift and Clang module loaders acting as scanners.
@@ -72,9 +76,8 @@ public:
                           DiagnosticEngine &diags, bool ParallelScan);
 
   /// Identify the scanner invocation's main module's dependencies
-  llvm::ErrorOr<ModuleDependencyInfo> getMainModuleDependencyInfo(
-      ModuleDecl *mainModule,
-      llvm::Optional<SwiftDependencyTracker> tracker = llvm::None);
+  llvm::ErrorOr<ModuleDependencyInfo>
+  getMainModuleDependencyInfo(ModuleDecl *mainModule);
 
   /// Resolve module dependencies of the given module, computing a full
   /// transitive closure dependency graph.
@@ -84,13 +87,13 @@ public:
 
   /// Query the module dependency info for the Clang module with the given name.
   /// Explicit by-name lookups are useful for batch mode scanning.
-  llvm::Optional<const ModuleDependencyInfo *>
+  std::optional<const ModuleDependencyInfo *>
   getNamedClangModuleDependencyInfo(StringRef moduleName,
                                     ModuleDependenciesCache &cache);
 
   /// Query the module dependency info for the Swift module with the given name.
   /// Explicit by-name lookups are useful for batch mode scanning.
-  llvm::Optional<const ModuleDependencyInfo *>
+  std::optional<const ModuleDependencyInfo *>
   getNamedSwiftModuleDependencyInfo(StringRef moduleName,
                                     ModuleDependenciesCache &cache);
 
@@ -107,9 +110,9 @@ private:
                             ModuleDependenciesCache &cache,
                             ModuleDependencyIDSetVector &directDependencies);
 
-  /// If a module has a bridging header, execute a dependency scan
+  /// If a module has a bridging header or other header inputs, execute a dependency scan
   /// on it and record the dependencies.
-  void resolveBridgingHeaderDependencies(
+  void resolveHeaderDependencies(
       const ModuleDependencyID &moduleID, ModuleDependenciesCache &cache,
       std::vector<std::string> &allClangModules,
       llvm::StringSet<> &alreadyKnownModules,

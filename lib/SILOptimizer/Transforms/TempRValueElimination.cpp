@@ -18,6 +18,7 @@
 
 #define DEBUG_TYPE "sil-temp-rvalue-opt"
 
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/BasicBlockUtils.h"
 #include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/MemAccessUtils.h"
@@ -201,7 +202,7 @@ collectLoads(Operand *addressUse, CopyAddrInst *originalCopy,
   case SILInstructionKind::TryApplyInst:
   case SILInstructionKind::BeginApplyInst: {
     auto convention = ApplySite(user).getArgumentConvention(*addressUse);
-    if (!convention.isGuaranteedConvention())
+    if (!convention.isGuaranteedConventionInCaller())
       return false;
 
     loadInsts.insert(user);
@@ -221,7 +222,7 @@ collectLoads(Operand *addressUse, CopyAddrInst *originalCopy,
   case SILInstructionKind::YieldInst: {
     auto *yield = cast<YieldInst>(user);
     auto convention = yield->getArgumentConventionForOperand(*addressUse);
-    if (!convention.isGuaranteedConvention())
+    if (!convention.isGuaranteedConventionInCaller())
       return false;
 
     loadInsts.insert(user);
@@ -401,14 +402,14 @@ bool TempRValueOptPass::extendAccessScopes(
       if (endAccessToMove)
         return false;
       // Is this the end of an access scope of the copy-source?
-      if (!aa->isNoAlias(copySrc, endAccess->getSource()) &&
+      if (aa->mayAlias(copySrc, endAccess->getSource()) &&
 
-          // There cannot be any aliasing modifying accesses within the liferange
-          // of the temporary, because we would have cought this in
+          // There cannot be any aliasing modifying accesses within the
+          // liverange of the temporary, because we would have cought this in
           // `getLastUseWhileSourceIsNotModified`.
-          // But there are cases where `AliasAnalysis::isNoAlias` is less precise
-          // than `AliasAnalysis::mayWriteToMemory`. Therefore, just ignore any
-          // non-read accesses.
+          // But there are cases where `AliasAnalysis::isNoAlias` is less
+          // precise than `AliasAnalysis::mayWriteToMemory`. Therefore, just
+          // ignore any non-read accesses.
           endAccess->getBeginAccess()->getAccessKind() == SILAccessKind::Read) {
 
         // Don't move instructions beyond the block's terminator.
@@ -527,7 +528,7 @@ void TempRValueOptPass::tryOptimizeCopyIntoTemp(CopyAddrInst *copyInst) {
     if (!storage.base)
       return;
     if (auto *arg = dyn_cast<SILFunctionArgument>(storage.base))
-      if (arg->getOwnershipKind() != OwnershipKind::Guaranteed)
+      if (!arg->getArgumentConvention().isGuaranteedConventionInCallee())
         return;
   }
 
@@ -847,7 +848,9 @@ TempRValueOptPass::tryOptimizeStoreIntoTemp(StoreInst *si) {
       assert(mdi->getBase() == tempObj);
       SILBuilderWithScope builder(user);
       auto newInst = builder.createMarkDependence(user->getLoc(),
-                       mdi->getValue(), si->getSrc());
+                                                  mdi->getValue(),
+                                                  si->getSrc(),
+                                                  mdi->dependenceKind());
       mdi->replaceAllUsesWith(newInst);
       toDelete.push_back(mdi);
       break;
@@ -960,9 +963,10 @@ void TempRValueOptPass::run() {
   }
 
   // Call the utlity to complete ossa lifetime.
-  OSSALifetimeCompletion completion(function, da->get(function));
+  OSSALifetimeCompletion completion(function, da->get(function), deBlocks);
   for (auto it : valuesToComplete) {
-    completion.completeOSSALifetime(it, /* forceBoundaryCompletion */ true);
+    completion.completeOSSALifetime(it,
+                                    OSSALifetimeCompletion::Boundary::Liveness);
   }
 }
 

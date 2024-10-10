@@ -21,6 +21,7 @@
 #include "TypeChecker.h"
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/ASTWalker.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/GenericEnvironment.h"
@@ -28,6 +29,7 @@
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Sema/ConstraintGraph.h"
 #include "swift/Sema/ConstraintSystem.h"
 #include "swift/Sema/IDETypeChecking.h"
@@ -102,7 +104,7 @@ namespace {
 
     PreWalkResult<Expr *> walkToExprPre(Expr *expr) override {
       if (isa<ClosureExpr>(expr))
-        return Action::SkipChildren(expr);
+        return Action::SkipNode(expr);
 
       // Store top-level binary exprs for further analysis.
       if (isa<BinaryExpr>(expr) ||
@@ -119,34 +121,30 @@ namespace {
           // we look at the assignment.
           isa<AssignExpr>(expr)) {
         LinkedExprs.push_back(expr);
-        return Action::SkipChildren(expr);
+        return Action::SkipNode(expr);
       }
       
       return Action::Continue(expr);
     }
-    
-    PostWalkResult<Expr *> walkToExprPost(Expr *expr) override {
-      return Action::Continue(expr);
-    }
-    
+
     /// Ignore statements.
     PreWalkResult<Stmt *> walkToStmtPre(Stmt *stmt) override {
-      return Action::SkipChildren(stmt);
+      return Action::SkipNode(stmt);
     }
     
     /// Ignore declarations.
     PreWalkAction walkToDeclPre(Decl *decl) override {
-      return Action::SkipChildren();
+      return Action::SkipNode();
     }
 
     /// Ignore patterns.
     PreWalkResult<Pattern *> walkToPatternPre(Pattern *pat) override {
-      return Action::SkipChildren(pat);
+      return Action::SkipNode(pat);
     }
 
     /// Ignore types.
     PreWalkAction walkToTypeReprPre(TypeRepr *T) override {
-      return Action::SkipChildren();
+      return Action::SkipNode();
     }
   };
   
@@ -170,7 +168,7 @@ namespace {
     PreWalkResult<Expr *> walkToExprPre(Expr *expr) override {
       if (isa<LiteralExpr>(expr)) {
         LTI.hasLiteral = true;
-        return Action::SkipChildren(expr);
+        return Action::SkipNode(expr);
       }
 
       if (isa<CollectionExpr>(expr)) {
@@ -183,17 +181,17 @@ namespace {
           LTI.collectedTypes.insert(CS.getType(UDE).getPointer());
         
         // Don't recurse into the base expression.
-        return Action::SkipChildren(expr);
+        return Action::SkipNode(expr);
       }
 
 
       if (isa<ClosureExpr>(expr)) {
-        return Action::SkipChildren(expr);
+        return Action::SkipNode(expr);
       }
 
       if (auto FVE = dyn_cast<ForceValueExpr>(expr)) {
         LTI.collectedTypes.insert(CS.getType(FVE).getPointer());
-        return Action::SkipChildren(expr);
+        return Action::SkipNode(expr);
       }
 
       if (auto DRE = dyn_cast<DeclRefExpr>(expr)) {
@@ -201,7 +199,7 @@ namespace {
           if (CS.hasType(DRE)) {
             LTI.collectedTypes.insert(CS.getType(DRE).getPointer());
           }
-          return Action::SkipChildren(expr);
+          return Action::SkipNode(expr);
         } 
       }             
 
@@ -210,8 +208,8 @@ namespace {
       // looking any further.
       if (isa<ApplyExpr>(expr) &&
           !(isa<BinaryExpr>(expr) || isa<PrefixUnaryExpr>(expr) ||
-            isa<PostfixUnaryExpr>(expr))) {      
-        return Action::SkipChildren(expr);
+            isa<PostfixUnaryExpr>(expr))) {
+        return Action::SkipNode(expr);
       }
 
       if (auto *binaryExpr = dyn_cast<BinaryExpr>(expr)) {
@@ -221,7 +219,7 @@ namespace {
       if (auto favoredType = CS.getFavoredType(expr)) {
         LTI.collectedTypes.insert(favoredType);
 
-        return Action::SkipChildren(expr);
+        return Action::SkipNode(expr);
       }
 
       // Optimize branches of a conditional expression separately.
@@ -229,13 +227,13 @@ namespace {
         CS.optimizeConstraints(IE->getCondExpr());
         CS.optimizeConstraints(IE->getThenExpr());
         CS.optimizeConstraints(IE->getElseExpr());
-        return Action::SkipChildren(expr);
+        return Action::SkipNode(expr);
       }      
 
       // For exprs of a tuple, avoid favoring. (We need to allow for cases like
       // (Int, Int32).)
       if (isa<TupleExpr>(expr)) {
-        return Action::SkipChildren(expr);
+        return Action::SkipNode(expr);
       }
 
       // Coercion exprs have a rigid type, so there's no use in gathering info
@@ -246,7 +244,7 @@ namespace {
         // because that might lead to overly eager type variable merging.
         if (!coercion->isLiteralInit())
           LTI.collectedTypes.insert(CS.getType(expr).getPointer());
-        return Action::SkipChildren(expr);
+        return Action::SkipNode(expr);
       }
 
       // Don't walk into subscript expressions - to do so would risk factoring
@@ -254,14 +252,14 @@ namespace {
       // if the index expression is a literal type that differs from the return
       // type of the subscript operation.)
       if (isa<SubscriptExpr>(expr) || isa<DynamicLookupExpr>(expr)) {
-        return Action::SkipChildren(expr);
+        return Action::SkipNode(expr);
       }
       
       // Don't walk into unresolved member expressions - we avoid merging type
       // variables inside UnresolvedMemberExpr and those outside, since they
       // should be allowed to behave independently in CS.
       if (isa<UnresolvedMemberExpr>(expr)) {
-        return Action::SkipChildren(expr);
+        return Action::SkipNode(expr);
       }
 
       return Action::Continue(expr);
@@ -269,22 +267,22 @@ namespace {
     
     /// Ignore statements.
     PreWalkResult<Stmt *> walkToStmtPre(Stmt *stmt) override {
-      return Action::SkipChildren(stmt);
+      return Action::SkipNode(stmt);
     }
     
     /// Ignore declarations.
     PreWalkAction walkToDeclPre(Decl *decl) override {
-      return Action::SkipChildren();
+      return Action::SkipNode();
     }
 
     /// Ignore patterns.
     PreWalkResult<Pattern *> walkToPatternPre(Pattern *pat) override {
-      return Action::SkipChildren(pat);
+      return Action::SkipNode(pat);
     }
 
     /// Ignore types.
     PreWalkAction walkToTypeReprPre(TypeRepr *T) override {
-      return Action::SkipChildren();
+      return Action::SkipNode();
     }
   };
   
@@ -817,7 +815,7 @@ namespace {
 
     PreWalkResult<Expr *> walkToExprPre(Expr *expr) override {
       if (CS.isArgumentIgnoredForCodeCompletion(expr)) {
-        return Action::SkipChildren(expr);
+        return Action::SkipNode(expr);
       }
       
       if (auto applyExpr = dyn_cast<ApplyExpr>(expr)) {
@@ -844,23 +842,18 @@ namespace {
       }
 
       if (isa<ClosureExpr>(expr))
-        return Action::SkipChildren(expr);
+        return Action::SkipNode(expr);
 
       return Action::Continue(expr);
     }
-    
-    PostWalkResult<Expr *> walkToExprPost(Expr *expr) override {
-      return Action::Continue(expr);
-    }
-    
     /// Ignore statements.
     PreWalkResult<Stmt *> walkToStmtPre(Stmt *stmt) override {
-      return Action::SkipChildren(stmt);
+      return Action::SkipNode(stmt);
     }
     
     /// Ignore declarations.
     PreWalkAction walkToDeclPre(Decl *decl) override {
-      return Action::SkipChildren();
+      return Action::SkipNode();
     }
   };
 } // end anonymous namespace
@@ -879,6 +872,14 @@ void TypeVarRefCollector::inferTypeVars(Decl *D) {
   TypeVars.insert(typeVars.begin(), typeVars.end());
 }
 
+void TypeVarRefCollector::inferTypeVars(PackExpansionExpr *E) {
+  auto expansionType = CS.getType(E)->castTo<PackExpansionType>();
+
+  SmallPtrSet<TypeVariableType *, 4> referencedVars;
+  expansionType->getTypeVariables(referencedVars);
+  TypeVars.insert(referencedVars.begin(), referencedVars.end());
+}
+
 ASTWalker::PreWalkResult<Expr *>
 TypeVarRefCollector::walkToExprPre(Expr *expr) {
   if (isa<ClosureExpr>(expr))
@@ -888,7 +889,7 @@ TypeVarRefCollector::walkToExprPre(Expr *expr) {
     inferTypeVars(DRE->getDecl());
 
   // FIXME: We can see UnresolvedDeclRefExprs here because we don't walk into
-  // patterns when running preCheckExpression, since we don't resolve patterns
+  // patterns when running preCheckTarget, since we don't resolve patterns
   // until CSGen. We ought to consider moving pattern resolution into
   // pre-checking, which would allow us to pre-check patterns normally.
   if (auto *declRef = dyn_cast<UnresolvedDeclRefExpr>(expr)) {
@@ -900,6 +901,14 @@ TypeVarRefCollector::walkToExprPre(Expr *expr) {
       inferTypeVars(D);
     }
   }
+
+  if (auto *packElement = getAsExpr<PackElementExpr>(expr)) {
+    // If environment hasn't been established yet, it means that pack expansion
+    // appears inside of this closure.
+    if (auto *outerEnvironment = CS.getPackEnvironment(packElement))
+      inferTypeVars(outerEnvironment);
+  }
+
   return Action::Continue(expr);
 }
 
@@ -942,7 +951,7 @@ namespace {
     llvm::MapVector<UnresolvedMemberExpr *, Type> UnresolvedBaseTypes;
 
     /// A stack of pack expansions that can open pack elements.
-    llvm::SmallVector<PackExpansionExpr *, 2> PackElementEnvironments;
+    llvm::SmallVector<PackExpansionExpr *, 1> OuterExpansions;
 
     /// Returns false and emits the specified diagnostic if the member reference
     /// base is a nil literal. Returns true otherwise.
@@ -1009,7 +1018,7 @@ namespace {
       }
       unsigned options = (TVO_CanBindToLValue |
                           TVO_CanBindToNoEscape);
-      if (!PackElementEnvironments.empty())
+      if (!OuterExpansions.empty())
         options |= TVO_CanBindToPack;
 
       auto tv = CS.createTypeVariable(
@@ -1194,6 +1203,12 @@ namespace {
       // result builders could generate constraints for its body
       // in the middle of the solving.
       CS.setPhase(ConstraintSystemPhase::ConstraintGeneration);
+
+      // Pick up the saved stack of pack expansions so we can continue
+      // to handle pack element references inside the closure body.
+      if (auto *ACE = dyn_cast<AbstractClosureExpr>(CurDC)) {
+        OuterExpansions = CS.getCapturedExpansions(ACE);
+      }
     }
 
     virtual ~ConstraintGenerator() {
@@ -1202,8 +1217,8 @@ namespace {
 
     ConstraintSystem &getConstraintSystem() const { return CS; }
 
-    void addPackElementEnvironment(PackExpansionExpr *expr) {
-      PackElementEnvironments.push_back(expr);
+    void pushPackExpansionExpr(PackExpansionExpr *expr) {
+      OuterExpansions.push_back(expr);
 
       SmallVector<ASTNode, 2> expandedPacks;
       collectExpandedPacks(expr, expandedPacks);
@@ -1222,6 +1237,7 @@ namespace {
           CS.getConstraintLocator(expr, ConstraintLocator::PackShape);
       auto *shapeTypeVar = CS.createTypeVariable(
           shapeLoc, TVO_CanBindToPack | TVO_CanBindToHole);
+
       auto expansionType = PackExpansionType::get(patternType, shapeTypeVar);
       CS.setType(expr, expansionType);
     }
@@ -1594,7 +1610,7 @@ namespace {
 
       unsigned options = (TVO_CanBindToLValue |
                           TVO_CanBindToNoEscape);
-      if (!PackElementEnvironments.empty())
+      if (!OuterExpansions.empty())
         options |= TVO_CanBindToPack;
 
       // Create an overload choice referencing this declaration and immediately
@@ -1616,25 +1632,37 @@ namespace {
         return E->getType();
 
       // Resolve the super type of 'self'.
-      return getSuperType(E->getSelf(), E->getLoc(),
-                          diag::super_not_in_class_method,
-                          diag::super_with_no_base_class);
+      auto *selfDecl = E->getSelf();
+
+      DeclContext *typeContext = selfDecl->getDeclContext()->getParent();
+      assert(typeContext);
+
+      auto selfTy =
+          CS.DC->mapTypeIntoContext(typeContext->getDeclaredInterfaceType());
+      auto superclassTy = selfTy->getSuperclass();
+
+      if (!superclassTy)
+        return Type();
+
+      if (selfDecl->getInterfaceType()->is<MetatypeType>())
+        superclassTy = MetatypeType::get(superclassTy);
+
+      return superclassTy;
     }
 
     Type
-    resolveTypeReferenceInExpression(TypeRepr *repr, TypeResolverContext resCtx,
+    resolveTypeReferenceInExpression(TypeRepr *repr,
+                                     TypeResolutionOptions options,
                                      const ConstraintLocatorBuilder &locator) {
-      TypeResolutionOptions options(resCtx);
-
       // Introduce type variables for unbound generics.
       const auto genericOpener = OpenUnboundGenericType(CS, locator);
       const auto placeholderHandler = HandlePlaceholderType(CS, locator);
 
       // Add a PackElementOf constraint for 'each T' type reprs.
       PackExpansionExpr *elementEnv = nullptr;
-      if (!PackElementEnvironments.empty()) {
+      if (!OuterExpansions.empty()) {
         options |= TypeResolutionFlags::AllowPackReferences;
-        elementEnv = PackElementEnvironments.back();
+        elementEnv = OuterExpansions.back();
       }
       const auto packElementOpener = OpenPackElementType(CS, locator, elementEnv);
 
@@ -1649,9 +1677,9 @@ namespace {
                                      TVO_CanBindToHole);
       }
       // Diagnose top-level usages of placeholder types.
-      if (isa<PlaceholderTypeRepr>(repr->getWithoutParens())) {
-        CS.getASTContext().Diags.diagnose(repr->getLoc(),
-                                          diag::placeholder_type_not_allowed);
+      if (auto *ty = dyn_cast<PlaceholderTypeRepr>(repr->getWithoutParens())) {
+        auto *loc = CS.getConstraintLocator(locator, {LocatorPathElt::PlaceholderType(ty)});
+        CS.recordFix(IgnoreInvalidPlaceholder::create(CS, loc));
       }
       return result;
     }
@@ -1674,6 +1702,21 @@ namespace {
       if (!type || type->hasError()) return Type();
 
       return MetatypeType::get(type);
+    }
+
+    Type visitTypeValueExpr(TypeValueExpr *E) {
+      auto locator = CS.getConstraintLocator(E);
+      auto type = resolveTypeReferenceInExpression(E->getParamTypeRepr(),
+                                              TypeResolverContext::InExpression,
+                                                  locator);
+
+      if (!type || type->hasError()) {
+        return Type();
+      }
+
+      auto archetype = type->castTo<ArchetypeType>();
+      E->setParamType(archetype);
+      return archetype->getValueType();
     }
 
     Type visitDotSyntaxBaseIgnoredExpr(DotSyntaxBaseIgnoredExpr *expr) {
@@ -1779,7 +1822,7 @@ namespace {
       auto *base = expr->getChainBase();
       assert(base == TypeChecker::getUnresolvedMemberChainBase(tail));
 
-      // The result type of the chain is is represented by a new type variable.
+      // The result type of the chain is represented by a new type variable.
       auto locator = CS.getConstraintLocator(
           expr, ConstraintLocator::UnresolvedMemberChainResult);
       auto chainResultTy = CS.createTypeVariable(
@@ -1876,74 +1919,48 @@ namespace {
     /// introduce them as an explicit generic arguments constraint.
     ///
     /// \returns true if resolving any of the specialization types failed.
-    bool addSpecializationConstraint(
-        ConstraintLocator *locator, Type boundType,
-        ArrayRef<TypeRepr *> specializationArgs) {
+    void addSpecializationConstraint(ConstraintLocator *locator, Type boundType,
+                                     SourceLoc lAngleLoc,
+                                     ArrayRef<TypeRepr *> specializationArgs) {
       // Resolve each type.
       SmallVector<Type, 2> specializationArgTypes;
       auto options =
           TypeResolutionOptions(TypeResolverContext::InExpression);
       for (auto specializationArg : specializationArgs) {
         PackExpansionExpr *elementEnv = nullptr;
-        if (!PackElementEnvironments.empty()) {
+        if (!OuterExpansions.empty()) {
           options |= TypeResolutionFlags::AllowPackReferences;
-          elementEnv = PackElementEnvironments.back();
+          elementEnv = OuterExpansions.back();
         }
-        const auto result = TypeResolution::resolveContextualType(
+        auto result = TypeResolution::resolveContextualType(
             specializationArg, CurDC, options,
             // Introduce type variables for unbound generics.
             OpenUnboundGenericType(CS, locator),
             HandlePlaceholderType(CS, locator),
             OpenPackElementType(CS, locator, elementEnv));
-        if (result->hasError())
-          return true;
-
+        if (result->hasError()) {
+          auto &ctxt = CS.getASTContext();
+          result = PlaceholderType::get(ctxt, specializationArg);
+          ctxt.Diags.diagnose(lAngleLoc,
+                              diag::while_parsing_as_left_angle_bracket);
+        }
         specializationArgTypes.push_back(result);
       }
 
-      CS.addConstraint(
-          ConstraintKind::ExplicitGenericArguments, boundType,
-          PackType::get(CS.getASTContext(), specializationArgTypes),
-          locator);
-      return false;
+      auto constraint = Constraint::create(
+          CS, ConstraintKind::ExplicitGenericArguments, boundType,
+          PackType::get(CS.getASTContext(), specializationArgTypes), locator);
+      CS.addUnsolvedConstraint(constraint);
+      CS.activateConstraint(constraint);
     }
 
     Type visitUnresolvedSpecializeExpr(UnresolvedSpecializeExpr *expr) {
       auto baseTy = CS.getType(expr->getSubExpr());
-
-      if (baseTy->isTypeVariableOrMember()) {
-        return baseTy;
-      }
-
-      // We currently only support explicit specialization of generic types.
-      // FIXME: We could support explicit function specialization.
-      auto &de = CS.getASTContext().Diags;
-      if (baseTy->is<AnyFunctionType>()) {
-        de.diagnose(expr->getSubExpr()->getLoc(),
-                    diag::cannot_explicitly_specialize_generic_function);
-        de.diagnose(expr->getLAngleLoc(),
-                    diag::while_parsing_as_left_angle_bracket);
-        return Type();
-      }
-      
-      if (AnyMetatypeType *meta = baseTy->getAs<AnyMetatypeType>()) {
-        auto *overloadLocator = CS.getConstraintLocator(expr->getSubExpr());
-        if (addSpecializationConstraint(overloadLocator,
-                                        meta->getInstanceType(),
-                                        expr->getUnresolvedParams())) {
-          return Type();
-        }
-
-        return baseTy;
-      }
-
-      // FIXME: If the base type is a type variable, constrain it to a metatype
-      // of a bound generic type.
-      de.diagnose(expr->getSubExpr()->getLoc(),
-                  diag::not_a_generic_definition);
-      de.diagnose(expr->getLAngleLoc(),
-                  diag::while_parsing_as_left_angle_bracket);
-      return Type();
+      auto *overloadLocator = CS.getConstraintLocator(expr->getSubExpr());
+      addSpecializationConstraint(
+          overloadLocator, baseTy->getMetatypeInstanceType(),
+          expr->getLAngleLoc(), expr->getUnresolvedParams());
+      return baseTy;
     }
     
     Type visitSequenceExpr(SequenceExpr *expr) {
@@ -2092,10 +2109,12 @@ namespace {
     }
     
     Type visitArrayExpr(ArrayExpr *expr) {
+      auto &ctx = CS.getASTContext();
+
       // An array expression can be of a type T that conforms to the
       // ExpressibleByArrayLiteral protocol.
-      ProtocolDecl *arrayProto = TypeChecker::getProtocol(
-          CS.getASTContext(), expr->getLoc(),
+      auto *arrayProto = TypeChecker::getProtocol(
+          ctx, expr->getLoc(),
           KnownProtocolKind::ExpressibleByArrayLiteral);
       if (!arrayProto) {
         return Type();
@@ -2110,7 +2129,7 @@ namespace {
       auto contextualType = CS.getContextualType(expr, /*forConstraint=*/false);
       auto contextualPurpose = CS.getContextualTypePurpose(expr);
 
-      auto joinElementTypes = [&](llvm::Optional<Type> elementType) {
+      auto joinElementTypes = [&](std::optional<Type> elementType) {
         const auto elements = expr->getElements();
         unsigned index = 0;
 
@@ -2146,15 +2165,16 @@ namespace {
         if (!contextualType)
           return false;
 
-        auto *M = CS.DC->getParentModule();
-
         auto type = contextualType->lookThroughAllOptionalTypes();
-        if (TypeChecker::conformsToKnownProtocol(
-                type, KnownProtocolKind::ExpressibleByArrayLiteral, M))
+
+        if (lookupConformance(type, arrayProto))
           return false;
 
-        return TypeChecker::conformsToKnownProtocol(
-            type, KnownProtocolKind::ExpressibleByDictionaryLiteral, M);
+        if (auto *proto = ctx.getProtocol(KnownProtocolKind::ExpressibleByDictionaryLiteral))
+          if (lookupConformance(type, proto))
+            return true;
+
+        return false;
       };
 
       if (isDictionaryContextualType(contextualType)) {
@@ -2206,7 +2226,7 @@ namespace {
 
       // The array element type defaults to 'Any'.
       CS.addConstraint(ConstraintKind::Defaultable, arrayElementTy,
-                       CS.getASTContext().getAnyExistentialType(), locator);
+                       ctx.getAnyExistentialType(), locator);
 
       return arrayTy;
     }
@@ -2509,9 +2529,11 @@ namespace {
             return declaredTy;
           }
 
+          auto options =
+              TypeResolutionOptions(TypeResolverContext::InExpression);
+          options.setContext(TypeResolverContext::ClosureExpr);
           const auto resolvedTy = resolveTypeReferenceInExpression(
-              closure->getExplicitResultTypeRepr(),
-              TypeResolverContext::InExpression, resultLocator);
+              closure->getExplicitResultTypeRepr(), options, resultLocator);
           if (resolvedTy)
             return resolvedTy;
         }
@@ -2533,15 +2555,28 @@ namespace {
         // If this is a multi-statement closure, let's mark result
         // as potential hole right away.
         return Type(CS.createTypeVariable(
-            resultLocator,
-            (!CS.participatesInInference(closure) || allowResultBindToHole)
-                ? TVO_CanBindToHole
-                : 0));
+            resultLocator, allowResultBindToHole ? TVO_CanBindToHole : 0));
       }();
 
-      // For a non-async function type, add the global actor if present.
-      if (!extInfo.isAsync()) {
-        extInfo = extInfo.withGlobalActor(getExplicitGlobalActor(closure));
+      // Determine the isolation of the closure.
+      auto isolation = [&] {
+        // Priority goes to an explicit isolated parameter.
+        if (hasIsolatedParameter(closureParams))
+          return FunctionTypeIsolation::forParameter();
+
+        // Honor an explicit global actor.  This is suppressed if the
+        // closure is async (but should it be?).
+        if (!extInfo.isAsync()) {
+          if (auto actorType = getExplicitGlobalActor(closure))
+            return FunctionTypeIsolation::forGlobalActor(actorType);
+        }
+
+        return FunctionTypeIsolation::forNonIsolated();
+      }();
+      extInfo = extInfo.withIsolation(isolation);
+      if (isolation.isGlobalActor() &&
+          CS.getASTContext().LangOpts.hasFeature(Feature::GlobalActorIsolatedTypesUsability)) {
+        extInfo = extInfo.withSendable();
       }
 
       auto *fnTy = FunctionType::get(closureParams, resultTy, extInfo);
@@ -2731,7 +2766,7 @@ namespace {
           // becomes `($T_x, $_T_y) = ($T_s_x, $T_s_y)` which doesn't result in
           // stripping of l-value flag from the right-hand side since
           // simplification can only happen when either side is resolved.
-          auto declTy = varType.transform([&](Type type) -> Type {
+          auto declTy = varType.transformRec([&](Type type) -> std::optional<Type> {
             if (auto *typeVar = type->getAs<TypeVariableType>()) {
               if (typeVar->getImpl().canBindToLValue()) {
                 foundLValueVars = true;
@@ -2740,11 +2775,11 @@ namespace {
                 auto options = typeVar->getImpl().getRawOptions();
                 options &= ~TVO_CanBindToLValue;
 
-                return CS.createTypeVariable(typeVar->getImpl().getLocator(),
-                                             options);
+                return Type(CS.createTypeVariable(typeVar->getImpl().getLocator(),
+                                                  options));
               }
             }
-            return type;
+            return std::nullopt;
           });
 
           // If pattern types allows l-value types, let's create an
@@ -3034,6 +3069,9 @@ namespace {
           Constraint::create(CS, ConstraintKind::FallbackType, closureType,
                              inferredType, locator, referencedVars));
 
+      if (!OuterExpansions.empty())
+        CS.setCapturedExpansions(closure, OuterExpansions);
+
       CS.setClosureType(closure, inferredType);
       return closureType;
     }
@@ -3095,7 +3133,7 @@ namespace {
         virtual PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
           // Don't walk into nested pack expansions
           if (isa<PackExpansionExpr>(E)) {
-            return Action::SkipChildren(E);
+            return Action::SkipNode(E);
           }
 
           if (isa<PackElementExpr>(E)) {
@@ -3124,7 +3162,7 @@ namespace {
         virtual PreWalkAction walkToTypeReprPre(TypeRepr *T) override {
           // Don't walk into nested pack expansions
           if (isa<PackExpansionTypeRepr>(T)) {
-            return Action::SkipChildren();
+            return Action::SkipNode();
           }
 
           if (isa<PackElementTypeRepr>(T)) {
@@ -3139,8 +3177,8 @@ namespace {
     }
 
     Type visitPackExpansionExpr(PackExpansionExpr *expr) {
-      assert(PackElementEnvironments.back() == expr);
-      PackElementEnvironments.pop_back();
+      assert(OuterExpansions.back() == expr);
+      OuterExpansions.pop_back();
 
       auto expansionType = CS.getType(expr)->castTo<PackExpansionType>();
       auto elementResultType = CS.getType(expr->getPatternExpr());
@@ -3161,7 +3199,7 @@ namespace {
       for (auto pack : expandedPacks) {
         Type packType;
         /// Skipping over pack elements because the relationship to its
-        /// environment is now established during \c addPackElementEnvironment
+        /// environment is now established during \c pushPackExpansionExpr
         /// upon visiting its pack expansion and the Shape constraint added
         /// upon visiting the pack element.
         if (isExpr<PackElementExpr>(pack)) {
@@ -3290,37 +3328,6 @@ namespace {
       return resultType;
     }
 
-    Type getSuperType(VarDecl *selfDecl,
-                      SourceLoc diagLoc,
-                      Diag<> diag_not_in_class,
-                      Diag<> diag_no_base_class) {
-      DeclContext *typeContext = selfDecl->getDeclContext()->getParent();
-      assert(typeContext && "constructor without parent context?!");
-
-      auto &de = CS.getASTContext().Diags;
-      ClassDecl *classDecl = typeContext->getSelfClassDecl();
-      if (!classDecl) {
-        de.diagnose(diagLoc, diag_not_in_class);
-        return Type();
-      }
-      if (!classDecl->hasSuperclass()) {
-        de.diagnose(diagLoc, diag_no_base_class);
-        return Type();
-      }
-
-      auto selfTy = CS.DC->mapTypeIntoContext(
-        typeContext->getDeclaredInterfaceType());
-      auto superclassTy = selfTy->getSuperclass();
-
-      if (!superclassTy)
-        return Type();
-
-      if (selfDecl->getInterfaceType()->is<MetatypeType>())
-        superclassTy = MetatypeType::get(superclassTy);
-
-      return superclassTy;
-    }
-    
     Type visitRebindSelfInConstructorExpr(RebindSelfInConstructorExpr *expr) {
       // The result is void.
       return TupleType::getEmpty(CS.getASTContext());
@@ -3515,23 +3522,10 @@ namespace {
       } else {
         auto *locator = CS.getConstraintLocator(expr);
 
-        auto isOrCanBeLValueType = [](Type type) {
-          if (auto *typeVar = type->getAs<TypeVariableType>()) {
-            return typeVar->getImpl().canBindToLValue();
-          }
-          return type->is<LValueType>();
-        };
-
         auto exprType = CS.getType(expr);
-        if (!isOrCanBeLValueType(exprType)) {
-          // Pretend that destination is an l-value type.
-          exprType = LValueType::get(exprType);
-          (void)CS.recordFix(TreatRValueAsLValue::create(CS, locator));
-        }
-
         auto *destTy = CS.createTypeVariable(locator, TVO_CanBindToNoEscape);
-        CS.addConstraint(ConstraintKind::Bind, LValueType::get(destTy),
-                         exprType, locator);
+        CS.addConstraint(ConstraintKind::LValueObject, exprType, destTy,
+                         locator);
         return destTy;
       }
     }
@@ -3914,6 +3908,23 @@ namespace {
       return kpTy;
     }
 
+    Type visitCurrentContextIsolationExpr(CurrentContextIsolationExpr *E) {
+      // If this was expanded from the builtin `#isolation` macro, it
+      // already has a type.
+      if (auto type = E->getType())
+        return type;
+
+      // Otherwise, this was created for a `for await` loop, where its
+      // type is always `(any Actor)?`.
+      auto actorProto = CS.getASTContext().getProtocol(
+          KnownProtocolKind::Actor);
+      return OptionalType::get(actorProto->getDeclaredExistentialType());
+    }
+
+    Type visitExtractFunctionIsolationExpr(ExtractFunctionIsolationExpr *E) {
+      llvm_unreachable("found ExtractFunctionIsolationExpr in CSGen");
+    }
+
     Type visitKeyPathDotExpr(KeyPathDotExpr *E) {
       llvm_unreachable("found KeyPathDotExpr in CSGen");
     }
@@ -4043,10 +4054,9 @@ namespace {
 
       // Add explicit generic arguments, if there were any.
       if (expr->getGenericArgsRange().isValid()) {
-        if (addSpecializationConstraint(
-              CS.getConstraintLocator(expr), macroRefType,
-              expr->getGenericArgs()))
-          return Type();
+        addSpecializationConstraint(CS.getConstraintLocator(expr), macroRefType,
+                                    expr->getGenericArgsRange().Start,
+                                    expr->getGenericArgs());
       }
 
       // Form the applicable-function constraint. The result type
@@ -4078,7 +4088,7 @@ namespace {
         return false;
 
       auto member = UDE->getName().getBaseName().userFacingName();
-      return member.equals("trigger_fallback_diagnostic");
+      return member == "trigger_fallback_diagnostic";
     }
 
     enum class TypeOperation { None,
@@ -4226,13 +4236,13 @@ namespace {
 
       if (CS.isArgumentIgnoredForCodeCompletion(expr)) {
         CG.setTypeForArgumentIgnoredForCompletion(expr);
-        return Action::SkipChildren(expr);
+        return Action::SkipNode(expr);
       }
 
       if (auto *SVE = dyn_cast<SingleValueStmtExpr>(expr)) {
         if (CS.generateConstraints(SVE))
           return Action::Stop();
-        return Action::SkipChildren(expr);
+        return Action::SkipNode(expr);
       }
 
       // Note that the subexpression of a #selector expression is
@@ -4265,7 +4275,7 @@ namespace {
           return Action::Stop();
 
         CS.setType(expr, closureType);
-        return Action::SkipChildren(expr);
+        return Action::SkipNode(expr);
       }
 
       // Don't visit CoerceExpr with an empty sub expression. They may occur
@@ -4273,7 +4283,7 @@ namespace {
       // of an error in the closure's signature.
       if (auto coerceExpr = dyn_cast<CoerceExpr>(expr)) {
         if (!coerceExpr->getSubExpr()) {
-          return Action::SkipChildren(expr);
+          return Action::SkipNode(expr);
         }
       }
 
@@ -4282,7 +4292,7 @@ namespace {
       // of an error in the closure's signature.
       if (auto *ternary = dyn_cast<TernaryExpr>(expr)) {
         if (!ternary->getThenExpr() || !ternary->getElseExpr())
-          return Action::SkipChildren(expr);
+          return Action::SkipNode(expr);
       }
 
       if (CS.isForCodeCompletion()) {
@@ -4294,7 +4304,7 @@ namespace {
       }
 
       if (auto *expansion = dyn_cast<PackExpansionExpr>(expr)) {
-        CG.addPackElementEnvironment(expansion);
+        CG.pushPackExpansionExpr(expansion);
       }
 
       return Action::Continue(expr);
@@ -4348,12 +4358,12 @@ namespace {
 
     /// Ignore statements.
     PreWalkResult<Stmt *> walkToStmtPre(Stmt *stmt) override {
-      return Action::SkipChildren(stmt);
+      return Action::SkipNode(stmt);
     }
 
     /// Ignore declarations.
     PreWalkAction walkToDeclPre(Decl *decl) override {
-      return Action::SkipChildren();
+      return Action::SkipNode();
     }
   };
 } // end anonymous namespace
@@ -4374,8 +4384,6 @@ static Expr *generateConstraintsFor(ConstraintSystem &cs, Expr *expr,
 
 bool ConstraintSystem::generateWrappedPropertyTypeConstraints(
     VarDecl *wrappedVar, Type initializerType, Type propertyType) {
-  auto dc = wrappedVar->getInnermostDeclContext();
-
   Type wrappedValueType;
   Type wrapperType;
   auto wrapperAttributes = wrappedVar->getAttachedPropertyWrappers();
@@ -4409,7 +4417,7 @@ bool ConstraintSystem::generateWrappedPropertyTypeConstraints(
     setType(typeExpr, wrapperType);
 
     wrappedValueType = wrapperType->getTypeOfMember(
-        dc->getParentModule(), wrapperInfo.valueVar);
+        wrapperInfo.valueVar);
   }
 
   // The property type must be equal to the wrapped value type
@@ -4453,7 +4461,7 @@ static bool generateInitPatternConstraints(ConstraintSystem &cs,
 
 /// Generate constraints for a for-in statement preamble where the expression
 /// is a `PackExpansionExpr`.
-static llvm::Optional<PackIterationInfo>
+static std::optional<PackIterationInfo>
 generateForEachStmtConstraints(ConstraintSystem &cs, DeclContext *dc,
                                PackExpansionExpr *expansion, Type patternType) {
   auto packIterationInfo = PackIterationInfo();
@@ -4466,7 +4474,7 @@ generateForEachStmtConstraints(ConstraintSystem &cs, DeclContext *dc,
                                   /*isDiscarded=*/false);
 
     if (cs.generateConstraints(target))
-      return llvm::None;
+      return std::nullopt;
 
     cs.setTargetFor(expansion, target);
   }
@@ -4482,7 +4490,7 @@ generateForEachStmtConstraints(ConstraintSystem &cs, DeclContext *dc,
 
 /// Generate constraints for a for-in statement preamble, expecting an
 /// expression that conforms to `Swift.Sequence`.
-static llvm::Optional<SequenceIterationInfo>
+static std::optional<SequenceIterationInfo>
 generateForEachStmtConstraints(ConstraintSystem &cs, DeclContext *dc,
                                ForEachStmt *stmt, Pattern *typeCheckedPattern,
                                bool shouldBindPatternVarsOneWay,
@@ -4502,7 +4510,7 @@ generateForEachStmtConstraints(ConstraintSystem &cs, DeclContext *dc,
       cs.getASTContext(), stmt->getForLoc(),
       isAsync ? KnownProtocolKind::AsyncSequence : KnownProtocolKind::Sequence);
   if (!sequenceProto)
-    return llvm::None;
+    return std::nullopt;
 
   std::string name;
   {
@@ -4515,6 +4523,19 @@ generateForEachStmtConstraints(ConstraintSystem &cs, DeclContext *dc,
       VarDecl(/*isStatic=*/false, VarDecl::Introducer::Var,
               sequenceExpr->getStartLoc(), ctx.getIdentifier(name), dc);
   makeIteratorVar->setImplicit();
+
+  // FIXME: Apply `nonisolated(unsafe)` to async iterators.
+  //
+  // Async iterators are not `Sendable`; they're only meant to be used from
+  // the isolation domain that creates them. But the `next()` method runs on
+  // the generic executor, so calling it from an actor-isolated context passes
+  // non-`Sendable` state across the isolation boundary. `next()` should
+  // inherit the isolation of the caller, but for now, use the opt out.
+  if (isAsync) {
+    auto *nonisolated = new (ctx)
+        NonisolatedAttr(/*unsafe=*/true, /*implicit=*/true);
+    makeIteratorVar->getAttrs().add(nonisolated);
+  }
 
   // First, let's form a call from sequence to `.makeIterator()` and save
   // that in a special variable which is going to be used by SILGen.
@@ -4534,7 +4555,7 @@ generateForEachStmtConstraints(ConstraintSystem &cs, DeclContext *dc,
         ctx, StaticSpellingKind::None, pattern, makeIteratorCall, dc);
 
     auto makeIteratorTarget = SyntacticElementTarget::forInitialization(
-        makeIteratorCall, dc, /*patternType=*/Type(), PB, /*index=*/0,
+        makeIteratorCall, /*patternType=*/Type(), PB, /*index=*/0,
         /*shouldBindPatternsOneWay=*/false);
 
     ContextualTypeInfo contextInfo(sequenceProto->getDeclaredInterfaceType(),
@@ -4542,7 +4563,7 @@ generateForEachStmtConstraints(ConstraintSystem &cs, DeclContext *dc,
     cs.setContextualInfo(sequenceExpr, contextInfo);
 
     if (cs.generateConstraints(makeIteratorTarget))
-      return llvm::None;
+      return std::nullopt;
 
     sequenceIterationInfo.makeIteratorVar = PB;
 
@@ -4573,19 +4594,35 @@ generateForEachStmtConstraints(ConstraintSystem &cs, DeclContext *dc,
   // Now, result type of `.makeIterator()` is used to form a call to
   // `.next()`. `next()` is called on each iteration of the loop.
   {
+    FuncDecl *nextFn = 
+        TypeChecker::getForEachIteratorNextFunction(dc, stmt->getForLoc(), isAsync);
+    Identifier nextId = nextFn ? nextFn->getName().getBaseIdentifier()
+                               : ctx.Id_next;
+    TinyPtrVector<Identifier> labels;
+    if (nextFn && nextFn->getParameters()->size() == 1)
+      labels.push_back(ctx.Id_isolation);
     auto *nextRef = UnresolvedDotExpr::createImplicit(
         ctx,
         new (ctx) DeclRefExpr(makeIteratorVar, DeclNameLoc(stmt->getForLoc()),
                               /*Implicit=*/true),
-        ctx.Id_next, /*labels=*/ArrayRef<Identifier>());
+        nextId, labels);
     nextRef->setFunctionRefKind(FunctionRefKind::SingleApply);
 
-    Expr *nextCall = CallExpr::createImplicitEmpty(ctx, nextRef);
+    ArgumentList *nextArgs;
+    if (nextFn && nextFn->getParameters()->size() == 1) {
+      auto isolationArg =
+        new (ctx) CurrentContextIsolationExpr(stmt->getForLoc(), Type());
+      nextArgs = ArgumentList::createImplicit(
+          ctx, {Argument(SourceLoc(), ctx.Id_isolation, isolationArg)});
+    } else {
+      nextArgs = ArgumentList::createImplicit(ctx, {});
+    }
+    Expr *nextCall = CallExpr::createImplicit(ctx, nextRef, nextArgs);
 
     // `next` is always async but witness might not be throwing
     if (isAsync) {
       nextCall =
-          AwaitExpr::createImplicit(ctx, /*awaitLoc=*/SourceLoc(), nextCall);
+          AwaitExpr::createImplicit(ctx, nextCall->getLoc(), nextCall);
     }
 
     // The iterator type must conform to IteratorProtocol.
@@ -4595,7 +4632,7 @@ generateForEachStmtConstraints(ConstraintSystem &cs, DeclContext *dc,
           isAsync ? KnownProtocolKind::AsyncIteratorProtocol
                   : KnownProtocolKind::IteratorProtocol);
       if (!iteratorProto)
-        return llvm::None;
+        return std::nullopt;
 
       ContextualTypeInfo contextInfo(iteratorProto->getDeclaredInterfaceType(),
                                      CTP_ForEachSequence);
@@ -4606,7 +4643,7 @@ generateForEachStmtConstraints(ConstraintSystem &cs, DeclContext *dc,
                                       /*contextualType=*/Type(),
                                       /*isDiscarded=*/false);
     if (cs.generateConstraints(nextTarget, FreeTypeVariableBinding::Disallow))
-      return llvm::None;
+      return std::nullopt;
 
     sequenceIterationInfo.nextCall = nextTarget.getAsExpr();
     cs.setTargetFor(sequenceIterationInfo.nextCall, nextTarget);
@@ -4617,7 +4654,7 @@ generateForEachStmtConstraints(ConstraintSystem &cs, DeclContext *dc,
       cs.generateConstraints(typeCheckedPattern, elementLocator,
                              shouldBindPatternVarsOneWay, nullptr, 0);
   if (!initType)
-    return llvm::None;
+    return std::nullopt;
 
   // Add a conversion constraint between the element type of the sequence
   // and the type of the element pattern.
@@ -4638,12 +4675,12 @@ generateForEachStmtConstraints(ConstraintSystem &cs, DeclContext *dc,
   if (whereExpr && !ignoreForEachWhereClause) {
     Type boolType = dc->getASTContext().getBoolType();
     if (!boolType)
-      return llvm::None;
+      return std::nullopt;
 
     SyntacticElementTarget whereTarget(whereExpr, dc, CTP_Condition, boolType,
                                        /*isDiscarded=*/false);
     if (cs.generateConstraints(whereTarget, FreeTypeVariableBinding::Disallow))
-      return llvm::None;
+      return std::nullopt;
 
     cs.setTargetFor(whereExpr, whereTarget);
 
@@ -4658,9 +4695,9 @@ generateForEachStmtConstraints(ConstraintSystem &cs, DeclContext *dc,
   return sequenceIterationInfo;
 }
 
-static llvm::Optional<SyntacticElementTarget>
-generateForEachStmtConstraints(ConstraintSystem &cs,
-                               SyntacticElementTarget target) {
+static std::optional<SyntacticElementTarget>
+generateForEachPreambleConstraints(ConstraintSystem &cs,
+                                   SyntacticElementTarget target) {
   ForEachStmt *stmt = target.getAsForEachStmt();
   auto *forEachExpr = stmt->getParsedSequence();
   auto *dc = target.getDeclContext();
@@ -4671,13 +4708,13 @@ generateForEachStmtConstraints(ConstraintSystem &cs,
   Pattern *pattern = TypeChecker::resolvePattern(stmt->getPattern(), dc,
                                                  /*isStmtCondition*/ false);
   if (!pattern)
-    return llvm::None;
+    return std::nullopt;
   target.setPattern(pattern);
 
   auto contextualPattern = ContextualPattern::forRawPattern(pattern, dc);
 
   if (TypeChecker::typeCheckPattern(contextualPattern)->hasError()) {
-    return llvm::None;
+    return std::nullopt;
   }
 
   if (isa<PackExpansionExpr>(forEachExpr)) {
@@ -4688,7 +4725,7 @@ generateForEachStmtConstraints(ConstraintSystem &cs,
         pattern, elementLocator, target.shouldBindPatternVarsOneWay(), nullptr,
         0);
     if (!patternType)
-      return llvm::None;
+      return std::nullopt;
 
     if (auto whereClause = stmt->getWhere()) {
       cs.recordFix(IgnoreWhereClauseInPackIteration::create(
@@ -4698,7 +4735,7 @@ generateForEachStmtConstraints(ConstraintSystem &cs,
     auto packIterationInfo =
         generateForEachStmtConstraints(cs, dc, expansion, patternType);
     if (!packIterationInfo) {
-      return llvm::None;
+      return std::nullopt;
     }
 
     target.getForEachStmtInfo() = *packIterationInfo;
@@ -4707,7 +4744,7 @@ generateForEachStmtConstraints(ConstraintSystem &cs,
         cs, dc, stmt, pattern, target.shouldBindPatternVarsOneWay(),
         target.ignoreForEachWhereClause());
     if (!sequenceIterationInfo) {
-      return llvm::None;
+      return std::nullopt;
     }
 
     target.getForEachStmtInfo() = *sequenceIterationInfo;
@@ -4730,6 +4767,12 @@ bool ConstraintSystem::generateConstraints(
                     target.getExprContextualTypePurpose()));
       Type var = createTypeVariable(convertTypeLocator, TVO_CanBindToNoEscape);
       target.setExprConversionType(TypeChecker::getOptionalType(expr->getLoc(), var));
+    }
+
+    // If we have a parent return statement, record whether it's implied.
+    if (auto *RS = target.getParentReturnStmt()) {
+      if (RS->isImplied())
+        recordImpliedResult(expr, ImpliedResultKind::Regular);
     }
 
     expr = buildTypeErasedExpr(expr, target.getDeclContext(),
@@ -4759,35 +4802,35 @@ bool ConstraintSystem::generateConstraints(
         // If we have a placeholder originating from a PlaceholderTypeRepr,
         // tack that on to the locator.
         if (auto *placeholderTy = ty->getAs<PlaceholderType>())
-          if (auto *placeholderRepr = placeholderTy->getOriginator()
-                                          .dyn_cast<PlaceholderTypeRepr *>())
+          if (auto *typeRepr = placeholderTy->getOriginator()
+                                          .dyn_cast<TypeRepr *>())
             return getConstraintLocator(
                 convertTypeLocator,
-                LocatorPathElt::PlaceholderType(placeholderRepr));
+                LocatorPathElt::PlaceholderType(typeRepr));
         return convertTypeLocator;
       };
 
       // Substitute type variables in for placeholder types (and unresolved
       // types, if allowed).
       if (allowFreeTypeVariables == FreeTypeVariableBinding::UnresolvedType) {
-        convertType = convertType.transform([&](Type type) -> Type {
+        convertType = convertType.transformRec([&](Type type) -> std::optional<Type> {
           if (type->is<UnresolvedType>() || type->is<PlaceholderType>()) {
-            return createTypeVariable(getLocator(type),
-                                      TVO_CanBindToNoEscape |
-                                          TVO_PrefersSubtypeBinding |
-                                          TVO_CanBindToHole);
+            return Type(createTypeVariable(getLocator(type),
+                                           TVO_CanBindToNoEscape |
+                                               TVO_PrefersSubtypeBinding |
+                                               TVO_CanBindToHole));
           }
-          return type;
+          return std::nullopt;
         });
       } else {
-        convertType = convertType.transform([&](Type type) -> Type {
+        convertType = convertType.transformRec([&](Type type) -> std::optional<Type> {
           if (type->is<PlaceholderType>()) {
-            return createTypeVariable(getLocator(type),
-                                      TVO_CanBindToNoEscape |
-                                          TVO_PrefersSubtypeBinding |
-                                          TVO_CanBindToHole);
+            return Type(createTypeVariable(getLocator(type),
+                                           TVO_CanBindToNoEscape |
+                                               TVO_PrefersSubtypeBinding |
+                                               TVO_CanBindToHole));
           }
-          return type;
+          return std::nullopt;
         });
       }
 
@@ -4838,8 +4881,7 @@ bool ConstraintSystem::generateConstraints(
 
       // Reset binding to point to the resolved pattern. This is required
       // before calling `forPatternBindingDecl`.
-      patternBinding->setPattern(index, pattern,
-                                 patternBinding->getInitContext(index));
+      patternBinding->setPattern(index, pattern);
 
       auto contextualPattern =
           ContextualPattern::forPatternBindingDecl(patternBinding, index);
@@ -4857,7 +4899,7 @@ bool ConstraintSystem::generateConstraints(
       }
 
       auto target = init ? SyntacticElementTarget::forInitialization(
-                               init, dc, patternType, patternBinding, index,
+                               init, patternType, patternBinding, index,
                                /*bindPatternVarsOneWay=*/true)
                          : SyntacticElementTarget::forUninitializedVar(
                                patternBinding, index, patternType);
@@ -4898,10 +4940,17 @@ bool ConstraintSystem::generateConstraints(
     }
   }
 
-  case SyntacticElementTarget::Kind::forEachStmt: {
+  case SyntacticElementTarget::Kind::forEachPreamble: {
+
+    // Cache the outer generic environment, if it exists.
+    if (target.getPackElementEnv()) {
+      PackElementGenericEnvironments.push_back(target.getPackElementEnv());
+      ASSERT(!isRecordingChanges() && "Need to record a change");
+    }
+
     // For a for-each statement, generate constraints for the pattern, where
     // clause, and sequence traversal.
-    auto resultTarget = generateForEachStmtConstraints(*this, target);
+    auto resultTarget = generateForEachPreambleConstraints(*this, target);
     if (!resultTarget)
       return true;
 
@@ -4911,10 +4960,8 @@ bool ConstraintSystem::generateConstraints(
   }
 }
 
-Expr *ConstraintSystem::generateConstraints(
-    Expr *expr, DeclContext *dc, bool isInputExpression) {
-  if (isInputExpression)
-    InputExprs.insert(expr);
+Expr *ConstraintSystem::generateConstraints(Expr *expr, DeclContext *dc) {
+  InputExprs.insert(expr);
   return generateConstraintsFor(*this, expr, dc);
 }
 
@@ -4948,7 +4995,7 @@ bool ConstraintSystem::generateConstraints(StmtCondition condition,
   }
 
   Type boolTy = boolDecl->getDeclaredInterfaceType();
-  for (const auto &condElement : condition) {
+  for (auto &condElement : condition) {
     switch (condElement.getKind()) {
     case StmtConditionElement::CK_Availability:
       // Nothing to do here.
@@ -4999,6 +5046,22 @@ bool ConstraintSystem::generateConstraints(StmtCondition condition,
   return false;
 }
 
+void ConstraintSystem::applyPropertyWrapper(
+    Expr *anchor, AppliedPropertyWrapper applied) {
+  appliedPropertyWrappers[anchor].push_back(applied);
+
+  if (solverState)
+    recordChange(SolverTrail::Change::AppliedPropertyWrapper(anchor));
+}
+
+void ConstraintSystem::removePropertyWrapper(Expr *anchor) {
+  auto found = appliedPropertyWrappers.find(anchor);
+  ASSERT(found != appliedPropertyWrappers.end());
+  auto &wrappers = found->second;
+  ASSERT(!wrappers.empty());
+  wrappers.pop_back();
+}
+
 ConstraintSystem::TypeMatchResult
 ConstraintSystem::applyPropertyWrapperToParameter(
     Type wrapperType, Type paramType, ParamDecl *param, Identifier argLabel,
@@ -5032,13 +5095,13 @@ ConstraintSystem::applyPropertyWrapperToParameter(
       setType(param->getPropertyWrapperProjectionVar(), projectionType);
     }
 
-    appliedPropertyWrappers[anchor].push_back({ wrapperType, PropertyWrapperInitKind::ProjectedValue });
+    applyPropertyWrapper(anchor, { wrapperType, PropertyWrapperInitKind::ProjectedValue });
   } else if (param->hasExternalPropertyWrapper()) {
     Type wrappedValueType = computeWrappedValueType(param, wrapperType);
     addConstraint(matchKind, paramType, wrappedValueType, locator);
     setType(param->getPropertyWrapperWrappedValueVar(), wrappedValueType);
 
-    appliedPropertyWrappers[anchor].push_back({ wrapperType, PropertyWrapperInitKind::WrappedValue });
+    applyPropertyWrapper(anchor, { wrapperType, PropertyWrapperInitKind::WrappedValue });
   } else {
     return getTypeMatchFailure(locator);
   }
@@ -5069,7 +5132,7 @@ void ConstraintSystem::optimizeConstraints(Expr *e) {
 struct ResolvedMemberResult::Implementation {
   llvm::SmallVector<ValueDecl*, 4> AllDecls;
   unsigned ViableStartIdx;
-  llvm::Optional<unsigned> BestIdx;
+  std::optional<unsigned> BestIdx;
 };
 
 ResolvedMemberResult::ResolvedMemberResult(): Impl(new Implementation()) {}
@@ -5088,7 +5151,7 @@ getBestOverload() const { return Impl->AllDecls[Impl->BestIdx.value()]; }
 
 ArrayRef<ValueDecl*> ResolvedMemberResult::
 getMemberDecls(InterestedMemberKind Kind) {
-  auto Result = llvm::makeArrayRef(Impl->AllDecls);
+  auto Result = llvm::ArrayRef(Impl->AllDecls);
   switch (Kind) {
   case InterestedMemberKind::Viable:
     return Result.slice(Impl->ViableStartIdx);
@@ -5103,7 +5166,7 @@ getMemberDecls(InterestedMemberKind Kind) {
 ResolvedMemberResult swift::resolveValueMember(DeclContext &DC, Type BaseTy,
                                                DeclName Name) {
   ResolvedMemberResult Result;
-  ConstraintSystem CS(&DC, llvm::None);
+  ConstraintSystem CS(&DC, std::nullopt);
 
   // Look up all members of BaseTy with the given Name.
   MemberLookupResult LookupResult = CS.performMemberLookup(
@@ -5134,7 +5197,7 @@ ResolvedMemberResult swift::resolveValueMember(DeclContext &DC, Type BaseTy,
                                                TVO_CanBindToLValue |
                                                TVO_CanBindToNoEscape);
   CS.addOverloadSet(TV, LookupResult.ViableCandidates, &DC, Locator);
-  llvm::Optional<Solution> OpSolution = CS.solveSingle();
+  std::optional<Solution> OpSolution = CS.solveSingle();
   ValueDecl *Selected = nullptr;
   if (OpSolution.has_value()) {
     Selected = OpSolution.value().overloadChoices[Locator].choice.getDecl();

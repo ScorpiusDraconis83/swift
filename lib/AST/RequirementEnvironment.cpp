@@ -23,6 +23,7 @@
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "llvm/ADT/Statistic.h"
 
 #define DEBUG_TYPE "Protocol conformance checking"
@@ -45,9 +46,10 @@ RequirementEnvironment::RequirementEnvironment(
 
   auto conformanceToWitnessThunkGenericParamFn = [&](GenericTypeParamType *genericParam)
       -> GenericTypeParamType * {
-    return GenericTypeParamType::get(genericParam->isParameterPack(),
+    return GenericTypeParamType::get(genericParam->getParamKind(),
                                      genericParam->getDepth() + (covariantSelf ? 1 : 0),
-                                     genericParam->getIndex(), ctx);
+                                     genericParam->getIndex(),
+                                     genericParam->getValueType(), ctx);
   };
 
   // This is a substitution function from the generic parameters of the
@@ -77,13 +79,9 @@ RequirementEnvironment::RequirementEnvironment(
 
   // Calculate the depth at which the requirement's generic parameters
   // appear in the witness thunk signature.
-  unsigned depth = 0;
-  if (covariantSelf) {
+  unsigned depth = conformanceSig.getNextDepth();
+  if (covariantSelf)
     ++depth;
-  }
-  if (conformanceSig) {
-    depth += conformanceSig.getGenericParams().back()->getDepth() + 1;
-  }
 
   // Build a substitution map to replace the protocol's \c Self and the type
   // parameters of the requirement into a combined context that provides the
@@ -100,8 +98,7 @@ RequirementEnvironment::RequirementEnvironment(
       // type.
       if (type->isEqual(selfType)) {
         if (covariantSelf)
-          return GenericTypeParamType::get(/*isParameterPack=*/false,
-                                           /*depth=*/0, /*index=*/0, ctx);
+          return GenericTypeParamType::getType(/*depth=*/0, /*index=*/0, ctx);
         return substConcreteType;
       }
       // Other requirement generic parameters map 1:1 with their depth
@@ -113,7 +110,8 @@ RequirementEnvironment::RequirementEnvironment(
       if (genericParam->getDepth() != 1)
         return Type();
       Type substGenericParam = GenericTypeParamType::get(
-          genericParam->isParameterPack(), depth, genericParam->getIndex(), ctx);
+          genericParam->getParamKind(), depth, genericParam->getIndex(),
+          genericParam->getValueType(), ctx);
       if (genericParam->isParameterPack()) {
         substGenericParam = PackType::getSingletonPackExpansion(
             substGenericParam);
@@ -128,10 +126,10 @@ RequirementEnvironment::RequirementEnvironment(
         ProtocolConformance *specialized = conformance;
         if (conformance && conformance->getGenericSignature()) {
           auto concreteSubs =
-            substConcreteType->getContextSubstitutionMap(
-              conformanceDC->getParentModule(), conformanceDC);
+            substConcreteType->getContextSubstitutionMap(conformanceDC);
           specialized =
-            ctx.getSpecializedConformance(substConcreteType, conformance,
+            ctx.getSpecializedConformance(substConcreteType,
+                                          cast<NormalProtocolConformance>(conformance),
                                           concreteSubs);
         }
 
@@ -162,8 +160,7 @@ RequirementEnvironment::RequirementEnvironment(
   // If the conforming type is a class, add a class-constrained 'Self'
   // parameter.
   if (covariantSelf) {
-    auto paramTy = GenericTypeParamType::get(/*isParameterPack=*/false,
-                                             /*depth=*/0, /*index=*/0, ctx);
+    auto paramTy = GenericTypeParamType::getType(/*depth=*/0, /*index=*/0, ctx);
     genericParamTypes.push_back(paramTy);
   }
 
@@ -178,8 +175,7 @@ RequirementEnvironment::RequirementEnvironment(
   // Next, add requirements.
   SmallVector<Requirement, 2> requirements;
   if (covariantSelf) {
-    auto paramTy = GenericTypeParamType::get(/*isParameterPack=*/false,
-                                             /*depth=*/0, /*index=*/0, ctx);
+    auto paramTy = GenericTypeParamType::getType(/*depth=*/0, /*index=*/0, ctx);
     Requirement reqt(RequirementKind::Superclass, paramTy, substConcreteType);
     requirements.push_back(reqt);
   }
@@ -202,7 +198,8 @@ RequirementEnvironment::RequirementEnvironment(
 
     // Create an equivalent generic parameter at the next depth.
     auto substGenericParam = GenericTypeParamType::get(
-        genericParam->isParameterPack(), depth, genericParam->getIndex(), ctx);
+        genericParam->getParamKind(), depth, genericParam->getIndex(),
+        genericParam->getValueType(), ctx);
 
     genericParamTypes.push_back(substGenericParam);
   }
@@ -218,5 +215,6 @@ RequirementEnvironment::RequirementEnvironment(
 
   witnessThunkSig = buildGenericSignature(ctx, GenericSignature(),
                                           std::move(genericParamTypes),
-                                          std::move(requirements));
+                                          std::move(requirements),
+                                          /*allowInverses=*/false);
 }

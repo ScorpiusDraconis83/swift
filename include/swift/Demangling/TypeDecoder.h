@@ -22,8 +22,10 @@
 #include "swift/Basic/LLVM.h"
 
 #include "swift/ABI/MetadataValues.h"
+#include "swift/ABI/InvertibleProtocols.h"
 #include "swift/AST/LayoutConstraintKind.h"
 #include "swift/AST/RequirementKind.h"
+#include "swift/Basic/OptionSet.h"
 #include "swift/Basic/Unreachable.h"
 #include "swift/Demangling/Demangler.h"
 #include "swift/Demangling/NamespaceMacros.h"
@@ -31,10 +33,9 @@
 #include "swift/Strings.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/None.h"
-#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/PointerIntPair.h"
 #include "llvm/ADT/StringSwitch.h"
+#include <optional>
 #include <vector>
 
 namespace swift {
@@ -45,6 +46,12 @@ enum class ImplMetatypeRepresentation {
   Thin,
   Thick,
   ObjC,
+};
+
+enum class ImplCoroutineKind {
+  None,
+  YieldOnce,
+  YieldMany,
 };
 
 /// Describe a function parameter, parameterized on the type
@@ -72,11 +79,12 @@ public:
 
   void setVariadic() { Flags = Flags.withVariadic(true); }
   void setAutoClosure() { Flags = Flags.withAutoClosure(true); }
-  void setValueOwnership(ValueOwnership ownership) {
-    Flags = Flags.withValueOwnership(ownership);
+  void setOwnership(ParameterOwnership ownership) {
+    Flags = Flags.withOwnership(ownership);
   }
   void setNoDerivative() { Flags = Flags.withNoDerivative(true); }
   void setIsolated() { Flags = Flags.withIsolated(true); }
+  void setSending() { Flags = Flags.withSending(true); }
   void setFlags(ParameterFlags flags) { Flags = flags; };
 
   FunctionParam withLabel(StringRef label) const {
@@ -106,10 +114,19 @@ enum class ImplParameterConvention {
   Pack_Inout,
 };
 
-enum class ImplParameterDifferentiability {
-  DifferentiableOrNotApplicable,
-  NotDifferentiable
+enum class ImplParameterInfoFlags : uint8_t {
+  NotDifferentiable = 0x1,
+  Sending = 0x2,
 };
+
+using ImplParameterInfoOptions = OptionSet<ImplParameterInfoFlags>;
+
+enum class ImplResultInfoFlags : uint8_t {
+  NotDifferentiable = 0x1,
+  IsSending = 0x2,
+};
+
+using ImplResultInfoOptions = OptionSet<ImplResultInfoFlags>;
 
 /// Describe a lowered function parameter, parameterized on the type
 /// representation.
@@ -117,13 +134,13 @@ template <typename BuiltType>
 class ImplFunctionParam {
   BuiltType Type;
   ImplParameterConvention Convention;
-  ImplParameterDifferentiability Differentiability;
+  ImplParameterInfoOptions Options;
 
 public:
   using ConventionType = ImplParameterConvention;
-  using DifferentiabilityType = ImplParameterDifferentiability;
+  using OptionsType = ImplParameterInfoOptions;
 
-  static llvm::Optional<ConventionType>
+  static std::optional<ConventionType>
   getConventionFromString(StringRef conventionString) {
     if (conventionString == "@in")
       return ConventionType::Indirect_In;
@@ -148,30 +165,45 @@ public:
     if (conventionString == "@pack_inout")
       return ConventionType::Pack_Inout;
 
-    return llvm::None;
+    return std::nullopt;
   }
 
-  static llvm::Optional<DifferentiabilityType>
+  static std::optional<OptionsType>
   getDifferentiabilityFromString(StringRef string) {
+    OptionsType result;
+
     if (string.empty())
-      return DifferentiabilityType::DifferentiableOrNotApplicable;
-    if (string == "@noDerivative")
-      return DifferentiabilityType::NotDifferentiable;
-    return llvm::None;
+      return result;
+
+    if (string == "@noDerivative") {
+      result |= ImplParameterInfoFlags::NotDifferentiable;
+      return result;
+    }
+
+    return {};
+  }
+
+  static OptionsType getSending() {
+    OptionsType result;
+
+    result |= ImplParameterInfoFlags::Sending;
+
+    return result;
   }
 
   ImplFunctionParam(BuiltType type, ImplParameterConvention convention,
-                    ImplParameterDifferentiability diffKind)
-      : Type(type), Convention(convention), Differentiability(diffKind) {}
+                    OptionsType options)
+      : Type(type), Convention(convention), Options(options) {}
 
   ImplParameterConvention getConvention() const { return Convention; }
 
-  ImplParameterDifferentiability getDifferentiability() const {
-    return Differentiability;
-  }
+  OptionsType getOptions() const { return Options; }
 
   BuiltType getType() const { return Type; }
 };
+
+template<typename Type>
+using ImplFunctionYield = ImplFunctionParam<Type>;
 
 enum class ImplResultConvention {
   Indirect,
@@ -193,13 +225,13 @@ template <typename BuiltType>
 class ImplFunctionResult {
   BuiltType Type;
   ImplResultConvention Convention;
-  ImplResultDifferentiability Differentiability;
+  ImplResultInfoOptions Options;
 
 public:
   using ConventionType = ImplResultConvention;
-  using DifferentiabilityType = ImplResultDifferentiability;
+  using OptionsType = ImplResultInfoOptions;
 
-  static llvm::Optional<ConventionType>
+  static std::optional<ConventionType>
   getConventionFromString(StringRef conventionString) {
     if (conventionString == "@out")
       return ConventionType::Indirect;
@@ -214,29 +246,37 @@ public:
     if (conventionString == "@pack_out")
       return ConventionType::Pack;
 
-    return llvm::None;
+    return std::nullopt;
   }
 
-  static llvm::Optional<DifferentiabilityType>
+  static std::optional<OptionsType>
   getDifferentiabilityFromString(StringRef string) {
+    OptionsType result;
+
     if (string.empty())
-      return DifferentiabilityType::DifferentiableOrNotApplicable;
-    if (string == "@noDerivative")
-      return DifferentiabilityType::NotDifferentiable;
-    return llvm::None;
+      return result;
+
+    if (string == "@noDerivative") {
+      result |= ImplResultInfoFlags::NotDifferentiable;
+      return result;
+    }
+
+    return {};
   }
 
-  ImplFunctionResult(
-      BuiltType type, ImplResultConvention convention,
-      ImplResultDifferentiability diffKind =
-          ImplResultDifferentiability::DifferentiableOrNotApplicable)
-      : Type(type), Convention(convention), Differentiability(diffKind) {}
+  static OptionsType getSending() {
+    OptionsType result;
+    result |= ImplResultInfoFlags::IsSending;
+    return result;
+  }
+
+  ImplFunctionResult(BuiltType type, ImplResultConvention convention,
+                     ImplResultInfoOptions options = {})
+      : Type(type), Convention(convention), Options(options) {}
 
   ImplResultConvention getConvention() const { return Convention; }
 
-  ImplResultDifferentiability getDifferentiability() const {
-    return Differentiability;
-  }
+  ImplResultInfoOptions getOptions() const { return Options; }
 
   BuiltType getType() const { return Type; }
 };
@@ -266,59 +306,89 @@ class ImplFunctionTypeFlags {
   unsigned Escaping : 1;
   unsigned Concurrent : 1;
   unsigned Async : 1;
+  unsigned ErasedIsolation : 1;
   unsigned DifferentiabilityKind : 3;
+  unsigned HasSendingResult : 1;
 
 public:
   ImplFunctionTypeFlags()
       : Rep(0), Pseudogeneric(0), Escaping(0), Concurrent(0), Async(0),
-        DifferentiabilityKind(0) {}
+        ErasedIsolation(0), DifferentiabilityKind(0), HasSendingResult(0) {}
 
   ImplFunctionTypeFlags(ImplFunctionRepresentation rep, bool pseudogeneric,
                         bool noescape, bool concurrent, bool async,
-                        ImplFunctionDifferentiabilityKind diffKind)
+                        bool erasedIsolation,
+                        ImplFunctionDifferentiabilityKind diffKind,
+                        bool hasSendingResult)
       : Rep(unsigned(rep)), Pseudogeneric(pseudogeneric), Escaping(noescape),
-        Concurrent(concurrent), Async(async),
-        DifferentiabilityKind(unsigned(diffKind)) {}
+        Concurrent(concurrent), Async(async), ErasedIsolation(erasedIsolation),
+        DifferentiabilityKind(unsigned(diffKind)),
+        HasSendingResult(hasSendingResult) {}
 
   ImplFunctionTypeFlags
   withRepresentation(ImplFunctionRepresentation rep) const {
     return ImplFunctionTypeFlags(
-        rep, Pseudogeneric, Escaping, Concurrent, Async,
-        ImplFunctionDifferentiabilityKind(DifferentiabilityKind));
+        rep, Pseudogeneric, Escaping, Concurrent, Async, ErasedIsolation,
+        ImplFunctionDifferentiabilityKind(DifferentiabilityKind),
+        HasSendingResult);
   }
 
   ImplFunctionTypeFlags
-  withConcurrent() const {
+  withSendable() const {
     return ImplFunctionTypeFlags(
-        ImplFunctionRepresentation(Rep), Pseudogeneric, Escaping, true,
-        Async, ImplFunctionDifferentiabilityKind(DifferentiabilityKind));
+        ImplFunctionRepresentation(Rep), Pseudogeneric, Escaping, true, Async,
+        ErasedIsolation,
+        ImplFunctionDifferentiabilityKind(DifferentiabilityKind),
+        HasSendingResult);
   }
 
   ImplFunctionTypeFlags
   withAsync() const {
     return ImplFunctionTypeFlags(
         ImplFunctionRepresentation(Rep), Pseudogeneric, Escaping, Concurrent,
-        true, ImplFunctionDifferentiabilityKind(DifferentiabilityKind));
+        true, ErasedIsolation,
+        ImplFunctionDifferentiabilityKind(DifferentiabilityKind),
+        HasSendingResult);
   }
 
   ImplFunctionTypeFlags
   withEscaping() const {
     return ImplFunctionTypeFlags(
         ImplFunctionRepresentation(Rep), Pseudogeneric, true, Concurrent, Async,
-        ImplFunctionDifferentiabilityKind(DifferentiabilityKind));
+        ErasedIsolation,
+        ImplFunctionDifferentiabilityKind(DifferentiabilityKind),
+        HasSendingResult);
+  }
+
+  ImplFunctionTypeFlags
+  withErasedIsolation() const {
+    return ImplFunctionTypeFlags(
+        ImplFunctionRepresentation(Rep), Pseudogeneric, Escaping, Concurrent,
+        Async, true, ImplFunctionDifferentiabilityKind(DifferentiabilityKind),
+        HasSendingResult);
   }
   
   ImplFunctionTypeFlags
   withPseudogeneric() const {
     return ImplFunctionTypeFlags(
         ImplFunctionRepresentation(Rep), true, Escaping, Concurrent, Async,
-        ImplFunctionDifferentiabilityKind(DifferentiabilityKind));
+        ErasedIsolation,
+        ImplFunctionDifferentiabilityKind(DifferentiabilityKind),
+        HasSendingResult);
   }
 
   ImplFunctionTypeFlags
   withDifferentiabilityKind(ImplFunctionDifferentiabilityKind diffKind) const {
     return ImplFunctionTypeFlags(ImplFunctionRepresentation(Rep), Pseudogeneric,
-                                 Escaping, Concurrent, Async, diffKind);
+                                 Escaping, Concurrent, Async, ErasedIsolation,
+                                 diffKind, HasSendingResult);
+  }
+
+  ImplFunctionTypeFlags withSendingResult() const {
+    return ImplFunctionTypeFlags(
+        ImplFunctionRepresentation(Rep), Pseudogeneric, Escaping, Concurrent,
+        Async, ErasedIsolation,
+        ImplFunctionDifferentiabilityKind(DifferentiabilityKind), true);
   }
 
   ImplFunctionRepresentation getRepresentation() const {
@@ -333,6 +403,10 @@ public:
 
   bool isPseudogeneric() const { return Pseudogeneric; }
 
+  bool hasErasedIsolation() const { return ErasedIsolation; }
+
+  bool hasSendingResult() const { return HasSendingResult; }
+
   bool isDifferentiable() const {
     return getDifferentiabilityKind() !=
         ImplFunctionDifferentiabilityKind::NonDifferentiable;
@@ -346,35 +420,38 @@ public:
 #if SWIFT_OBJC_INTEROP
 /// For a mangled node that refers to an Objective-C class or protocol,
 /// return the class or protocol name.
-static inline llvm::Optional<StringRef>
+static inline std::optional<StringRef>
 getObjCClassOrProtocolName(NodePointer node) {
   if (node->getKind() != Demangle::Node::Kind::Class &&
       node->getKind() != Demangle::Node::Kind::Protocol)
-    return llvm::None;
+    return std::nullopt;
 
   if (node->getNumChildren() != 2)
-    return llvm::None;
+    return std::nullopt;
 
   // Check whether we have the __ObjC module.
   auto moduleNode = node->getChild(0);
   if (moduleNode->getKind() != Demangle::Node::Kind::Module ||
       moduleNode->getText() != MANGLING_MODULE_OBJC)
-    return llvm::None;
+    return std::nullopt;
 
   // Check whether we have an identifier.
   auto nameNode = node->getChild(1);
   if (nameNode->getKind() != Demangle::Node::Kind::Identifier)
-    return llvm::None;
+    return std::nullopt;
 
   return nameNode->getText();
 }
 #endif
 
 template <typename BuiltType, typename BuiltRequirement,
+          typename BuiltInverseRequirement,
           typename BuiltLayoutConstraint, typename BuilderType>
-void decodeRequirement(NodePointer node,
-                       llvm::SmallVectorImpl<BuiltRequirement> &requirements,
-                       BuilderType &Builder) {
+void decodeRequirement(
+    NodePointer node,
+    llvm::SmallVectorImpl<BuiltRequirement> &requirements,
+    llvm::SmallVectorImpl<BuiltInverseRequirement> &inverseRequirements,
+    BuilderType &Builder) {
   for (auto &child : *node) {
     if (child->getKind() == Demangle::Node::Kind::DependentGenericParamCount ||
         child->getKind() == Demangle::Node::Kind::DependentGenericParamPackMarker)
@@ -398,7 +475,21 @@ void decodeRequirement(NodePointer node,
           child->getChild(1), /*forRequirement=*/false);
       if (!constraintType)
         return;
+    } else if (child->getKind() ==
+          Demangle::Node::Kind::DependentGenericInverseConformanceRequirement) {
+      // Type child
+      auto constraintNode = child->getChild(0);
+      if (constraintNode->getKind() != Demangle::Node::Kind::Type ||
+          constraintNode->getNumChildren() != 1)
+        return;
+
+      auto protocolKind =
+          static_cast<InvertibleProtocolKind>(child->getChild(1)->getIndex());
+      inverseRequirements.push_back(
+          Builder.createInverseRequirement(subjectType, protocolKind));
+      continue;
     }
+
 
     switch (child->getKind()) {
     case Demangle::Node::Kind::DependentGenericConformanceRequirement: {
@@ -419,7 +510,7 @@ void decodeRequirement(NodePointer node,
         return;
 
       auto kind =
-          llvm::StringSwitch<llvm::Optional<LayoutConstraintKind>>(
+          llvm::StringSwitch<std::optional<LayoutConstraintKind>>(
               kindChild->getText())
               .Case("U", LayoutConstraintKind::UnknownLayout)
               .Case("R", LayoutConstraintKind::RefCountedObject)
@@ -431,7 +522,7 @@ void decodeRequirement(NodePointer node,
               .Cases("E", "e", LayoutConstraintKind::TrivialOfExactSize)
               .Cases("M", "m", LayoutConstraintKind::TrivialOfAtMostSize)
               .Case("S", LayoutConstraintKind::TrivialStride)
-              .Default(llvm::None);
+              .Default(std::nullopt);
 
       if (!kind)
         return;
@@ -481,6 +572,7 @@ class TypeDecoder {
   using Field = typename BuilderType::BuiltSILBoxField;
   using BuiltSubstitution = typename BuilderType::BuiltSubstitution;
   using BuiltRequirement = typename BuilderType::BuiltRequirement;
+  using BuiltInverseRequirement = typename BuilderType::BuiltInverseRequirement;
   using BuiltLayoutConstraint = typename BuilderType::BuiltLayoutConstraint;
   using BuiltGenericSignature = typename BuilderType::BuiltGenericSignature;
   using BuiltSubstitutionMap = typename BuilderType::BuiltSubstitutionMap;
@@ -638,7 +730,7 @@ protected:
     case NodeKind::Metatype:
     case NodeKind::ExistentialMetatype: {
       unsigned i = 0;
-      llvm::Optional<ImplMetatypeRepresentation> repr;
+      std::optional<ImplMetatypeRepresentation> repr;
 
       // Handle lowered metatypes in a hackish way. If the representation
       // was not thin, force the resulting typeref to have a non-empty
@@ -743,16 +835,19 @@ protected:
         return protocolType;
 
       llvm::SmallVector<BuiltRequirement, 8> requirements;
+      llvm::SmallVector<BuiltInverseRequirement, 8> inverseRequirements;
 
       auto *reqts = Node->getChild(1);
       if (reqts->getKind() != NodeKind::ConstrainedExistentialRequirementList)
         return MAKE_NODE_TYPE_ERROR0(reqts, "is not requirement list");
 
-      decodeRequirement<BuiltType, BuiltRequirement, BuiltLayoutConstraint,
-                        BuilderType>(reqts, requirements, Builder);
+      decodeRequirement<BuiltType, BuiltRequirement, BuiltInverseRequirement,
+                        BuiltLayoutConstraint, BuilderType>(
+          reqts, requirements, inverseRequirements, Builder);
 
       return Builder.createConstrainedExistentialType(protocolType.getType(),
-                                                      requirements);
+                                                      requirements,
+                                                      inverseRequirements);
     }
     case NodeKind::ConstrainedExistentialSelf:
       return Builder.createGenericTypeParameterType(/*depth*/ 0, /*index*/ 0);
@@ -782,7 +877,9 @@ protected:
     case NodeKind::DependentGenericParamType: {
       auto depth = Node->getChild(0)->getIndex();
       auto index = Node->getChild(1)->getIndex();
-      return Builder.createGenericTypeParameterType(depth, index);
+      return TypeLookupErrorOr<BuiltType>(
+          Builder.createGenericTypeParameterType(depth, index),
+          /*ignoreValueCheck*/ true);
     }
     case NodeKind::EscapingObjCBlock:
     case NodeKind::ObjCBlock:
@@ -798,6 +895,7 @@ protected:
                                     Node->getNumChildren());
 
       FunctionTypeFlags flags;
+      ExtendedFunctionTypeFlags extFlags;
       if (Node->getKind() == NodeKind::ObjCBlock ||
           Node->getKind() == NodeKind::EscapingObjCBlock) {
         flags = flags.withConvention(FunctionMetadataConvention::Block);
@@ -830,6 +928,16 @@ protected:
           return globalActorResult;
 
         globalActorType = globalActorResult.getType();
+        ++firstChildIdx;
+      } else if (Node->getChild(firstChildIdx)->getKind() ==
+                 NodeKind::IsolatedAnyFunctionType) {
+        extFlags = extFlags.withIsolatedAny();
+        ++firstChildIdx;
+      }
+
+      if (Node->getChild(firstChildIdx)->getKind() ==
+          NodeKind::SendingResultFunctionType) {
+        extFlags = extFlags.withSendingResult();
         ++firstChildIdx;
       }
 
@@ -881,6 +989,8 @@ protected:
 
         thrownErrorType = thrownErrorResult.getType();
         ++firstChildIdx;
+
+        extFlags = extFlags.withTypedThrows(true);
       }
 
       bool isSendable = false;
@@ -897,7 +1007,7 @@ protected:
         ++firstChildIdx;
       }
 
-      flags = flags.withConcurrent(isSendable)
+      flags = flags.withSendable(isSendable)
           .withAsync(isAsync).withThrows(isThrow)
           .withDifferentiable(diffKind.isDifferentiable());
 
@@ -927,16 +1037,21 @@ protected:
       if (result.isError())
         return result;
 
+      if (extFlags != ExtendedFunctionTypeFlags())
+        flags = flags.withExtendedFlags(true);
+
       return Builder.createFunctionType(
-          parameters, result.getType(), flags, diffKind, globalActorType,
+          parameters, result.getType(), flags, extFlags, diffKind, globalActorType,
           thrownErrorType);
     }
     case NodeKind::ImplFunctionType: {
       auto calleeConvention = ImplParameterConvention::Direct_Unowned;
       llvm::SmallVector<ImplFunctionParam<BuiltType>, 8> parameters;
+      llvm::SmallVector<ImplFunctionYield<BuiltType>, 8> yields;
       llvm::SmallVector<ImplFunctionResult<BuiltType>, 8> results;
       llvm::SmallVector<ImplFunctionResult<BuiltType>, 8> errorResults;
       ImplFunctionTypeFlags flags;
+      ImplCoroutineKind coroutineKind = ImplCoroutineKind::None;
 
       for (unsigned i = 0; i < Node->getNumChildren(); i++) {
         auto child = Node->getChild(i);
@@ -973,10 +1088,19 @@ protected:
           if (!child->hasText())
             return MAKE_NODE_TYPE_ERROR0(child, "expected text");
           if (child->getText() == "@Sendable") {
-            flags = flags.withConcurrent();
+            flags = flags.withSendable();
           } else if (child->getText() == "@async") {
             flags = flags.withAsync();
           }
+        } else if (child->getKind() == NodeKind::ImplCoroutineKind) {
+          if (!child->hasText())
+            return MAKE_NODE_TYPE_ERROR0(child, "expected text");
+          if (child->getText() == "yield_once") {
+            coroutineKind = ImplCoroutineKind::YieldOnce;
+          } else if (child->getText() == "yield_many") {
+            coroutineKind = ImplCoroutineKind::YieldMany;
+          } else
+            return MAKE_NODE_TYPE_ERROR0(child, "failed to decode coroutine kind");
         } else if (child->getKind() == NodeKind::ImplDifferentiabilityKind) {
           ImplFunctionDifferentiabilityKind implDiffKind;
           switch ((MangledDifferentiabilityKind)child->getIndex()) {
@@ -993,14 +1117,20 @@ protected:
           flags = flags.withDifferentiabilityKind(implDiffKind);
         } else if (child->getKind() == NodeKind::ImplEscaping) {
           flags = flags.withEscaping();
+        } else if (child->getKind() == NodeKind::ImplErasedIsolation) {
+          flags = flags.withErasedIsolation();
         } else if (child->getKind() == NodeKind::ImplParameter) {
           if (decodeImplFunctionParam(child, depth + 1, parameters))
             return MAKE_NODE_TYPE_ERROR0(child,
                                          "failed to decode function parameter");
+        } else if (child->getKind() == NodeKind::ImplYield) {
+          if (decodeImplFunctionParam(child, depth + 1, yields))
+            return MAKE_NODE_TYPE_ERROR0(child,
+                                         "failed to decode function yields");
         } else if (child->getKind() == NodeKind::ImplResult) {
           if (decodeImplFunctionParam(child, depth + 1, results))
             return MAKE_NODE_TYPE_ERROR0(child,
-                                         "failed to decode function parameter");
+                                         "failed to decode function results");
         } else if (child->getKind() == NodeKind::ImplErrorResult) {
           if (decodeImplFunctionPart(child, depth + 1, errorResults))
             return MAKE_NODE_TYPE_ERROR0(child,
@@ -1010,7 +1140,7 @@ protected:
         }
       }
 
-      llvm::Optional<ImplFunctionResult<BuiltType>> errorResult;
+      std::optional<ImplFunctionResult<BuiltType>> errorResult;
       switch (errorResults.size()) {
       case 0:
         break;
@@ -1024,11 +1154,10 @@ protected:
 
       // TODO: Some cases not handled above, but *probably* they cannot
       // appear as the types of values in SIL (yet?):
-      // - functions with yield returns
       // - functions with generic signatures
       // - foreign error conventions
-      return Builder.createImplFunctionType(calleeConvention,
-                                            parameters, results,
+      return Builder.createImplFunctionType(calleeConvention, coroutineKind,
+                                            parameters, yields, results,
                                             errorResult, flags);
     }
 
@@ -1205,6 +1334,7 @@ protected:
       llvm::SmallVector<Field, 4> fields;
       llvm::SmallVector<BuiltSubstitution, 4> substitutions;
       llvm::SmallVector<BuiltRequirement, 4> requirements;
+      llvm::SmallVector<BuiltInverseRequirement, 8> inverseRequirements;
       llvm::SmallVector<BuiltType, 4> genericParams;
 
       if (Node->getNumChildren() < 1)
@@ -1257,10 +1387,10 @@ protected:
         }
 
         // Decode requirements.
-        decodeRequirement<BuiltType, BuiltRequirement, BuiltLayoutConstraint,
-                          BuilderType>(dependentGenericSignatureNode,
-                                       requirements,
-                                       Builder);
+        decodeRequirement<BuiltType, BuiltRequirement, BuiltInverseRequirement,
+                          BuiltLayoutConstraint, BuilderType>(
+            dependentGenericSignatureNode, requirements, inverseRequirements,
+            Builder);
 
         // Decode substitutions.
         for (unsigned i = 0, e = substNode->getNumChildren(); i < e; ++i) {
@@ -1298,7 +1428,8 @@ protected:
       }
 
       return Builder.createSILBoxTypeWithLayout(fields, substitutions,
-                                                requirements);
+                                                requirements,
+                                                inverseRequirements);
     }
     case NodeKind::SugaredOptional: {
       if (Node->getNumChildren() < 1)
@@ -1386,6 +1517,15 @@ protected:
       
       return Builder.resolveOpaqueType(descriptor, genericArgs, ordinal);
     }
+
+    case NodeKind::Integer: {
+      return Builder.createIntegerType((intptr_t)Node->getIndex());
+    }
+
+    case NodeKind::NegativeInteger: {
+      return Builder.createNegativeIntegerType((intptr_t)Node->getIndex());
+    }
+
     // TODO: Handle OpaqueReturnType, when we're in the middle of reconstructing
     // the defining decl
     default:
@@ -1395,8 +1535,8 @@ protected:
   }
 
 private:
-  template<typename Fn>
-  llvm::Optional<TypeLookupError>
+  template <typename Fn>
+  std::optional<TypeLookupError>
   decodeTypeSequenceElement(Demangle::NodePointer node, unsigned depth,
                             Fn resultCallback) {
     if (node->getKind() == NodeKind::Type)
@@ -1444,7 +1584,7 @@ private:
       resultCallback(elementType.getType());
     }
 
-    return llvm::None;
+    return std::nullopt;
   }
 
   template <typename T>
@@ -1461,7 +1601,7 @@ private:
       return true;
 
     StringRef conventionString = node->getChild(0)->getText();
-    llvm::Optional<typename T::ConventionType> convention =
+    std::optional<typename T::ConventionType> convention =
         T::getConventionFromString(conventionString);
     if (!convention)
       return true;
@@ -1479,8 +1619,9 @@ private:
     if (depth > TypeDecoder::MaxDepth)
       return true;
 
-    // Children: `convention, differentiability?, type`
-    if (node->getNumChildren() != 2 && node->getNumChildren() != 3)
+    // Children: `convention, differentiability?, sending?, type`
+    if (node->getNumChildren() != 2 && node->getNumChildren() != 3 &&
+        node->getNumChildren() != 4)
       return true;
 
     auto *conventionNode = node->getChild(0);
@@ -1497,24 +1638,32 @@ private:
     if (result.isError())
       return true;
 
-    auto diffKind = T::DifferentiabilityType::DifferentiableOrNotApplicable;
-    if (node->getNumChildren() == 3) {
+    typename T::OptionsType options;
+    if (node->getNumChildren() == 3 || node->getNumChildren() == 4) {
       auto diffKindNode = node->getChild(1);
       if (diffKindNode->getKind() !=
           Node::Kind::ImplParameterResultDifferentiability)
         return true;
-      auto optDiffKind =
+      auto optDiffOptions =
           T::getDifferentiabilityFromString(diffKindNode->getText());
-      if (!optDiffKind)
+      if (!optDiffOptions)
         return true;
-      diffKind = *optDiffKind;
+      options |= *optDiffOptions;
     }
 
-    results.emplace_back(result.getType(), *convention, diffKind);
+    if (node->getNumChildren() == 4) {
+      auto sendingKindNode = node->getChild(2);
+      if (sendingKindNode->getKind() != Node::Kind::ImplParameterSending)
+        return true;
+      options |= T::getSending();
+    }
+
+    results.emplace_back(result.getType(), *convention, options);
+
     return false;
   }
 
-  llvm::Optional<TypeLookupError>
+  std::optional<TypeLookupError>
   decodeGenericArgs(Demangle::NodePointer node, unsigned depth,
                     llvm::SmallVectorImpl<BuiltType> &args) {
     if (node->getKind() != NodeKind::TypeList)
@@ -1527,10 +1676,10 @@ private:
         return *paramType.getError();
       args.push_back(paramType.getType());
     }
-    return llvm::None;
+    return std::nullopt;
   }
 
-  llvm::Optional<TypeLookupError>
+  std::optional<TypeLookupError>
   decodeMangledTypeDecl(Demangle::NodePointer node, unsigned depth,
                         BuiltTypeDecl &typeDecl, BuiltType &parent,
                         bool &typeAlias) {
@@ -1587,7 +1736,7 @@ private:
     if (!typeDecl)
       return TypeLookupError("Failed to create type decl");
 
-    return llvm::None;
+    return std::nullopt;
   }
 
   BuiltProtocolDecl decodeMangledProtocolType(Demangle::NodePointer node,
@@ -1611,12 +1760,12 @@ private:
     return Builder.createProtocolDecl(node);
   }
 
-  llvm::Optional<TypeLookupError> decodeMangledFunctionInputType(
+  std::optional<TypeLookupError> decodeMangledFunctionInputType(
       Demangle::NodePointer node, unsigned depth,
       llvm::SmallVectorImpl<FunctionParam<BuiltType>> &params,
       bool &hasParamFlags) {
     if (depth > TypeDecoder::MaxDepth)
-      return llvm::None;
+      return std::nullopt;
 
     // Look through a couple of sugar nodes.
     if (node->getKind() == NodeKind::Type ||
@@ -1627,26 +1776,26 @@ private:
 
     auto decodeParamTypeAndFlags =
         [&](Demangle::NodePointer typeNode,
-            FunctionParam<BuiltType> &param) -> llvm::Optional<TypeLookupError> {
+            FunctionParam<BuiltType> &param) -> std::optional<TypeLookupError> {
       Demangle::NodePointer node = typeNode;
 
       bool recurse = true;
       while (recurse) {
         switch (node->getKind()) {
         case NodeKind::InOut:
-          param.setValueOwnership(ValueOwnership::InOut);
+          param.setOwnership(ParameterOwnership::InOut);
           node = node->getFirstChild();
           hasParamFlags = true;
           break;
 
         case NodeKind::Shared:
-          param.setValueOwnership(ValueOwnership::Shared);
+          param.setOwnership(ParameterOwnership::Shared);
           node = node->getFirstChild();
           hasParamFlags = true;
           break;
 
         case NodeKind::Owned:
-          param.setValueOwnership(ValueOwnership::Owned);
+          param.setOwnership(ParameterOwnership::Owned);
           node = node->getFirstChild();
           hasParamFlags = true;
           break;
@@ -1659,6 +1808,12 @@ private:
 
         case NodeKind::Isolated:
           param.setIsolated();
+          node = node->getFirstChild();
+          hasParamFlags = true;
+          break;
+
+        case NodeKind::Sending:
+          param.setSending();
           node = node->getFirstChild();
           hasParamFlags = true;
           break;
@@ -1684,9 +1839,9 @@ private:
     };
 
     auto decodeParam =
-        [&](NodePointer paramNode) -> llvm::Optional<TypeLookupError> {
+        [&](NodePointer paramNode) -> std::optional<TypeLookupError> {
       if (paramNode->getKind() != NodeKind::TupleElement)
-        return llvm::None;
+        return std::nullopt;
 
       FunctionParam<BuiltType> param;
       for (const auto &child : *paramNode) {
@@ -1713,7 +1868,7 @@ private:
         }
       }
 
-      return llvm::None;
+      return std::nullopt;
     };
 
     // Expand a single level of tuple.
@@ -1725,7 +1880,7 @@ private:
           return *optError;
       }
 
-      return llvm::None;
+      return std::nullopt;
     }
 
     // Otherwise, handle the type as a single argument.
@@ -1734,7 +1889,7 @@ private:
     if (optError)
       return *optError;
 
-    return llvm::None;
+    return std::nullopt;
   }
 };
 

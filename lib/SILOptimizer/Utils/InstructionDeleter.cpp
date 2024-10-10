@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/SILOptimizer/Utils/InstructionDeleter.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/Test.h"
 #include "swift/SILOptimizer/Utils/ConstExpr.h"
@@ -62,17 +63,27 @@ static bool isScopeAffectingInstructionDead(SILInstruction *inst,
     return false;
   }
 
-  // If inst has any owned move-only value as a result, deleting it may shorten
-  // that value's lifetime which is illegal according to language rules.
-  //
-  // In particular, this check is needed before returning true when
-  // getSingleValueCopyOrCast returns true.  That function returns true for
-  // move_value instructions.  And `move_value %moveOnlyValue` must not be
-  // deleted.
   for (auto result : inst->getResults()) {
-    if (result->getType().getASTType()->isNoncopyable() &&
+    // If inst has any owned move-only value as a result, deleting it may
+    // shorten that value's lifetime which is illegal according to language
+    // rules.
+    //
+    // In particular, this check is needed before returning true when
+    // getSingleValueCopyOrCast returns true.  That function returns true for
+    // move_value instructions.  And `move_value %moveOnlyValue` must not be
+    // deleted.
+    if (result->getType().isMoveOnly() &&
         result->getOwnershipKind() == OwnershipKind::Owned) {
       return false;
+    }
+
+    // If result was lexical, lifetime shortening maybe observed, return.
+    if (result->isLexical()) {
+      auto resultTy = result->getType().getAs<SILFunctionType>();
+      // Allow deleted dead lexical values when they are trivial no escape types.
+      if (!resultTy || !resultTy->isTrivialNoEscape()) {
+        return false;
+      }
     }
   }
 
@@ -170,7 +181,9 @@ bool InstructionDeleter::trackIfDead(SILInstruction *inst) {
   bool fixLifetime = inst->getFunction()->hasOwnership();
   if (isInstructionTriviallyDead(inst)
       || isScopeAffectingInstructionDead(inst, fixLifetime)) {
-    assert(!isIncidentalUse(inst) && !isa<DestroyValueInst>(inst) &&
+    assert(!isIncidentalUse(inst) &&
+           (!isa<DestroyValueInst>(inst) ||
+            canTriviallyDeleteOSSAEndScopeInst(inst)) &&
            "Incidental uses cannot be removed in isolation. "
            "They would be removed iff the operand is dead");
     getCallbacks().notifyWillBeDeleted(inst);
@@ -216,6 +229,7 @@ void InstructionDeleter::deleteWithUses(SILInstruction *inst, bool fixLifetimes,
   // Recursively visit all uses while growing toDeleteInsts in def-use order and
   // dropping dead operands.
   SmallVector<SILInstruction *, 4> toDeleteInsts;
+  SmallVector<Operand *, 4> toDropUses;
 
   toDeleteInsts.push_back(inst);
   swift::salvageDebugInfo(inst);
@@ -230,11 +244,14 @@ void InstructionDeleter::deleteWithUses(SILInstruction *inst, bool fixLifetimes,
         assert(!isa<BranchInst>(user) && "can't delete phis");
 
         toDeleteInsts.push_back(user);
+        toDropUses.push_back(use);
         swift::salvageDebugInfo(user);
-        use->drop();
       }
     }
   }
+  // Drop all after salvage debug info has been run.
+  for (auto *use : toDropUses)
+    use->drop();
   // Process the remaining operands. Insert destroys for consuming
   // operands. Track newly dead operand values. Instructions with multiple dead
   // operands may occur in toDeleteInsts multiple times.
@@ -318,7 +335,7 @@ namespace swift::test {
 // Dumps:
 // - the function
 static FunctionTest DeleterDeleteIfDeadTest(
-    "deleter-delete-if-dead", [](auto &function, auto &arguments, auto &test) {
+    "deleter_delete_if_dead", [](auto &function, auto &arguments, auto &test) {
       auto *inst = arguments.takeInstruction();
       InstructionDeleter deleter;
       llvm::outs() << "Deleting-if-dead " << *inst;

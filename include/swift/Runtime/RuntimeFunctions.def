@@ -193,7 +193,7 @@ FUNCTION(UnexpectedError, swift_unexpectedError, SwiftCC, AlwaysAvailable,
          RETURNS(VoidTy),
          ARGS(ErrorPtrTy),
          ATTRS(NoUnwind, NoReturn),
-         EFFECT(NoEffect),
+         EFFECT(NoEffect, Deallocating),
          UNKNOWN_MEMEFFECTS)
 
 // void *swift_copyPOD(void *dest, void *src, Metadata *self);
@@ -1437,6 +1437,19 @@ FUNCTION(UpdateClassMetadata2,
          EFFECT(MetaData),
          UNKNOWN_MEMEFFECTS)
 
+// objc_class *swift_updatePureObjCClassMetadata(
+//             objc_class *self,
+//             ClassLayoutFlags flags,
+//             size_t numFields,
+//             TypeLayout * const *fieldTypes);
+FUNCTION(UpdatePureObjCClassMetadata,
+         swift_updatePureObjCClassMetadata, SwiftCC, AlwaysAvailable,
+         RETURNS(ObjCClassPtrTy),
+         ARGS(ObjCClassPtrTy, SizeTy, SizeTy, Int8PtrPtrTy->getPointerTo()),
+         ATTRS(NoUnwind),
+         EFFECT(MetaData),
+         UNKNOWN_MEMEFFECTS)
+
 // void *swift_lookUpClassMethod(Metadata *metadata,
 //                               ClassDescriptor *description,
 //                               MethodDescriptor *method);
@@ -2138,6 +2151,21 @@ FUNCTION(PlatformVersionAtLeast, __isPlatformVersionAtLeast,
          EFFECT(NoEffect),
          UNKNOWN_MEMEFFECTS)
 
+// int32 __isPlatformOrVariantPlatformVersionAtLeast(uint32_t platform1,
+//            uint32_t major1, uint32_t minor1, uint32_t patch1,
+//            uint32_t platform2, uint32_t major2, uint32_t minor2,
+//            uint32_t patch2);
+// This is a C builtin provided by compiler-rt.
+FUNCTION(TargetOSVersionOrVariantOSVersionAtLeast,
+         __isPlatformOrVariantPlatformVersionAtLeast,
+         C_CC, AlwaysAvailable,
+         RETURNS(Int32Ty),
+         ARGS(Int32Ty, Int32Ty, Int32Ty, Int32Ty, Int32Ty, Int32Ty, Int32Ty,
+              Int32Ty),
+         ATTRS(NoUnwind),
+         EFFECT(NoEffect),
+         UNKNOWN_MEMEFFECTS)
+
 FUNCTION(GetKeyPath, swift_getKeyPath, C_CC, AlwaysAvailable,
          RETURNS(RefCountedPtrTy),
          ARGS(Int8PtrTy, Int8PtrTy),
@@ -2250,7 +2278,7 @@ FUNCTION(GetTypeByMangledNameInContextInMetadataState2,
          EFFECT(MetaData),
          MEMEFFECTS(ArgMemOnly))
 
-// AsyncTask *swift_task_getCurrent();s
+// AsyncTask *swift_task_getCurrent();
 FUNCTION(GetCurrentTask,
          swift_task_getCurrent, SwiftCC,
          ConcurrencyAvailability,
@@ -2319,6 +2347,20 @@ FUNCTION(TaskSwitchFunc,
          ATTRS(NoUnwind),
          EFFECT(Concurrency),
          UNKNOWN_MEMEFFECTS)
+         
+// void swift_task_deinitOnExecutor(void *object,
+//                                  DeinitWorkFunction *work,
+//                                  SerialExecutorRef newExecutor,
+//                                  size_t flags);
+FUNCTION(DeinitOnExecutorFunc,
+         swift_task_deinitOnExecutor, SwiftCC,
+         ConcurrencyAvailability,
+         RETURNS(VoidTy),
+         ARGS(Int8PtrTy, Int8PtrTy, ExecutorFirstTy, ExecutorSecondTy, SizeTy),
+         ATTRS(NoUnwind),
+         EFFECT(Concurrency),
+         UNKNOWN_MEMEFFECTS)
+
 
 // AsyncTask *swift_continuation_init(AsyncContext *continuationContext,
 //                                    AsyncContinuationFlags);
@@ -2527,7 +2569,7 @@ FUNCTION(TaskRunInline,
          EFFECT(NoEffect),
          UNKNOWN_MEMEFFECTS)
 
-// void swift_taskGroup_initialize(TaskGroup *group);
+// void swift_taskGroup_initialize(TaskGroup *group, const Metadata *T);
 FUNCTION(TaskGroupInitialize,
          swift_taskGroup_initialize, SwiftCC,
          ConcurrencyAvailability,
@@ -2537,7 +2579,7 @@ FUNCTION(TaskGroupInitialize,
          EFFECT(Concurrency),
          UNKNOWN_MEMEFFECTS)
 
-// void swift_taskGroup_initializeWithFlags(size_t flags, TaskGroup *group);
+// void swift_taskGroup_initializeWithFlags(size_t flags, TaskGroup *group, const Metadata *T);
 FUNCTION(TaskGroupInitializeWithFlags,
          swift_taskGroup_initializeWithFlags, SwiftCC,
          ConcurrencyDiscardingTaskGroupAvailability,
@@ -2545,6 +2587,20 @@ FUNCTION(TaskGroupInitializeWithFlags,
          ARGS(SizeTy,           // flags
               Int8PtrTy,        // group
               TypeMetadataPtrTy // T.Type
+         ),
+         ATTRS(NoUnwind),
+         EFFECT(Concurrency),
+         UNKNOWN_MEMEFFECTS)
+
+// void swift_taskGroup_initializeWithTaskOptions(size_t flags, TaskGroup *group, const Metadata *T, TaskOptionRecord *options);
+FUNCTION(TaskGroupInitializeWithOptions,
+         swift_taskGroup_initializeWithOptions, SwiftCC,
+         ConcurrencyDiscardingTaskGroupAvailability,
+         RETURNS(VoidTy),
+         ARGS(SizeTy,                     // flags
+              Int8PtrTy,                  // group
+              TypeMetadataPtrTy,          // T.Type
+              SwiftTaskOptionRecordPtrTy  // options
          ),
          ATTRS(NoUnwind),
          EFFECT(Concurrency),
@@ -2635,7 +2691,7 @@ FUNCTION(GenericAssignWithCopy,
          RETURNS(Int8PtrTy),
          ARGS(Int8PtrTy, Int8PtrTy, TypeMetadataPtrTy),
          ATTRS(NoUnwind),
-         EFFECT(Refcounting, Deallocating),
+         EFFECT(RefCounting, Deallocating),
          UNKNOWN_MEMEFFECTS)
 
 // void *swift_generic_assignWithTake(opaque* dest, opaque* src, const Metadata* type);
@@ -2645,7 +2701,7 @@ FUNCTION(GenericAssignWithTake,
          RETURNS(Int8PtrTy),
          ARGS(Int8PtrTy, Int8PtrTy, TypeMetadataPtrTy),
          ATTRS(NoUnwind),
-         EFFECT(Refcounting, Deallocating),
+         EFFECT(RefCounting, Deallocating),
          UNKNOWN_MEMEFFECTS)
 
 // void *swift_generic_initWithCopy(opaque* dest, opaque* src, const Metadata* type);
@@ -2655,7 +2711,7 @@ FUNCTION(GenericInitWithCopy,
          RETURNS(Int8PtrTy),
          ARGS(Int8PtrTy, Int8PtrTy, TypeMetadataPtrTy),
          ATTRS(NoUnwind),
-         EFFECT(Refcounting),
+         EFFECT(RefCounting),
          UNKNOWN_MEMEFFECTS)
 
 // void *swift_generic_initWithTake(opaque* dest, opaque* src, const Metadata* type);
@@ -2665,7 +2721,7 @@ FUNCTION(GenericInitWithTake,
          RETURNS(Int8PtrTy),
          ARGS(Int8PtrTy, Int8PtrTy, TypeMetadataPtrTy),
          ATTRS(NoUnwind),
-         EFFECT(Refcounting),
+         EFFECT(RefCounting),
          UNKNOWN_MEMEFFECTS)
 
 // void *swift_generic_initializeBufferWithCopyOfBuffer(ValueBuffer* dest, ValueBuffer* src, const Metadata* type);
@@ -2677,7 +2733,7 @@ FUNCTION(GenericInitializeBufferWithCopyOfBuffer,
               getFixedBufferTy()->getPointerTo(),
               TypeMetadataPtrTy),
          ATTRS(NoUnwind),
-         EFFECT(Refcounting),
+         EFFECT(RefCounting),
          UNKNOWN_MEMEFFECTS)
 
 // unsigned swift_singletonEnum_getEnumTag(swift::OpaqueValue *address,
@@ -2800,11 +2856,58 @@ FUNCTION(GenericInstantiateLayoutString,
 //                                  int32_t count);
 FUNCTION(InitRawStructMetadata,
          swift_initRawStructMetadata,
-         C_CC, AlwaysAvailable,
+         C_CC, InitRawStructMetadataAvailability,
          RETURNS(VoidTy),
          ARGS(TypeMetadataPtrTy, SizeTy, Int8PtrPtrTy->getPointerTo(0), Int32Ty),
          ATTRS(NoUnwind),
          EFFECT(MetaData),
+         UNKNOWN_MEMEFFECTS)
+
+// void swift_initRawStructMetadata2(Metadata *structType,
+//                                   StructLayoutFlags structLayoutFlags,
+//                                   const TypeLayout *likeType,
+//                                   intptr_t count,
+//                                   RawLayoutFlags rawLayoutFlags);
+FUNCTION(InitRawStructMetadata2,
+         swift_initRawStructMetadata2,
+         C_CC, InitRawStructMetadata2Availability,
+         RETURNS(VoidTy),
+         ARGS(TypeMetadataPtrTy, SizeTy, Int8PtrPtrTy->getPointerTo(0), SizeTy,
+              SizeTy),
+         ATTRS(NoUnwind),
+         EFFECT(MetaData),
+         UNKNOWN_MEMEFFECTS)
+
+// _Unwind_Reason_Code _swift_exceptionPersonality(int version,
+//                                                 _Unwind_Action actions,
+//                                                 uint64 exceptionClass,
+//                                                 struct _Unwind_Exception *exceptionObject,
+//                                                 struct _Unwind_Context *context);
+FUNCTION(ExceptionPersonality,
+         _swift_exceptionPersonality,
+         C_CC, AlwaysAvailable,
+         RETURNS(Int32Ty),
+         ARGS(Int32Ty,
+              Int32Ty,
+              Int64Ty,
+              Int8PtrTy,
+              Int8PtrTy),
+         ATTRS(NoUnwind),
+         EFFECT(NoEffect),
+         UNKNOWN_MEMEFFECTS)
+
+FUNCTION(ClearSensitive, swift_clearSensitive, C_CC, ClearSensitiveAvailability,
+         RETURNS(VoidTy),
+         ARGS(PtrTy, SizeTy),
+         ATTRS(NoUnwind),
+         EFFECT(NoEffect),
+         UNKNOWN_MEMEFFECTS)
+
+FUNCTION(MemsetS, memset_s, C_CC, AlwaysAvailable,
+         RETURNS(Int32Ty),
+         ARGS(PtrTy, SizeTy, Int32Ty, SizeTy),
+         ATTRS(NoUnwind),
+         EFFECT(NoEffect),
          UNKNOWN_MEMEFFECTS)
 
 #undef RETURNS

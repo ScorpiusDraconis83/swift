@@ -1117,8 +1117,9 @@ func testLabeledScalarPayload(_ lsp: LabeledScalarPayload) -> Any {
   switch lsp {
   // CHECK: bb1([[TUPLE:%.*]] : $(name: Int)):
   // CHECK:   [[X:%.*]] = destructure_tuple [[TUPLE]]
+  // CHECK:   [[MV:%.*]] = move_value [var_decl] [[X]] : $Int
   // CHECK:   [[ANY_X_ADDR:%.*]] = init_existential_addr {{%.*}}, $Int
-  // CHECK:   store [[X]] to [trivial] [[ANY_X_ADDR]]
+  // CHECK:   store [[MV]] to [trivial] [[ANY_X_ADDR]]
   case let .Payload(x):
     return x
   }
@@ -1148,7 +1149,8 @@ func testOptionalEnumMix(_ a : Int?) -> Int {
     return 0
 
   // CHECK: [[SOMEBB]]([[X:%.*]] : $Int):
-  // CHECK-NEXT: debug_value [[X]] : $Int, let, name "x"
+  // CHECK-NEXT: [[MV:%.*]] = move_value [var_decl] [[X]] : $Int
+  // CHECK-NEXT: debug_value [[MV]] : $Int, let, name "x"
   // CHECK: integer_literal $Builtin.IntLiteral, 0
 
   case .none:
@@ -1170,7 +1172,8 @@ func testOptionalEnumMixWithNil(_ a : Int?) -> Int {
     return 0
 
   // CHECK: [[SOMEBB]]([[X:%.*]] : $Int):
-  // CHECK-NEXT: debug_value [[X]] : $Int, let, name "x"
+  // CHECK-NEXT: [[MV:%.*]] = move_value [var_decl] [[X]] : $Int
+  // CHECK-NEXT: debug_value [[MV]] : $Int, let, name "x"
   // CHECK: integer_literal $Builtin.IntLiteral, 0
 
   case nil:
@@ -1188,16 +1191,24 @@ func testMultiPatternsWithOuterScopeSameNamedVar(base: Int?, filter: Int?) {
   switch(base, filter) {
 
   case (.some(let base), .some(let filter)):
-    // CHECK: bb2(%10 : $Int):
-    // CHECK-NEXT: debug_value %8 : $Int, let, name "base"
-    // CHECK-NEXT: debug_value %10 : $Int, let, name "filter"
+    // CHECK: bb1([[BASE:%[0-9]+]] : $Int):
+    // CHECK:   switch_enum
+    // CHECK: bb2([[FILTER:%[0-9]+]] : $Int):
+    // CHECK-NEXT: [[MV_BASE:%.*]] = move_value [var_decl] [[BASE]]
+    // CHECK-NEXT: [[MV_FILTER:%.*]] = move_value [var_decl] [[FILTER]]
+    // CHECK-NEXT: debug_value [[MV_BASE]] : $Int, let, name "base"
+    // CHECK-NEXT: debug_value [[MV_FILTER]] : $Int, let, name "filter"
     print("both: \(base), \(filter)")
   case (.some(let base), .none), (.none, .some(let base)):
     // CHECK: bb3:
-    // CHECK-NEXT: br bb6(%8 : $Int)
+    // CHECK-NEXT: [[MV_BASE_PATTERN:%.*]] = move_value [var_decl] [[BASE]] : $Int
+    // CHECK-NEXT: extend_lifetime [[MV_BASE_PATTERN]] : $Int
+    // CHECK-NEXT: br bb6([[MV_BASE_PATTERN]] : $Int)
 
     // CHECK: bb5([[OTHER_BASE:%.*]] : $Int)
-    // CHECK-NEXT: br bb6([[OTHER_BASE]] : $Int)
+    // CHECK-NEXT: [[MV_OTHER_BASE:%.*]] = move_value [var_decl] [[OTHER_BASE]] : $Int
+    // CHECK-NEXT: extend_lifetime [[MV_OTHER_BASE]] : $Int
+    // CHECK-NEXT: br bb6([[MV_OTHER_BASE]] : $Int)
 
     // CHECK: bb6([[ARG:%.*]] : $Int):
     // CHECK-NEXT: debug_value [[ARG]] : $Int, let, name "base"
@@ -1461,16 +1472,16 @@ func testVoidType() {
 
 // CHECK-LABEL: sil hidden [ossa] @$s6switch28addressOnlyFallthroughCalleeyyAA015MultipleAddressC8CaseEnumOyxGSzRzlF : $@convention(thin) <T where T : BinaryInteger> (@in_guaranteed MultipleAddressOnlyCaseEnum<T>) -> () {
 // CHECK: bb0([[ARG:%.*]] :
-// CHECK:   [[AB_PHI:%.*]] = alloc_stack $T, let, name "x"
-// CHECK:   [[ABB_PHI:%.*]] = alloc_stack $T, let, name "x"
-// CHECK:   [[ABBC_PHI:%.*]] = alloc_stack $T, let, name "x"
+// CHECK:   [[AB_PHI:%.*]] = alloc_stack $T
+// CHECK:   [[ABB_PHI:%.*]] = alloc_stack $T
+// CHECK:   [[ABBC_PHI:%.*]] = alloc_stack $T
 // CHECK:   [[SWITCH_ENUM_ARG:%.*]] = alloc_stack $MultipleAddressOnlyCaseEnum<T>
 // CHECK:   copy_addr [[ARG]] to [init] [[SWITCH_ENUM_ARG]]
 // CHECK:   switch_enum_addr [[SWITCH_ENUM_ARG]] : $*MultipleAddressOnlyCaseEnum<T>, case #MultipleAddressOnlyCaseEnum.a!enumelt: [[BB_A:bb[0-9]+]], case #MultipleAddressOnlyCaseEnum.b!enumelt: [[BB_B:bb[0-9]+]], case #MultipleAddressOnlyCaseEnum.c!enumelt: [[BB_C:bb[0-9]+]]
 //
 // CHECK: [[BB_A]]:
 // CHECK:   [[SWITCH_ENUM_ARG_PROJ:%.*]] = unchecked_take_enum_data_addr [[SWITCH_ENUM_ARG]]
-// CHECK:   [[CASE_BODY_VAR_A:%.*]] = alloc_stack [lexical] $T, let, name "x"
+// CHECK:   [[CASE_BODY_VAR_A:%.*]] = alloc_stack [lexical] [var_decl] $T, let, name "x"
 // CHECK:   copy_addr [take] [[SWITCH_ENUM_ARG_PROJ]] to [init] [[CASE_BODY_VAR_A]]
 // CHECK:   copy_addr [[CASE_BODY_VAR_A]] to [init] [[AB_PHI]]
 // CHECK:   destroy_addr [[CASE_BODY_VAR_A]]
@@ -1478,7 +1489,7 @@ func testVoidType() {
 //
 // CHECK: [[BB_B]]:
 // CHECK:   [[SWITCH_ENUM_ARG_PROJ:%.*]] = unchecked_take_enum_data_addr [[SWITCH_ENUM_ARG]]
-// CHECK:   [[CASE_BODY_VAR_B:%.*]] = alloc_stack [lexical] $T, let, name "x"
+// CHECK:   [[CASE_BODY_VAR_B:%.*]] = alloc_stack [lexical] [var_decl] $T, let, name "x"
 // CHECK:   copy_addr [[SWITCH_ENUM_ARG_PROJ]] to [init] [[CASE_BODY_VAR_B]]
 // CHECK:   [[FUNC_CMP:%.*]] = function_ref @$sSzsE2eeoiySbx_qd__tSzRd__lFZ :
 // CHECK:   [[GUARD_RESULT:%.*]] = apply [[FUNC_CMP]]<T, Int>([[CASE_BODY_VAR_B]], {{%.*}}, {{%.*}})
@@ -1503,14 +1514,14 @@ func testVoidType() {
 //
 // CHECK: [[BB_B_GUARD_FAIL]]:
 // CHECK:   destroy_addr [[CASE_BODY_VAR_B]]
-// CHECK:   [[CASE_BODY_VAR_B_2:%.*]] = alloc_stack [lexical] $T, let, name "x"
+// CHECK:   [[CASE_BODY_VAR_B_2:%.*]] = alloc_stack [lexical] [var_decl] $T, let, name "x"
 // CHECK:   copy_addr [take] [[SWITCH_ENUM_ARG_PROJ]] to [init] [[CASE_BODY_VAR_B_2]]
 // CHECK:   copy_addr [[CASE_BODY_VAR_B_2]] to [init] [[ABB_PHI]]
 // CHECK:   br [[BB_AB_CONT]]
 //
 // CHECK: [[BB_C]]:
 // CHECK:   [[SWITCH_ENUM_ARG_PROJ:%.*]] = unchecked_take_enum_data_addr [[SWITCH_ENUM_ARG]]
-// CHECK:   [[CASE_BODY_VAR_C:%.*]] = alloc_stack [lexical] $T, let, name "x"
+// CHECK:   [[CASE_BODY_VAR_C:%.*]] = alloc_stack [lexical] [var_decl] $T, let, name "x"
 // CHECK:   copy_addr [take] [[SWITCH_ENUM_ARG_PROJ]] to [init] [[CASE_BODY_VAR_C]]
 // CHECK:   copy_addr [[CASE_BODY_VAR_C]] to [init] [[ABBC_PHI]]
 // CHECK:   destroy_addr [[CASE_BODY_VAR_C]]

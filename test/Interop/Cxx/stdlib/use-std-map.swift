@@ -1,12 +1,22 @@
 // RUN: %target-run-simple-swift(-I %S/Inputs -Xfrontend -enable-experimental-cxx-interop)
+// RUN: %target-run-simple-swift(-I %S/Inputs -cxx-interoperability-mode=swift-6)
 // RUN: %target-run-simple-swift(-I %S/Inputs -cxx-interoperability-mode=upcoming-swift)
-//
+
+// Also test this with a bridging header instead of the StdMap module.
+// RUN: %empty-directory(%t2)
+// RUN: cp %S/Inputs/std-map.h %t2/std-map-bridging-header.h
+// RUN: %target-run-simple-swift(-D BRIDGING_HEADER -import-objc-header %t2/std-map-bridging-header.h -Xfrontend -enable-experimental-cxx-interop)
+// RUN: %target-run-simple-swift(-D BRIDGING_HEADER -import-objc-header %t2/std-map-bridging-header.h -cxx-interoperability-mode=swift-6)
+// RUN: %target-run-simple-swift(-D BRIDGING_HEADER -import-objc-header %t2/std-map-bridging-header.h -cxx-interoperability-mode=upcoming-swift)
+
 // REQUIRES: executable_test
 //
 // REQUIRES: OS=macosx || OS=linux-gnu
 
 import StdlibUnittest
+#if !BRIDGING_HEADER
 import StdMap
+#endif
 import CxxStdlib
 import Cxx
 
@@ -16,6 +26,78 @@ StdMapTestSuite.test("init") {
   let m = Map()
   expectEqual(m.size(), 0)
   expectTrue(m.empty())
+}
+
+StdMapTestSuite.test("Map.init(_: Dictionary<Int, Int>)") {
+  let swiftDict: [Int32 : Int32] = [-1: 2, 2: 3, 33: 44]
+  let m = Map(swiftDict)
+  expectEqual(m.size(), 3)
+
+  expectEqual(m[-1], 2)
+  expectEqual(m[2], 3)
+  expectEqual(m[33], 44)
+
+  let emptySwiftDict: [Int32 : Int32] = [:]
+  let emptyM = Map(emptySwiftDict)
+  expectEqual(emptyM.size(), 0)
+}
+
+/// Same as above, but for std::unordered_map.
+StdMapTestSuite.test("UnorderedMap.init(_: Dictionary<Int, Int>)") {
+  let swiftDict: [Int32 : Int32] = [-1 : 2, 2 : 3, 33 : 44]
+  let m = UnorderedMap(swiftDict)
+  expectEqual(m.size(), 3)
+
+  expectEqual(m[-1], 2)
+  expectEqual(m[2], 3)
+  expectEqual(m[33], 44)
+
+  let emptySwiftDict: [Int32 : Int32] = [:]
+  let emptyM = UnorderedMap(emptySwiftDict)
+  expectEqual(emptyM.size(), 0)
+}
+
+StdMapTestSuite.test("MapStrings.init(_: Dictionary<std.string, std.string>)") {
+  let swiftDict = [std.string("abc") : std.string("123"),
+                   std.string() : std.string("empty")]
+  let m = MapStrings(swiftDict)
+  expectEqual(m.size(), 2)
+
+  expectEqual(m[std.string("abc")], std.string("123"))
+  expectEqual(m[std.string()], std.string("empty"))
+
+  let emptySwiftDict: [std.string : std.string] = [:]
+  let emptyM = MapStrings(emptySwiftDict)
+  expectEqual(emptyM.size(), 0)
+}
+
+StdMapTestSuite.test("Map as ExpressibleByDictionaryLiteral") {
+  let m: Map = [-1 : 2, 2 : 3, 33 : 44]
+  expectEqual(m.size(), 3)
+
+  func takesMap(_ m: Map) {
+    expectEqual(m[-1], 2)
+    expectEqual(m[2], 3)
+    expectEqual(m[33], 44)
+  }
+
+  takesMap(m)
+  takesMap([-1 : 2, 2 : 3, 33 : 44])
+}
+
+/// Same as above, but for std::unordered_map.
+StdMapTestSuite.test("UnorderedMap as ExpressibleByDictionaryLiteral") {
+  let m: UnorderedMap = [-1 : 2, 2 : 3, 33 : 44]
+  expectEqual(m.size(), 3)
+
+  func takesUnorderedMap(_ m: UnorderedMap) {
+    expectEqual(m[-1], 2)
+    expectEqual(m[2], 3)
+    expectEqual(m[33], 44)
+  }
+
+  takesUnorderedMap(m)
+  takesUnorderedMap([-1 : 2, 2 : 3, 33 : 44])
 }
 
 StdMapTestSuite.test("Map.subscript") {

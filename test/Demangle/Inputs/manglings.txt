@@ -105,6 +105,7 @@ _TF3foooP1xFTCS_3barVS_3bas_OS_3zim ---> foo.^ postfix(foo.bar, foo.bas) -> foo.
 _TFC3foo3barCfT_S0_ ---> foo.bar.__allocating_init() -> foo.bar
 _TFC3foo3barcfT_S0_ ---> foo.bar.init() -> foo.bar
 _TFC3foo3barD ---> foo.bar.__deallocating_deinit
+_TFC3foo3barZ ---> foo.bar.__isolated_deallocating_deinit
 _TFC3foo3bard ---> foo.bar.deinit
 _TMPC3foo3bar ---> generic type metadata pattern for foo.bar
 _TMnC3foo3bar ---> nominal type descriptor for foo.bar
@@ -292,6 +293,10 @@ _T04main4TestCACSi1x_tc6_PRIV_Llfc ---> main.Test.(in _PRIV_).init(x: Swift.Int)
 _$S3abc6testityySiFTm ---> merged abc.testit(Swift.Int) -> ()
 _$S4main4TestC1xACSi_tc6_PRIV_Llfc ---> main.Test.(in _PRIV_).init(x: Swift.Int) -> main.Test
 _T0SqWOy.17 ---> outlined copy of Swift.Optional with unmangled suffix ".17"
+_T0SqWOC ---> outlined init with copy of Swift.Optional
+_T0SqWOD ---> outlined assign with take of Swift.Optional
+_T0SqWOF ---> outlined assign with copy of Swift.Optional
+_T0SqWOH ---> outlined destroy of Swift.Optional
 _T03nix6testitSaySiGyFTv_ ---> outlined variable #0 of nix.testit() -> [Swift.Int]
 _T03nix6testitSaySiGyFTv_r ---> outlined read-only object #0 of nix.testit() -> [Swift.Int]
 _T03nix6testitSaySiGyFTv0_ ---> outlined variable #1 of nix.testit() -> [Swift.Int]
@@ -358,7 +363,8 @@ $S18resilient_protocol21ResilientBaseProtocolTL ---> protocol requirements base 
 $S1t1PP10AssocType2_AA1QTn ---> associated conformance descriptor for t.P.AssocType2: t.Q
 $S1t1PP10AssocType2_AA1QTN ---> default associated conformance accessor for t.P.AssocType2: t.Q
 $s4Test6testityyxlFAA8MystructV_TB5 ---> generic specialization <Test.Mystruct> of Test.testit<A>(A) -> ()
-$sSUss17FixedWidthIntegerRzrlEyxqd__cSzRd__lufCSu_SiTgm5 ---> generic specialization <Swift.UInt, Swift.Int> of (extension in Swift):Swift.UnsignedInteger< where A: Swift.FixedWidthInteger>.init<A where A1: Swift.BinaryInteger>(A1) -> A
+$sSUss17FixedWidthIntegerRzrlEyxqd__cSzRd__lufCSu_SiTg5 ---> generic specialization <Swift.UInt, Swift.Int> of (extension in Swift):Swift.UnsignedInteger< where A: Swift.FixedWidthInteger>.init<A where A1: Swift.BinaryInteger>(A1) -> A
+$s4test7genFuncyyx_q_tr0_lFSi_SbTtt1g5 ---> generic specialization <Swift.Int, Swift.Bool> of test.genFunc<A, B>(A, B) -> ()
 $sSD5IndexVy__GD ---> $sSD5IndexVy__GD
 $s4test3StrCACycfC ---> {T:$s4test3StrCACycfc} test.Str.__allocating_init() -> test.Str
 $s18keypaths_inlinable13KeypathStructV8computedSSvpACTKq  ---> key path getter for keypaths_inlinable.KeypathStruct.computed : Swift.String : keypaths_inlinable.KeypathStruct, serialized
@@ -449,4 +455,24 @@ $s9MacroUser016testFreestandingA9ExpansionyyF4Foo3L_V23bitwidthNumberedStructsfM
 @__swiftmacro_9MacroUser16MemberNotCoveredV33_4361AD9339943F52AE6186DD51E04E91Ll0dE0fMf0_ ---> freestanding macro expansion #2 of NotCovered(in _4361AD9339943F52AE6186DD51E04E91) in MacroUser.MemberNotCovered
 $sxSo8_NSRangeVRlzCRl_Cr0_llySo12ModelRequestCyxq_GIsPetWAlYl_TC ---> coroutine continuation prototype for @escaping @convention(thin) @convention(witness_method) @yield_once <A, B where A: AnyObject, B: AnyObject> @substituted <A> (@inout A) -> (@yields @inout __C._NSRange) for <__C.ModelRequest<A, B>>
 $SyyySGSS_IIxxxxx____xsIyFSySIxx_@xIxx____xxI ---> $SyyySGSS_IIxxxxx____xsIyFSySIxx_@xIxx____xxI
-$s12typed_throws15rethrowConcreteyyAA7MyErrorOYKF --> typed_throws.rethrowConcrete() throws(typed_throws.MyError) -> ()
+$s12typed_throws15rethrowConcreteyyAA7MyErrorOYKF ---> typed_throws.rethrowConcrete() throws(typed_throws.MyError) -> ()
+$s3red3use2fnySiyYAXE_tF ---> red.use(fn: @isolated(any) () -> Swift.Int) -> ()
+$s4testAAyAA5KlassC_ACtACnYTF ---> test.test(__owned test.Klass) -> sending (test.Klass, test.Klass)
+$s5test24testyyAA5KlassCnYuF ---> test2.test(sending __owned test2.Klass) -> ()
+$s7ElementSTQzqd__s5Error_pIgnrzo_ABqd__sAC_pIegnrzr_SlRzr__lTR ---> {T:} reabstraction thunk helper <A><A1 where A: Swift.Collection> from @callee_guaranteed (@in_guaranteed A.Swift.Sequence.Element) -> (@out A1, @error @owned Swift.Error) to @escaping @callee_guaranteed (@in_guaranteed A.Swift.Sequence.Element) -> (@out A1, @error @out Swift.Error)
+$sS3fIedgyywTd_D ---> @escaping @differentiable @callee_guaranteed (@unowned Swift.Float, @unowned @noDerivative sending Swift.Float) -> (@unowned Swift.Float)
+$sS3fIedgyyTd_D ---> @escaping @differentiable @callee_guaranteed (@unowned Swift.Float, @unowned sending Swift.Float) -> (@unowned Swift.Float)
+$s4testA2A5KlassCyYTF ---> test.test() -> sending test.Klass
+$s4main5KlassCACYTcMD ---> demangling cache variable for type metadata for (main.Klass) -> sending main.Klass
+$s4null19transferAsyncResultAA16NonSendableKlassCyYaYTF ---> null.transferAsyncResult() -> sending null.NonSendableKlass
+$s4null16NonSendableKlassCIegHo_ACs5Error_pIegHTrzo_TR ---> {T:} reabstraction thunk helper from @escaping @callee_guaranteed @async () -> (@owned null.NonSendableKlass) to @escaping @callee_guaranteed @async () -> sending (@out null.NonSendableKlass, @error @owned Swift.Error)
+$sSRyxG15Synchronization19AtomicRepresentableABRi_zrlMc ---> protocol conformance descriptor for < where A: ~Swift.Copyable> Swift.UnsafeBufferPointer<A> : Synchronization.AtomicRepresentable in Synchronization
+$sSRyxG15Synchronization19AtomicRepresentableABRi0_zrlMc ---> protocol conformance descriptor for < where A: ~Swift.Escapable> Swift.UnsafeBufferPointer<A> : Synchronization.AtomicRepresentable in Synchronization
+$sSRyxG15Synchronization19AtomicRepresentableABRi1_zrlMc ---> protocol conformance descriptor for < where A: ~Swift.<bit 2>> Swift.UnsafeBufferPointer<A> : Synchronization.AtomicRepresentable in Synchronization
+
+$s23variadic_generic_opaque2G2VyAA2S1V_AA2S2VQPGAA1PHPAeA1QHPyHC_AgaJHPyHCHX_HC ---> concrete protocol conformance variadic_generic_opaque.G2<Pack{variadic_generic_opaque.S1, variadic_generic_opaque.S2}> to protocol conformance ref (type's module) variadic_generic_opaque.P with conditional requirements: (pack protocol conformance (concrete protocol conformance variadic_generic_opaque.S1 to protocol conformance ref (type's module) variadic_generic_opaque.Q, concrete protocol conformance variadic_generic_opaque.S2 to protocol conformance ref (type's module) variadic_generic_opaque.Q))
+
+$s9MacroUser0023macro_expandswift_elFCffMX436_4_23bitwidthNumberedStructsfMf_ ---> freestanding macro expansion #1 of bitwidthNumberedStructs in module MacroUser file macro_expand.swift line 437 column 5
+$sxq_IyXd_D ---> @callee_unowned (@in_cxx A) -> (@unowned B)
+$s2hi1SV1iSivx ---> hi.S.i.modify2 : Swift.Int
+$s2hi1SV1iSivy ---> hi.S.i.read2 : Swift.Int

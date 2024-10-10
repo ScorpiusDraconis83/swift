@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "swift/Basic/Assertions.h"
 #include "swift/IDE/PostfixCompletion.h"
 #include "swift/IDE/CodeCompletion.h"
 #include "swift/IDE/CompletionLookup.h"
@@ -21,31 +22,20 @@ using namespace swift;
 using namespace swift::constraints;
 using namespace swift::ide;
 
-bool PostfixCompletionCallback::Result::canBeMergedWith(const Result &Other,
-                                                        DeclContext &DC) const {
-  if (BaseDecl != Other.BaseDecl) {
+bool PostfixCompletionCallback::Result::tryMerge(const Result &Other,
+                                                 DeclContext *DC) {
+  if (BaseDecl != Other.BaseDecl)
     return false;
-  }
-  if (!BaseTy->isEqual(Other.BaseTy) &&
-      !isConvertibleTo(BaseTy, Other.BaseTy, /*openArchetypes=*/true, DC) &&
-      !isConvertibleTo(Other.BaseTy, BaseTy, /*openArchetypes=*/true, DC)) {
-    return false;
-  }
-  return true;
-}
 
-void PostfixCompletionCallback::Result::merge(const Result &Other,
-                                              DeclContext &DC) {
-  assert(canBeMergedWith(Other, DC));
   // These properties should match if we are talking about the same BaseDecl.
   assert(IsBaseDeclUnapplied == Other.IsBaseDeclUnapplied);
   assert(BaseIsStaticMetaType == Other.BaseIsStaticMetaType);
 
-  if (!BaseTy->isEqual(Other.BaseTy) &&
-      isConvertibleTo(Other.BaseTy, BaseTy, /*openArchetypes=*/true, DC)) {
-    // Pick the more specific base type as it will produce more solutions.
-    BaseTy = Other.BaseTy;
-  }
+  auto baseTy = tryMergeBaseTypeForCompletionLookup(BaseTy, Other.BaseTy, DC);
+  if (!baseTy)
+    return false;
+
+  BaseTy = baseTy;
 
   // There could be multiple results that have different actor isolations if the
   // closure is an argument to a function that has multiple overloads with
@@ -64,20 +54,17 @@ void PostfixCompletionCallback::Result::merge(const Result &Other,
     ExpectedTypes.push_back(OtherExpectedTy);
   }
   ExpectsNonVoid &= Other.ExpectsNonVoid;
-  IsImplicitSingleExpressionReturn |= Other.IsImplicitSingleExpressionReturn;
+  IsImpliedResult |= Other.IsImpliedResult;
   IsInAsyncContext |= Other.IsInAsyncContext;
+  return true;
 }
 
 void PostfixCompletionCallback::addResult(const Result &Res) {
-  auto ExistingRes =
-      llvm::find_if(Results, [&Res, DC = DC](const Result &ExistingResult) {
-        return ExistingResult.canBeMergedWith(Res, *DC);
-      });
-  if (ExistingRes != Results.end()) {
-    ExistingRes->merge(Res, *DC);
-  } else {
-    Results.push_back(Res);
+  for (auto idx : indices(Results)) {
+    if (Results[idx].tryMerge(Res, DC))
+      return;
   }
+  Results.push_back(Res);
 }
 
 void PostfixCompletionCallback::fallbackTypeCheck(DeclContext *DC) {
@@ -189,28 +176,31 @@ void PostfixCompletionCallback::sawSolutionImpl(
 
   bool BaseIsStaticMetaType = S.isStaticallyDerivedMetatype(ParsedExpr);
 
+  bool ExpectsNonVoid = false;
   SmallVector<Type, 4> ExpectedTypes;
   if (ExpectedTy) {
     ExpectedTypes.push_back(ExpectedTy);
+    ExpectsNonVoid = !ExpectedTy->isVoid();
+  } else {
+    // If we don't know what the expected type is, assume it must be non-Void
+    // if we have a contextual type that is not unused. This prevents us from
+    // suggesting Void values for e.g bindings without explicit types.
+    ExpectsNonVoid |= !ParentExpr &&
+                      CS.getContextualTypePurpose(CompletionExpr) != CTP_Unused;
+
+    for (auto SAT : S.targets) {
+      if (ExpectsNonVoid) {
+        // ExpectsNonVoid is already set. No need to iterate further.
+        break;
+      }
+      if (SAT.second.getAsExpr() == CompletionExpr) {
+        ExpectsNonVoid |=
+            SAT.second.getExprContextualTypePurpose() != CTP_Unused;
+      }
+    }
   }
 
-  bool ExpectsNonVoid = false;
-  ExpectsNonVoid |= ExpectedTy && !ExpectedTy->isVoid();
-  ExpectsNonVoid |=
-      !ParentExpr && CS.getContextualTypePurpose(CompletionExpr) != CTP_Unused;
-
-  for (auto SAT : S.targets) {
-    if (ExpectsNonVoid) {
-      // ExpectsNonVoid is already set. No need to iterate further.
-      break;
-    }
-    if (SAT.second.getAsExpr() == CompletionExpr) {
-      ExpectsNonVoid |= SAT.second.getExprContextualTypePurpose() != CTP_Unused;
-    }
-  }
-
-  bool IsImplicitSingleExpressionReturn =
-      isImplicitSingleExpressionReturn(CS, CompletionExpr);
+  bool IsImpliedResult = isImpliedResult(S, CompletionExpr);
 
   bool IsInAsyncContext = isContextAsync(S, DC);
   llvm::DenseMap<AbstractClosureExpr *, ActorIsolation>
@@ -228,7 +218,7 @@ void PostfixCompletionCallback::sawSolutionImpl(
       BaseIsStaticMetaType,
       ExpectedTypes,
       ExpectsNonVoid,
-      IsImplicitSingleExpressionReturn,
+      IsImpliedResult,
       IsInAsyncContext,
       ClosureActorIsolations
   };
@@ -302,8 +292,7 @@ getOperatorCompletionTypes(DeclContext *DC, Type LHSType, OperatorDecl *Op) {
   UnresolvedDeclRefExpr UDRE(DeclNameRef(Op->getName()),
                              getDeclRefKindOfOperator(Op), DeclNameLoc(Loc));
   DiagnosticTransaction IgnoreDiags(DC->getASTContext().Diags);
-  Expr *OpExpr =
-      resolveDeclRefExpr(&UDRE, DC, /*replaceInvalidRefsWithErrors=*/true);
+  Expr *OpExpr = resolveDeclRefExpr(&UDRE, DC);
   IgnoreDiags.abort();
   if (isa<ErrorExpr>(OpExpr)) {
     // If we couldn't resolve the operator (e.g. because there is only an
@@ -328,8 +317,14 @@ getOperatorCompletionTypes(DeclContext *DC, Type LHSType, OperatorDecl *Op) {
     llvm_unreachable("unexpected operator kind");
   }
 
-  CS.preCheckExpression(OpCallExpr, DC, /*replaceInvalidRefsWithErrors=*/true);
-  OpCallExpr = CS.generateConstraints(OpCallExpr, DC);
+  auto target = SyntacticElementTarget(OpCallExpr, DC, CTP_Unused, Type(),
+                                       /*isDiscarded*/ true);
+  if (CS.preCheckTarget(target))
+    return {};
+  if (CS.generateConstraints(target))
+    return {};
+
+  OpCallExpr = target.getAsExpr();
 
   CS.assignFixedType(CS.getType(&LHS)->getAs<TypeVariableType>(), LHSType);
 
@@ -444,8 +439,7 @@ void PostfixCompletionCallback::collectResults(
     if (!ProcessedBaseTypes.contains(Result.BaseTy)) {
       Lookup.getPostfixKeywordCompletions(Result.BaseTy, BaseExpr);
     }
-    Lookup.setExpectedTypes(Result.ExpectedTypes,
-                            Result.IsImplicitSingleExpressionReturn,
+    Lookup.setExpectedTypes(Result.ExpectedTypes, Result.IsImpliedResult,
                             Result.ExpectsNonVoid);
     if (isDynamicLookup(Result.BaseTy))
       Lookup.setIsDynamicLookup();

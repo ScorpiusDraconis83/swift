@@ -26,13 +26,16 @@
 #include "swift/ABI/Metadata.h"
 #include "swift/ABI/Task.h"
 #include "swift/ABI/TaskGroup.h"
+#include "swift/ABI/TaskOptions.h"
 #include "swift/Basic/RelativePointer.h"
 #include "swift/Basic/STLExtras.h"
 #include "swift/Runtime/Concurrency.h"
 #include "swift/Runtime/Config.h"
+#include "swift/Runtime/Heap.h"
 #include "swift/Runtime/HeapObject.h"
 #include "swift/Threading/Mutex.h"
 #include <atomic>
+#include <deque>
 #include <new>
 
 #if SWIFT_STDLIB_HAS_ASL
@@ -113,7 +116,7 @@ class DiscardingTaskGroup;
 
 template<typename T>
 class NaiveTaskGroupQueue {
-  std::queue <T> queue;
+  std::queue<T, std::deque<T, swift::cxx_allocator<T>>> queue;
 
 public:
   NaiveTaskGroupQueue() = default;
@@ -292,7 +295,12 @@ public:
   };
 
 protected:
-#if SWIFT_STDLIB_SINGLE_THREADED_CONCURRENCY || SWIFT_CONCURRENCY_TASK_TO_THREAD_MODEL
+// Guard with SWIFT_THREADING_NONE and not just SWIFT_STDLIB_SINGLE_THREADED_CONCURRENCY 
+// because the latter just means that the global executor is cooperative, 
+// but it doesn't mean that the target platform is always single-threaded. For example, on 
+// wasm32-unknown-wasip1-threads, the global executor is cooperative, but users can still set up their 
+// own TaskExecutor with multiple threads.
+#if SWIFT_THREADING_NONE || SWIFT_CONCURRENCY_TASK_TO_THREAD_MODEL
   // Synchronization is simple here. In a single threaded mode, all swift tasks
   // run on a single thread so no coordination is needed. In a task-to-thread
   // model, only the parent task which created the task group can
@@ -339,6 +347,11 @@ protected:
 
 public:
   virtual ~TaskGroupBase() {}
+
+  /// Because we have a virtual destructor, we need to declare a delete operator
+  /// here, otherwise the compiler will generate a deleting destructor that
+  /// calls ::operator delete.
+  SWIFT_CXX_DELETE_OPERATOR(TaskGroupBase)
 
   TaskStatusRecordKind getKind() const {
     return Flags.getKind();
@@ -413,7 +426,9 @@ public:
   TaskGroupStatus statusLoadRelaxed() const;
   TaskGroupStatus statusLoadAcquire() const;
 
+#if !SWIFT_CONCURRENCY_EMBEDDED
   std::string statusString() const;
+#endif
 
   bool isEmpty() const;
 
@@ -463,6 +478,7 @@ public:
 
 };
 
+#if !SWIFT_CONCURRENCY_EMBEDDED
 [[maybe_unused]]
 static std::string to_string(TaskGroupBase::PollStatus status) {
   switch (status) {
@@ -472,6 +488,7 @@ static std::string to_string(TaskGroupBase::PollStatus status) {
     case TaskGroupBase::PollStatus::Error: return "Error";
   }
 }
+#endif
 
 /// The status of a task group.
 ///
@@ -573,7 +590,13 @@ struct TaskGroupStatus {
     swift_asprintf(
         &message,
         "error: %sTaskGroup: detected pending task count overflow, in task group %p! Status: %s",
-        group->isDiscardingResults() ? "Discarding" : "", group, status.to_string(group).c_str());
+        group->isDiscardingResults() ? "Discarding" : "", group,
+#if !SWIFT_CONCURRENCY_EMBEDDED
+        status.to_string(group).c_str()
+#else
+        "<status unavailable in embedded>"
+#endif
+                   );
 
 #if !SWIFT_CONCURRENCY_EMBEDDED
     if (_swift_shouldReportFatalErrorsToDebugger()) {
@@ -594,7 +617,10 @@ struct TaskGroupStatus {
     write(STDERR_FILENO, message, strlen(message));
 #endif
 #if defined(SWIFT_STDLIB_HAS_ASL)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
     asl_log(nullptr, nullptr, ASL_LEVEL_ERR, "%s", message);
+#pragma clang diagnostic pop
 #elif defined(__ANDROID__)
     __android_log_print(ANDROID_LOG_FATAL, "SwiftRuntime", "%s", message);
 #endif
@@ -603,6 +629,7 @@ struct TaskGroupStatus {
     abort();
   }
 
+#if !SWIFT_CONCURRENCY_EMBEDDED
   /// Pretty prints the status, as follows:
   /// If accumulating results:
   ///     TaskGroupStatus{ C:{cancelled} W:{waiting task} R:{ready tasks} P:{pending tasks} {binary repr} }
@@ -625,6 +652,7 @@ struct TaskGroupStatus {
     str.append(" }");
     return str;
   }
+#endif // !SWIFT_CONCURRENCY_EMBEDDED
 
   /// Initially there are no waiting and no pending tasks.
   static const TaskGroupStatus initial() {
@@ -645,7 +673,9 @@ AsyncTask *TaskGroupBase::claimWaitingTask() {
          "task is present!");
 
   auto waitingTask = waitQueue.load(std::memory_order_acquire);
-  if (!waitQueue.compare_exchange_strong(waitingTask, nullptr)) {
+  if (!waitQueue.compare_exchange_strong(waitingTask, nullptr,
+                                         std::memory_order_release,
+                                         std::memory_order_relaxed)) {
     swift_Concurrency_fatalError(0, "Failed to claim waitingTask!");
   }
   return waitingTask;
@@ -680,9 +710,11 @@ TaskGroupStatus TaskGroupBase::statusLoadAcquire() const {
   return TaskGroupStatus{status.load(std::memory_order_acquire)};
 }
 
+#if !SWIFT_CONCURRENCY_EMBEDDED
 std::string TaskGroupBase::statusString() const {
   return statusLoadRelaxed().to_string(this);
 }
+#endif
 
 bool TaskGroupBase::isEmpty() const {
   auto oldStatus = TaskGroupStatus{status.load(std::memory_order_relaxed)};
@@ -738,6 +770,7 @@ TaskGroupStatus TaskGroupBase::statusAddPendingTaskAssumeRelaxed(bool unconditio
   }
 
   SWIFT_TASK_GROUP_DEBUG_LOG(this, "addPending, after: %s", s.to_string(this).c_str());
+
   return s;
 }
 
@@ -944,6 +977,8 @@ TaskGroup* TaskGroupTaskStatusRecord::getGroup() {
 // =============================================================================
 // ==== initialize -------------------------------------------------------------
 
+static void _swift_taskGroup_initialize(ResultTypeInfo resultType, size_t rawGroupFlags, TaskGroup *group);
+
 // Initializes into the preallocated _group an actual TaskGroupBase.
 SWIFT_CC(swift)
 static void swift_taskGroup_initializeImpl(TaskGroup *group, const Metadata *T) {
@@ -954,11 +989,51 @@ static void swift_taskGroup_initializeImpl(TaskGroup *group, const Metadata *T) 
 SWIFT_CC(swift)
 static void swift_taskGroup_initializeWithFlagsImpl(size_t rawGroupFlags,
                                                     TaskGroup *group, const Metadata *T) {
-
 #if !SWIFT_CONCURRENCY_EMBEDDED
   ResultTypeInfo resultType;
   resultType.metadata = T;
+  _swift_taskGroup_initialize(resultType, rawGroupFlags, group);
+#else
+  swift_unreachable("swift_taskGroup_initializeWithFlags in embedded");
+#endif
+}
 
+// Initializes into the preallocated _group an actual instance.
+SWIFT_CC(swift)
+static void swift_taskGroup_initializeWithOptionsImpl(size_t rawGroupFlags, TaskGroup *group, const Metadata *T, TaskOptionRecord *options) {
+  ResultTypeInfo resultType;
+#if !SWIFT_CONCURRENCY_EMBEDDED
+  resultType.metadata = T;
+#endif
+
+  for (auto option = options; option; option = option->getParent()) {
+    switch (option->getKind()) {
+    case TaskOptionRecordKind::ResultTypeInfo: {
+#if SWIFT_CONCURRENCY_EMBEDDED
+      auto *typeInfo = cast<ResultTypeInfoTaskOptionRecord>(option);
+      resultType = {
+          .size = typeInfo->size,
+          .alignMask = typeInfo->alignMask,
+          .initializeWithCopy = typeInfo->initializeWithCopy,
+          .storeEnumTagSinglePayload = typeInfo->storeEnumTagSinglePayload,
+          .destroy = typeInfo->destroy,
+      };
+#else
+      swift_unreachable("ResultTypeInfo in non embedded");
+#endif
+      break;
+    }
+    default:
+      break; // ignore unknown records
+    }
+  }
+
+  assert(!resultType.isNull());
+
+  _swift_taskGroup_initialize(resultType, rawGroupFlags, group);
+}
+
+static void _swift_taskGroup_initialize(ResultTypeInfo resultType, size_t rawGroupFlags, TaskGroup *group) {
   TaskGroupFlags groupFlags(rawGroupFlags);
   SWIFT_TASK_GROUP_DEBUG_LOG_0(group, "create group, from task:%p; flags: isDiscardingResults=%d",
                                swift_task_getCurrent(),
@@ -983,9 +1058,6 @@ static void swift_taskGroup_initializeWithFlagsImpl(size_t rawGroupFlags,
     }
     return true;
   });
-#else
-  swift_unreachable("task groups not supported yet in embedded Swift");
-#endif
 }
 
 // =============================================================================
@@ -1381,7 +1453,12 @@ void DiscardingTaskGroup::offer(AsyncTask *completedTask, AsyncContext *context)
       _swift_taskGroup_detachChild(asAbstract(this), completedTask);
       return unlock();
     }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunreachable-code"
+    // This _should_ be statically unreachable, but we leave it in as a
+    // safeguard in case the control flow above changes.
     swift_unreachable("expected to early return from when handling offer of last task in group");
+#pragma clang diagnostic pop
   }
 
   assert(!hadErrorResult && "only successfully completed tasks can reach here");
@@ -1390,7 +1467,9 @@ void DiscardingTaskGroup::offer(AsyncTask *completedTask, AsyncContext *context)
     // allows a single task to get the waiting task and attempt to complete it.
     // As another offer gets to run, it will have either a different waiting task, or no waiting task at all.
     auto waitingTask = waitQueue.load(std::memory_order_acquire);
-    if (!waitQueue.compare_exchange_strong(waitingTask, nullptr)) {
+    if (!waitQueue.compare_exchange_strong(waitingTask, nullptr,
+                                           std::memory_order_release,
+                                           std::memory_order_relaxed)) {
       swift_Concurrency_fatalError(0, "Failed to claim waitingTask!");
     }
     assert(waitingTask && "status claimed to have waitingTask but waitQueue was empty!");
@@ -1779,14 +1858,14 @@ reevaluate_if_taskgroup_has_results:;
   // ==== 3) Add to wait queue -------------------------------------------------
   assert(assumed.readyTasks(this) == 0);
   _swift_tsan_release(static_cast<Job *>(waitingTask));
+  if (!hasSuspended) {
+    waitingTask->flagAsSuspendedOnTaskGroup(asAbstract(this));
+    hasSuspended = true;
+  }
   while (true) {
-    if (!hasSuspended) {
-      hasSuspended = true;
-      waitingTask->flagAsSuspendedOnTaskGroup(asAbstract(this));
-    }
     // Put the waiting task at the beginning of the wait queue.
     SWIFT_TASK_GROUP_DEBUG_LOG(this, "WATCH OUT, SET WAITER ONTO waitQueue.head = %p", waitQueue.load(std::memory_order_relaxed));
-    if (waitQueue.compare_exchange_strong(
+    if (waitQueue.compare_exchange_weak(
         waitHead, waitingTask,
         /*success*/ std::memory_order_release,
         /*failure*/ std::memory_order_acquire)) {
@@ -1941,13 +2020,13 @@ void TaskGroupBase::waitAll(SwiftError* bodyError, AsyncTask *waitingTask,
 
   auto waitHead = waitQueue.load(std::memory_order_acquire);
   _swift_tsan_release(static_cast<Job *>(waitingTask));
+  if (!hasSuspended) {
+    waitingTask->flagAsSuspendedOnTaskGroup(asAbstract(this));
+    hasSuspended = true;
+  }
   while (true) {
-    if (!hasSuspended) {
-      hasSuspended = true;
-      waitingTask->flagAsSuspendedOnTaskGroup(asAbstract(this));
-    }
     // Put the waiting task at the beginning of the wait queue.
-    if (waitQueue.compare_exchange_strong(
+    if (waitQueue.compare_exchange_weak(
         waitHead, waitingTask,
         /*success*/ std::memory_order_release,
         /*failure*/ std::memory_order_acquire)) {
@@ -2067,4 +2146,4 @@ static bool swift_taskGroup_addPendingImpl(TaskGroup *_group, bool unconditional
 }
 
 #define OVERRIDE_TASK_GROUP COMPATIBILITY_OVERRIDE
-#include COMPATIBILITY_OVERRIDE_INCLUDE_PATH
+#include "../CompatibilityOverride/CompatibilityOverrideIncludePath.h"

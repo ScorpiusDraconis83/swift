@@ -170,9 +170,6 @@ public:
   /// Stores a set of requirements on a type parameter. Used by
   /// GenericEnvironment for building archetypes.
   struct LocalRequirements {
-    Type anchor;
-
-    Type concreteType;
     Type superclass;
 
     RequiredProtocols protos;
@@ -196,6 +193,11 @@ public:
   /// Given a generic signature for a nested generic type, produce an
   /// array of the generic parameters for the innermost generic type.
   ArrayRef<GenericTypeParamType *> getInnermostGenericParams() const;
+
+  /// Returns the depth that a generic parameter at the next level of
+  /// nesting would have. This is zero for the empty signature,
+  /// and one plus the depth of the final generic parameter otherwise.
+  unsigned getNextDepth() const;
 
   /// Retrieve the requirements.
   ArrayRef<Requirement> getRequirements() const;
@@ -225,9 +227,6 @@ public:
   /// requirement signature against the protocol generic signature
   /// <Self where Self : P>.
   void verify(ArrayRef<Requirement> reqts) const;
-
-  /// Returns a new signature with the given parameters erased
-  GenericSignature typeErased(ArrayRef<Type> typeErasedParams) const;
 };
 
 /// A reference to a canonical generic signature.
@@ -310,11 +309,15 @@ public:
     return Mem;
   }
 
-  /// Look up a stored conformance in the generic signature. These are formed
-  /// from same-type constraints placed on associated types of generic
-  /// parameters which have conformance constraints on them.
-  ProtocolConformanceRef lookupConformance(CanType depTy,
-                                           ProtocolDecl *proto) const;
+  /// Returns the depth of the last generic parameter.
+  unsigned getMaxDepth() const;
+
+  /// Transform the requirements into a form where implicit Copyable and
+  /// Escapable conformances are omitted, and their absence is explicitly
+  /// noted.
+  void getRequirementsWithInverses(
+      SmallVector<Requirement, 2> &reqs,
+      SmallVector<InverseRequirement, 2> &inverses) const;
 
   /// Iterate over all generic parameters, passing a flag to the callback
   /// indicating if the generic parameter is canonical or not.
@@ -401,6 +404,11 @@ public:
 
   bool isReducedType(Type type) const;
 
+  /// Return the reduced version of the given type parameter under this generic
+  /// signature. To reduce a type that more generally contains type parameters,
+  /// use GenericSignature::getReducedType().
+  CanType getReducedTypeParameter(CanType type) const;
+
   /// Determine whether the given type parameter is defined under this generic
   /// signature.
   bool isValidTypeParameter(Type type) const;
@@ -458,9 +466,22 @@ public:
   /// Given a type parameter, compute the most specific supertype (upper bound),
   /// possibly dependent on other type parameters.
   ///
+  ///
+  /// \param forExistentialSelf If true, we ensure the result does not include
+  /// any type parameters rooted in the same generic parameter as the one given.
+  ///
+  /// \param includeParameterizedProtocols If true, we form parameterized
+  /// protocol types if we find that the given type's primary associated types
+  /// are sufficiently constrained.
+  ///
   /// \note If the upper bound is a protocol or protocol composition,
   /// will return an instance of \c ExistentialType.
-  Type getUpperBound(Type type) const;
+  Type getUpperBound(Type type,
+                     bool forExistentialSelf,
+                     bool includeParameterizedProtocols) const;
+
+  /// Utility wrapper for use when this is an opened existential signature.
+  Type getExistentialType(Type type) const;
 
   static void Profile(llvm::FoldingSetNodeID &ID,
                       ArrayRef<GenericTypeParamType *> genericParams,
@@ -543,16 +564,17 @@ void validateGenericSignaturesInModule(ModuleDecl *module);
 /// required to be minimal or canonical, and may contain unresolved
 /// DependentMemberTypes.
 ///
-/// If \p baseSignature is non-null, the new parameters and requirements
-/// are added on; existing requirements of the base signature might become
-/// redundant.
-///
-/// If \p baseSignature is null, build a new signature from scratch.
+/// \param baseSignature if non-null, the new parameters and requirements
+///// are added on; existing requirements of the base signature might become
+///// redundant. Otherwise if null, build a new signature from scratch.
+/// \param allowInverses if true, default requirements to Copyable/Escapable are
+/// expanded for generic parameters.
 GenericSignature buildGenericSignature(
     ASTContext &ctx,
     GenericSignature baseSignature,
     SmallVector<GenericTypeParamType *, 2> addedParameters,
-    SmallVector<Requirement, 2> addedRequirements);
+    SmallVector<Requirement, 2> addedRequirements,
+    bool allowInverses);
 
 /// Summary of error conditions detected by the Requirement Machine.
 enum class GenericSignatureErrorFlags {

@@ -1,12 +1,12 @@
 // RUN: %empty-directory(%t)
-// RUN: %target-swift-frontend -enable-experimental-feature LayoutStringValueWitnesses -enable-layout-string-value-witnesses -parse-stdlib -emit-module -emit-module-path=%t/layout_string_witnesses_types.swiftmodule %S/Inputs/layout_string_witnesses_types.swift
+// RUN: %target-swift-frontend -O -I %S/Inputs/CTypes -enable-experimental-feature LayoutStringValueWitnesses -enable-layout-string-value-witnesses -parse-stdlib -emit-module -emit-module-path=%t/layout_string_witnesses_types.swiftmodule %S/Inputs/layout_string_witnesses_types.swift
 
 // NOTE: We have to build this as dylib to turn private external symbols into local symbols, so we can observe potential issues with linkage
-// RUN: %target-build-swift-dylib(%t/%target-library-name(layout_string_witnesses_types)) -Xfrontend -enable-experimental-feature -Xfrontend LayoutStringValueWitnesses -Xfrontend -enable-layout-string-value-witnesses -Xfrontend -parse-stdlib -parse-as-library %S/Inputs/layout_string_witnesses_types.swift
+// RUN: %target-build-swift-dylib(%t/%target-library-name(layout_string_witnesses_types)) -O -I %S/Inputs/CTypes -Xfrontend -enable-experimental-feature -Xfrontend LayoutStringValueWitnesses -Xfrontend -enable-layout-string-value-witnesses -Xfrontend -parse-stdlib -parse-as-library %S/Inputs/layout_string_witnesses_types.swift
 // RUN: %target-codesign %t/%target-library-name(layout_string_witnesses_types)
-// RUN: %target-swift-frontend -enable-experimental-feature LayoutStringValueWitnesses -enable-layout-string-value-witnesses -enable-library-evolution -emit-module -emit-module-path=%t/layout_string_witnesses_types_resilient.swiftmodule %S/Inputs/layout_string_witnesses_types_resilient.swift
-// RUN: %target-build-swift -g -Xfrontend -enable-experimental-feature -Xfrontend LayoutStringValueWitnesses -Xfrontend -enable-layout-string-value-witnesses -Xfrontend -enable-library-evolution -c -parse-as-library -o %t/layout_string_witnesses_types_resilient.o %S/Inputs/layout_string_witnesses_types_resilient.swift
-// RUN: %target-build-swift -g -Xfrontend -enable-experimental-feature -Xfrontend LayoutStringValueWitnesses -Xfrontend -enable-layout-string-value-witnesses -Xfrontend -enable-type-layout -Xfrontend -parse-stdlib -module-name layout_string_witnesses_static -llayout_string_witnesses_types -L%t %t/layout_string_witnesses_types_resilient.o -I %t -o %t/main %s %target-rpath(%t)
+// RUN: %target-swift-frontend -O -enable-experimental-feature LayoutStringValueWitnesses -enable-layout-string-value-witnesses -enable-library-evolution -emit-module -emit-module-path=%t/layout_string_witnesses_types_resilient.swiftmodule %S/Inputs/layout_string_witnesses_types_resilient.swift
+// RUN: %target-build-swift -O -g -Xfrontend -enable-experimental-feature -Xfrontend LayoutStringValueWitnesses -Xfrontend -enable-layout-string-value-witnesses -Xfrontend -enable-library-evolution -c -parse-as-library -o %t/layout_string_witnesses_types_resilient.o %S/Inputs/layout_string_witnesses_types_resilient.swift
+// RUN: %target-build-swift -O -g -Xfrontend -enable-experimental-feature -Xfrontend LayoutStringValueWitnesses -Xfrontend -enable-layout-string-value-witnesses -Xfrontend -enable-type-layout -Xfrontend -parse-stdlib -module-name layout_string_witnesses_static -llayout_string_witnesses_types -L%t %t/layout_string_witnesses_types_resilient.o -I %t -o %t/main %s %target-rpath(%t)
 // RUN: %target-codesign %t/main
 // RUN: %target-run %t/main %t/%target-library-name(layout_string_witnesses_types) | %FileCheck %s --check-prefix=CHECK -check-prefix=CHECK-%target-os
 
@@ -308,6 +308,12 @@ struct StructWithSomeProtocolInline: SomeProtocol {
     let x: SimpleClass
 }
 
+struct StructWithSomeProtocolInlineShifted: SomeProtocol {
+    let y: Int = 0
+    let y2: Int = 0
+    let x: SimpleClass
+}
+
 func testExistentialStructInline() {
     let ptr = UnsafeMutablePointer<ExistentialWrapper>.allocate(capacity: 1)
 
@@ -395,6 +401,47 @@ func testExistentialStructBox() {
 }
 
 testExistentialStructBox()
+
+func testExistentialStructTypeChange() {
+    let ptr = UnsafeMutablePointer<ExistentialWrapper>.allocate(capacity: 1)
+
+    do {
+        let x = StructWithSomeProtocolInline(x: SimpleClass(x: 23))
+        testInit(ptr, to: createExistentialWrapper(x))
+    }
+
+    do {
+        let y = StructWithSomeProtocolInlineShifted(x: SimpleClass(x: 32))
+
+        // CHECK: Before deinit
+        print("Before deinit")
+
+        // CHECK-NEXT: SimpleClass deinitialized!
+        var wrapper = createExistentialWrapper(y)
+        testAssignCopy(ptr, from: &wrapper)
+    }
+
+    do {
+        let z = StructWithSomeProtocolBox(x: SimpleClass(x: 32))
+
+        // CHECK-NEXT: Before deinit
+        print("Before deinit")
+
+        // CHECK-NEXT: SimpleClass deinitialized!
+        var wrapper = createExistentialWrapper(z)
+        testAssignCopy(ptr, from: &wrapper)
+    }
+
+    // CHECK-NEXT: Before deinit
+    print("Before deinit")
+
+    // CHECK-NEXT: SimpleClass deinitialized!
+    testDestroy(ptr)
+
+    ptr.deallocate()
+}
+
+testExistentialStructTypeChange()
 
 func testAnyWrapper() {
     let ptr = UnsafeMutablePointer<AnyWrapper>.allocate(capacity: 1)
@@ -1055,6 +1102,251 @@ func testNotBitwiseTakableBridge() {
 }
 
 testNotBitwiseTakableBridge()
+
+// Regression test for rdar://121868127
+func testMultiPayloadEnumNested() {
+    let ptr = UnsafeMutablePointer<NestedMultiPayloadOuter>.allocate(capacity: 1)
+
+    do {
+        testInit(ptr, to: .b(.b(SimpleClass(x: 23))))
+    }
+
+    do {
+        let y = NestedMultiPayloadOuter.b(.b(SimpleClass(x: 23)))
+
+        // CHECK: Before deinit
+        print("Before deinit")
+
+        // CHECK-NEXT: SimpleClass deinitialized!
+        testAssign(ptr, from: y)
+    }
+
+    // CHECK-NEXT: Before deinit
+    print("Before deinit")
+
+    // CHECK-NEXT: SimpleClass deinitialized!
+    testDestroy(ptr)
+
+    ptr.deallocate()
+}
+
+testMultiPayloadEnumNested()
+
+struct MyError: Error {
+    let x: SimpleClass
+}
+
+// Regression test for rdar://122911427
+func testMultiPayloadError() {
+    let ptr = UnsafeMutablePointer<MultiPayloadError>.allocate(capacity: 1)
+
+    // initWithTake
+    do {
+        let x = MultiPayloadError.error2(0, MyError(x: SimpleClass(x: 23)))
+        testInitTake(ptr, to: consume x)
+    }
+
+    // assignWithTake
+    do {
+        let y = MultiPayloadError.error2(1, MyError(x: SimpleClass(x: 32)))
+
+        // CHECK-NEXT: Before deinit
+        print("Before deinit")
+
+        // CHECK-NEXT: SimpleClass deinitialized!
+        testAssign(ptr, from: y)
+    }
+
+    // assignWithCopy
+    do {
+        var z = MultiPayloadError.error2(2, MyError(x: SimpleClass(x: 41)))
+
+        // CHECK-NEXT: Before deinit
+        print("Before deinit")
+
+        // CHECK-NEXT: SimpleClass deinitialized!
+        testAssignCopy(ptr, from: &z)
+    }
+
+    // CHECK-NEXT: Before deinit
+    print("Before deinit")
+
+    // destroy
+    // CHECK-NEXT: SimpleClass deinitialized!
+    testDestroy(ptr)
+
+    ptr.deallocate()
+}
+
+testMultiPayloadError()
+
+// Regression test for rdar://127379960
+func testMultiPayloadErrorKeepsTagIntact() {
+    let ptr = UnsafeMutablePointer<MultiPayloadError>.allocate(capacity: 1)
+
+    // initWithTake
+    do {
+        let x = MultiPayloadError.error2(0, MyError(x: SimpleClass(x: 23)))
+        testInit(ptr, to: x)
+    }
+
+    // CHECK: Got error2!
+    switch ptr.pointee {
+        case .error1: print("Get error1!")
+        case .error2: print("Got error2!")
+        case .empty: print("Got empty!")
+    }
+
+    // CHECK-NEXT: SimpleClass deinitialized!
+    testDestroy(ptr)
+    ptr.deallocate()
+}
+
+testMultiPayloadErrorKeepsTagIntact()
+
+func testCTypeAligned() {
+    let ptr = UnsafeMutablePointer<CTypeAligned>.allocate(capacity: 1)
+
+    // initWithCopy
+    do {
+        let x = CTypeAligned(SimpleClass(x: 23))
+        testInit(ptr, to: x)
+    }
+
+    // assignWithTake
+    do {
+        let y = CTypeAligned(SimpleClass(x: 1))
+
+        // CHECK-NEXT: Before deinit
+        print("Before deinit")
+
+        // CHECK-NEXT: SimpleClass deinitialized!
+        testAssign(ptr, from: y)
+    }
+
+    // assignWithCopy
+    do {
+        var z = CTypeAligned(SimpleClass(x: 5))
+
+        // CHECK-NEXT: Before deinit
+        print("Before deinit")
+
+        // CHECK-NEXT: SimpleClass deinitialized!
+        testAssignCopy(ptr, from: &z)
+    }
+
+    // CHECK-NEXT: Before deinit
+    print("Before deinit")
+
+    // destroy
+    // CHECK-NEXT: SimpleClass deinitialized!
+    testDestroy(ptr)
+
+    ptr.deallocate()
+}
+
+testCTypeAligned()
+
+func testCTypeUnderAligned() {
+    let ptr = UnsafeMutablePointer<CTypeUnderAligned>.allocate(capacity: 1)
+
+    // initWithCopy
+    do {
+        let x = CTypeUnderAligned(SimpleClass(x: 23))
+        testInit(ptr, to: x)
+    }
+
+    // assignWithTake
+    do {
+        let y = CTypeUnderAligned(SimpleClass(x: 1))
+
+        // CHECK-NEXT: Before deinit
+        print("Before deinit")
+
+        // CHECK-NEXT: SimpleClass deinitialized!
+        testAssign(ptr, from: y)
+    }
+
+    // assignWithCopy
+    do {
+        var z = CTypeUnderAligned(SimpleClass(x: 5))
+
+        // CHECK-NEXT: Before deinit
+        print("Before deinit")
+
+        // CHECK-NEXT: SimpleClass deinitialized!
+        testAssignCopy(ptr, from: &z)
+    }
+
+    // CHECK-NEXT: Before deinit
+    print("Before deinit")
+
+    // destroy
+    // CHECK-NEXT: SimpleClass deinitialized!
+    testDestroy(ptr)
+
+    ptr.deallocate()
+}
+
+testCTypeUnderAligned()
+
+func testNestedTwoPayload() {
+    let ptr = UnsafeMutablePointer<TwoPayloadOuter>.allocate(capacity: 1)
+
+    do {
+        let x = TwoPayloadOuter.y(TwoPayloadInner.y(SimpleClass(x: 23)))
+        testInit(ptr, to: x)
+    }
+
+    do {
+        let y = TwoPayloadOuter.y(TwoPayloadInner.y(SimpleClass(x: 1)))
+
+        // CHECK: Before deinit
+        print("Before deinit")
+
+        // CHECK-NEXT: SimpleClass deinitialized!
+        testAssign(ptr, from: y)
+    }
+
+    // CHECK-NEXT: Before deinit
+    print("Before deinit")
+
+    // CHECK-NEXT: SimpleClass deinitialized!
+    testDestroy(ptr)
+
+    ptr.deallocate()
+}
+
+testNestedTwoPayload()
+
+func testMultiPayloadOneExtraTagValue() {
+    let ptr = UnsafeMutablePointer<OneExtraTagValue>.allocate(capacity: 1)
+
+    do {
+        let x = OneExtraTagValue.y(SimpleClass(x: 23))
+        testInit(ptr, to: x)
+    }
+
+    do {
+        let y = OneExtraTagValue.y(SimpleClass(x: 1))
+
+        // CHECK: Before deinit
+        print("Before deinit")
+
+        // CHECK-NEXT: SimpleClass deinitialized!
+        testAssign(ptr, from: y)
+    }
+
+    // CHECK-NEXT: Before deinit
+    print("Before deinit")
+
+    // CHECK-NEXT: SimpleClass deinitialized!
+    testDestroy(ptr)
+
+    ptr.deallocate()
+}
+
+testMultiPayloadOneExtraTagValue()
 
 #if os(macOS)
 func testObjc() {

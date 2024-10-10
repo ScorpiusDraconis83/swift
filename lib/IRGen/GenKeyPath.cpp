@@ -53,6 +53,7 @@
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Statistic.h"
 #include "swift/IRGen/Linking.h"
 
@@ -83,14 +84,12 @@ irgen::bindPolymorphicArgumentsFromComponentIndices(IRGenFunction &IGF,
   // The generic environment is marshaled into the end of the component
   // argument area inside the instance. Bind the generic information out of
   // the buffer.
-  if (hasSubscriptIndices) {
-    auto genericArgsSize = llvm::ConstantInt::get(IGF.IGM.SizeTy,
-      requirements.size() * IGF.IGM.getPointerSize().getValue());
+  auto genericArgsSize = llvm::ConstantInt::get(IGF.IGM.SizeTy,
+    requirements.size() * IGF.IGM.getPointerSize().getValue());
 
-    auto genericArgsOffset = IGF.Builder.CreateSub(size, genericArgsSize);
-    args =
-        IGF.Builder.CreateInBoundsGEP(IGF.IGM.Int8Ty, args, genericArgsOffset);
-  }
+  auto genericArgsOffset = IGF.Builder.CreateSub(size, genericArgsSize);
+  args =
+      IGF.Builder.CreateInBoundsGEP(IGF.IGM.Int8Ty, args, genericArgsOffset);
 
   bindFromGenericRequirementsBuffer(
       IGF, requirements,
@@ -536,7 +535,7 @@ getInitializerForComputedComponent(IRGenModule &IGM,
       // buffer.
       if (&component == operands[index.Operand].LastUser) {
         ti.initializeWithTake(IGF, destAddr, srcAddresses[index.Operand], ty,
-                              false);
+                              false, /*zeroizeIfSensitive=*/ true);
       } else {
         ti.initializeWithCopy(IGF, destAddr, srcAddresses[index.Operand], ty,
                               false);
@@ -783,11 +782,11 @@ emitKeyPathComponent(IRGenModule &IGM,
               // FIXME: This seems wrong. We used to just mangle opened archetypes as
               // their interface type. Let's make that explicit now.
               substType = substType
-                              .transformRec([](Type t) -> llvm::Optional<Type> {
+                              .transformRec([](Type t) -> std::optional<Type> {
                                 if (auto *openedExistential =
                                         t->getAs<OpenedArchetypeType>())
                                   return openedExistential->getInterfaceType();
-                                return llvm::None;
+                                return std::nullopt;
                               })
                               ->getCanonicalType();
 
@@ -945,7 +944,7 @@ emitKeyPathComponent(IRGenModule &IGM,
         // only ever use a struct field as a uniquing key from inside the
         // struct's own module, so this is OK.
         idResolution = KeyPathComponentHeader::Resolved;
-        llvm::Optional<unsigned> structIdx;
+        std::optional<unsigned> structIdx;
         unsigned i = 0;
         for (auto storedProp : struc->getStoredProperties()) {
           if (storedProp == property) {
@@ -1309,7 +1308,7 @@ void IRGenModule::emitSILProperty(SILProperty *prop) {
 std::pair<llvm::Value *, llvm::Value *> irgen::emitKeyPathArgument(
     IRGenFunction &IGF, SubstitutionMap subs, const CanGenericSignature &sig,
     ArrayRef<SILType> indiceTypes, Explosion &indiceValues,
-    llvm::Optional<StackAddress> &dynamicArgsBuf) {
+    std::optional<StackAddress> &dynamicArgsBuf) {
   auto &IGM = IGF.IGM;
 
   if (subs.empty() && indiceTypes.empty()) {
@@ -1364,7 +1363,7 @@ std::pair<llvm::Value *, llvm::Value *> irgen::emitKeyPathArgument(
         IGF.Builder.CreateBitCast(ptr, ti.getStorageType()->getPointerTo()));
     if (operandTy.isAddress()) {
       ti.initializeWithTake(IGF, addr, ti.getAddressForPointer(indiceValues.claimNext()),
-                            operandTy, false);
+                            operandTy, false, /*zeroizeIfSensitive=*/ true);
     } else {
       cast<LoadableTypeInfo>(ti).initialize(IGF, indiceValues, addr, false);
     }

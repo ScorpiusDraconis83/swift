@@ -10,14 +10,16 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "swift/AST/SourceFile.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Range.h"
 #include "swift/Basic/SourceLoc.h"
 #include "swift/Basic/SourceManager.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/PrettyStackTrace.h"
-#include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/Signals.h"
+#include "llvm/Support/raw_ostream.h"
 
 using namespace swift;
 
@@ -205,12 +207,25 @@ SourceManager::getVirtualFile(SourceLoc Loc) const {
   return nullptr;
 }
 
-llvm::Optional<unsigned>
+std::optional<unsigned>
 SourceManager::getIDForBufferIdentifier(StringRef BufIdentifier) const {
   auto It = BufIdentIDMap.find(BufIdentifier);
   if (It == BufIdentIDMap.end())
-    return llvm::None;
+    return std::nullopt;
   return It->second;
+}
+
+void SourceManager::recordSourceFile(unsigned bufferID, SourceFile *sourceFile){
+  bufferIDToSourceFiles[bufferID].push_back(sourceFile);
+}
+
+llvm::TinyPtrVector<SourceFile *>
+SourceManager::getSourceFilesForBufferID(unsigned bufferID) const {
+  auto found = bufferIDToSourceFiles.find(bufferID);
+  if (found == bufferIDToSourceFiles.end())
+    return { };
+
+  return found->second;
 }
 
 SourceManager::~SourceManager() {
@@ -225,7 +240,7 @@ SourceManager::~SourceManager() {
 
 /// Dump the contents of the given memory buffer to a file, returning the
 /// name of that file (when successful) and \c None otherwise.
-static llvm::Optional<std::string>
+static std::optional<std::string>
 dumpBufferToFile(const llvm::MemoryBuffer *buffer,
                  const SourceManager &sourceMgr,
                  CharSourceRange originalSourceRange) {
@@ -234,7 +249,7 @@ dumpBufferToFile(const llvm::MemoryBuffer *buffer,
   llvm::sys::path::system_temp_directory(true, outputFileName);
   llvm::sys::path::append(outputFileName, "swift-generated-sources");
   if (llvm::sys::fs::create_directory(outputFileName))
-    return llvm::None;
+    return std::nullopt;
 
   // Finalize the name of the resulting file. This is unique based on name
   // mangling.
@@ -272,7 +287,7 @@ dumpBufferToFile(const llvm::MemoryBuffer *buffer,
       }
     });
   if (ec)
-    return llvm::None;
+    return std::nullopt;
 
   return outputFileName.str().str();
 }
@@ -286,10 +301,12 @@ StringRef SourceManager::getIdentifierForBuffer(
   // If this is generated source code, and we're supposed to force it to disk
   // so external clients can see it, do so now.
   if (ForceGeneratedSourceToDisk) {
-    if (auto generatedInfo = getGeneratedSourceInfo(bufferID)) {
+    if (const GeneratedSourceInfo *generatedInfo =
+            getGeneratedSourceInfo(bufferID)) {
       // We only care about macros, so skip everything else.
       if (generatedInfo->kind == GeneratedSourceInfo::ReplacedFunctionBody ||
-          generatedInfo->kind == GeneratedSourceInfo::PrettyPrinted)
+          generatedInfo->kind == GeneratedSourceInfo::PrettyPrinted ||
+          generatedInfo->kind == GeneratedSourceInfo::DefaultArgument)
         return buffer->getBufferIdentifier();
 
       if (generatedInfo->onDiskBufferCopyFileName.empty()) {
@@ -361,7 +378,7 @@ StringRef SourceManager::getEntireTextForBuffer(unsigned BufferID) const {
 }
 
 StringRef SourceManager::extractText(CharSourceRange Range,
-                                     llvm::Optional<unsigned> BufferID) const {
+                                     std::optional<unsigned> BufferID) const {
   assert(Range.isValid() && "range should be valid");
 
   if (!BufferID)
@@ -382,6 +399,7 @@ void SourceManager::setGeneratedSourceInfo(
   case GeneratedSourceInfo::Name##MacroExpansion:
 #include "swift/Basic/MacroRoles.def"
   case GeneratedSourceInfo::PrettyPrinted:
+  case GeneratedSourceInfo::DefaultArgument:
     break;
 
   case GeneratedSourceInfo::ReplacedFunctionBody:
@@ -399,12 +417,12 @@ bool SourceManager::hasGeneratedSourceInfo(unsigned bufferID) {
   return GeneratedSourceInfos.count(bufferID);
 }
 
-llvm::Optional<GeneratedSourceInfo>
+const GeneratedSourceInfo *
 SourceManager::getGeneratedSourceInfo(unsigned bufferID) const {
   auto known = GeneratedSourceInfos.find(bufferID);
   if (known == GeneratedSourceInfos.end())
-    return llvm::None;
-  return known->second;
+    return nullptr;
+  return &known->second;
 }
 
 namespace {
@@ -460,31 +478,30 @@ namespace {
   };
 }
 
-llvm::Optional<unsigned>
+std::optional<unsigned>
 SourceManager::findBufferContainingLocInternal(SourceLoc Loc) const {
   assert(Loc.isValid());
 
   // If the cache is out-of-date, update it now.
   unsigned numBuffers = LLVMSourceMgr.getNumBuffers();
   if (numBuffers != LocCache.numBuffersOriginal) {
-    LocCache.sortedBuffers.assign(
-        std::begin(range(1, numBuffers+1)), std::end(range(1, numBuffers+1)));
+    LocCache.sortedBuffers.assign(std::begin(range(1, numBuffers + 1)),
+                                  std::end(range(1, numBuffers + 1)));
     LocCache.numBuffersOriginal = numBuffers;
 
     // Sort the buffer IDs by source range.
-    std::sort(LocCache.sortedBuffers.begin(),
-              LocCache.sortedBuffers.end(),
+    std::sort(LocCache.sortedBuffers.begin(), LocCache.sortedBuffers.end(),
               BufferIDRangeComparison{this});
 
     // Remove lower-numbered buffers with the same source ranges as higher-
     // numbered buffers. We want later alias buffers to be found first.
-    auto newEnd = std::unique(
-        LocCache.sortedBuffers.begin(), LocCache.sortedBuffers.end(),
-        BufferIDSameRange{this});
+    auto newEnd =
+        std::unique(LocCache.sortedBuffers.begin(),
+                    LocCache.sortedBuffers.end(), BufferIDSameRange{this});
     LocCache.sortedBuffers.erase(newEnd, LocCache.sortedBuffers.end());
 
     // Forget the last buffer we looked at; it might have been replaced.
-    LocCache.lastBufferID = llvm::None;
+    LocCache.lastBufferID = std::nullopt;
   }
 
   // Determine whether the source location we're looking for is within the
@@ -494,9 +511,9 @@ SourceManager::findBufferContainingLocInternal(SourceLoc Loc) const {
     auto buffer = LLVMSourceMgr.getMemoryBuffer(bufferID);
 
     return less_equal(buffer->getBufferStart(), Loc.Value.getPointer()) &&
-        // Use <= here so that a pointer to the null at the end of the buffer
-        // is included as part of the buffer.
-        less_equal(Loc.Value.getPointer(), buffer->getBufferEnd());
+           // Use <= here so that a pointer to the null at the end of the
+           // buffer is included as part of the buffer.
+           less_equal(Loc.Value.getPointer(), buffer->getBufferEnd());
   };
 
   // Check the last buffer we looked in.
@@ -507,14 +524,13 @@ SourceManager::findBufferContainingLocInternal(SourceLoc Loc) const {
 
   // Search the sorted list of buffer IDs.
   auto found = std::lower_bound(LocCache.sortedBuffers.begin(),
-                                LocCache.sortedBuffers.end(),
-                                Loc,
+                                LocCache.sortedBuffers.end(), Loc,
                                 BufferIDRangeComparison{this});
 
   // If the location was past the range covered by source buffers or
   // is not within any of the source buffers, fail.
   if (found == LocCache.sortedBuffers.end() || !isInBuffer(*found))
-    return llvm::None;
+    return std::nullopt;
 
   // Cache the buffer ID we just found, because the next location is likely to
   // be close by.
@@ -531,6 +547,23 @@ unsigned SourceManager::findBufferContainingLoc(SourceLoc Loc) const {
 
 bool SourceManager::isOwning(SourceLoc Loc) const {
   return findBufferContainingLocInternal(Loc).has_value();
+}
+
+SourceRange SourceRange::combine(ArrayRef<SourceRange> ranges) {
+  if (ranges.empty())
+    return SourceRange();
+
+  SourceRange result = ranges.front();
+  for (auto other : ranges.drop_front()) {
+    if (!other)
+      continue;
+    if (!result) {
+      result = other;
+      continue;
+    }
+    result.widen(other);
+  }
+  return result;
 }
 
 void SourceRange::widen(SourceRange Other) {
@@ -626,27 +659,27 @@ void CharSourceRange::dump(const SourceManager &SM) const {
   print(llvm::errs(), SM);
 }
 
-llvm::Optional<unsigned>
+std::optional<unsigned>
 SourceManager::resolveOffsetForEndOfLine(unsigned BufferId,
                                          unsigned Line) const {
   return resolveFromLineCol(BufferId, Line, ~0u);
 }
 
-llvm::Optional<unsigned>
-SourceManager::getLineLength(unsigned BufferId, unsigned Line) const {
+std::optional<unsigned> SourceManager::getLineLength(unsigned BufferId,
+                                                     unsigned Line) const {
   auto BegOffset = resolveFromLineCol(BufferId, Line, 0);
   auto EndOffset = resolveFromLineCol(BufferId, Line, ~0u);
   if (BegOffset && EndOffset) {
      return EndOffset.value() - BegOffset.value();
   }
-  return llvm::None;
+  return std::nullopt;
 }
 
-llvm::Optional<unsigned> SourceManager::resolveFromLineCol(unsigned BufferId,
-                                                           unsigned Line,
-                                                           unsigned Col) const {
+std::optional<unsigned> SourceManager::resolveFromLineCol(unsigned BufferId,
+                                                          unsigned Line,
+                                                          unsigned Col) const {
   if (Line == 0) {
-    return llvm::None;
+    return std::nullopt;
   }
   const bool LineEnd = (Col == ~0u);
   if (LineEnd)
@@ -656,7 +689,7 @@ llvm::Optional<unsigned> SourceManager::resolveFromLineCol(unsigned BufferId,
                  ->getLLVMSourceMgr()
                  .FindLocForLineAndColumn(BufferId, Line, Col);
   if (!loc.isValid())
-    return llvm::None;
+    return std::nullopt;
 
   auto InputBuf = getLLVMSourceMgr().getMemoryBuffer(BufferId);
   const char *Ptr = loc.getPointer();
@@ -676,7 +709,11 @@ unsigned SourceManager::getExternalSourceBufferID(StringRef Path) {
     return It->getSecond();
   }
   unsigned Id = 0u;
-  auto InputFileOrErr = swift::vfs::getFileOrSTDIN(*getFileSystem(), Path);
+  auto InputFileOrErr =
+      swift::vfs::getFileOrSTDIN(*getFileSystem(), Path,
+                                 /* FileSize */ -1,
+                                 /* RequiresNullTerminator */ true,
+                                 /* isVolatile */ this->OpenSourcesAsVolatile);
   if (InputFileOrErr) {
     // This assertion ensures we can look up from the map in the future when
     // using the same Path.
@@ -761,7 +798,7 @@ ArrayRef<unsigned> SourceManager::getAncestors(
   // Cache the ancestors in the generated source info record.
   unsigned *ancestorsPtr = new unsigned [ancestors.size()];
   std::copy(ancestors.begin(), ancestors.end(), ancestorsPtr);
-  knownInfo->second.ancestors = llvm::makeArrayRef(ancestorsPtr, ancestors.size());
+  knownInfo->second.ancestors = llvm::ArrayRef(ancestorsPtr, ancestors.size());
   return knownInfo->second.ancestors;
 }
 

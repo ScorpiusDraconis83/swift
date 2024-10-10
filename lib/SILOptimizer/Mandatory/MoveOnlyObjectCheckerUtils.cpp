@@ -14,6 +14,7 @@
 
 #include "swift/AST/DiagnosticsSIL.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/FrozenMultiMap.h"
 #include "swift/Basic/STLExtras.h"
 #include "swift/SIL/BasicBlockBits.h"
@@ -174,7 +175,9 @@ struct MoveOnlyObjectCheckerPImpl {
       : fn(fn), allocator(allocator), diagnosticEmitter(diagnosticEmitter),
         moveIntroducersToProcess(moveIntroducersToProcess) {}
 
-  void check(DominanceInfo *domTree, PostOrderAnalysis *poa);
+  void check(DominanceInfo *domTree,
+             DeadEndBlocksAnalysis *deadEndBlocksAnalysis,
+             PostOrderAnalysis *poa);
 
   bool convertBorrowExtractsToOwnedDestructures(
       MarkUnresolvedNonCopyableValueInst *mmci, DominanceInfo *domTree,
@@ -330,8 +333,9 @@ bool MoveOnlyObjectCheckerPImpl::checkForSameInstMultipleUseErrors(
 //                          MARK: Main PImpl Routine
 //===----------------------------------------------------------------------===//
 
-void MoveOnlyObjectCheckerPImpl::check(DominanceInfo *domTree,
-                                       PostOrderAnalysis *poa) {
+void MoveOnlyObjectCheckerPImpl::check(
+    DominanceInfo *domTree, DeadEndBlocksAnalysis *deadEndBlocksAnalysis,
+    PostOrderAnalysis *poa) {
   auto callbacks =
       InstModCallbacks().onDelete([&](SILInstruction *instToDelete) {
         if (auto *mvi =
@@ -340,13 +344,13 @@ void MoveOnlyObjectCheckerPImpl::check(DominanceInfo *domTree,
         instToDelete->eraseFromParent();
       });
   InstructionDeleter deleter(std::move(callbacks));
-  OSSACanonicalizer canonicalizer(fn, domTree, deleter);
+  OSSACanonicalizer canonicalizer(fn, domTree, deadEndBlocksAnalysis, deleter);
   diagnosticEmitter.initCanonicalizer(&canonicalizer);
 
   unsigned initialDiagCount = diagnosticEmitter.getDiagnosticCount();
 
-  auto moveIntroducers = llvm::makeArrayRef(moveIntroducersToProcess.begin(),
-                                            moveIntroducersToProcess.end());
+  auto moveIntroducers = llvm::ArrayRef(moveIntroducersToProcess.begin(),
+                                        moveIntroducersToProcess.end());
   while (!moveIntroducers.empty()) {
     MarkUnresolvedNonCopyableValueInst *markedValue = moveIntroducers.front();
 
@@ -488,10 +492,10 @@ void MoveOnlyObjectCheckerPImpl::check(DominanceInfo *domTree,
 
           // Handle:
           //
-          // bb0(%0 : @guaranteed $Type):
-          //   %1 = copy_value %0
-          //   %2 = mark_unresolved_non_copyable_value [no_consume_or_assign] %1
-          if (auto *arg = dyn_cast<SILFunctionArgument>(i->getOperand(0))) {
+          // bb(%arg : @guaranteed $Type):
+          //   %copy = copy_value %arg
+          //   %mark = mark_unresolved_non_copyable_value [no_consume_or_assign] %copy
+          if (auto *arg = dyn_cast<SILArgument>(i->getOperand(0))) {
             if (arg->getOwnershipKind() == OwnershipKind::Guaranteed) {
               for (auto *use : markedInst->getConsumingUses()) {
                 destroys.push_back(cast<DestroyValueInst>(use->getUser()));
@@ -507,24 +511,19 @@ void MoveOnlyObjectCheckerPImpl::check(DominanceInfo *domTree,
 
           // Handle:
           //
-          // bb0(%0 : $*Type): // in_guaranteed
           //   %1 = load_borrow %0
           //   %2 = copy_value %1
           //   %3 = mark_unresolved_non_copyable_value [no_consume_or_assign] %2
           if (auto *lbi = dyn_cast<LoadBorrowInst>(i->getOperand(0))) {
-            if (auto *arg = dyn_cast<SILFunctionArgument>(lbi->getOperand())) {
-              if (arg->getKnownParameterInfo().isIndirectInGuaranteed()) {
-                for (auto *use : markedInst->getConsumingUses()) {
-                  destroys.push_back(cast<DestroyValueInst>(use->getUser()));
-                }
-                while (!destroys.empty())
-                  destroys.pop_back_val()->eraseFromParent();
-                markedInst->replaceAllUsesWith(lbi);
-                markedInst->eraseFromParent();
-                cvi->eraseFromParent();
-                continue;
-              }
+            for (auto *use : markedInst->getConsumingUses()) {
+              destroys.push_back(cast<DestroyValueInst>(use->getUser()));
             }
+            while (!destroys.empty())
+              destroys.pop_back_val()->eraseFromParent();
+            markedInst->replaceAllUsesWith(lbi);
+            markedInst->eraseFromParent();
+            cvi->eraseFromParent();
+            continue;
           }
           
           // Handle:
@@ -565,6 +564,6 @@ bool MoveOnlyObjectChecker::check(
          "Should only call this with actual insts to check?!");
   MoveOnlyObjectCheckerPImpl checker(instsToCheck[0]->getFunction(), allocator,
                                      diagnosticEmitter, instsToCheck);
-  checker.check(domTree, poa);
+  checker.check(domTree, deadEndBlocksAnalysis, poa);
   return checker.changed;
 }

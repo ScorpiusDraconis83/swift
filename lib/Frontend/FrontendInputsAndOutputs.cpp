@@ -13,6 +13,7 @@
 #include "swift/Frontend/FrontendInputsAndOutputs.h"
 
 #include "swift/AST/DiagnosticsFrontend.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/FileTypes.h"
 #include "swift/Basic/PrimarySpecificPaths.h"
 #include "swift/Basic/Range.h"
@@ -159,6 +160,10 @@ FrontendInputsAndOutputs::getFirstOutputProducingInput() const {
   return isWholeModule() ? firstInput() : firstPrimaryInput();
 }
 
+unsigned FrontendInputsAndOutputs::getIndexOfFirstOutputProducingInput() const {
+  return isWholeModule() ? 0 : PrimaryInputsInOrder[0];
+}
+
 bool FrontendInputsAndOutputs::isInputPrimary(StringRef file) const {
   return primaryInputNamed(file) != nullptr;
 }
@@ -167,7 +172,7 @@ unsigned FrontendInputsAndOutputs::numberOfPrimaryInputsEndingWith(
     StringRef extension) const {
   unsigned n = 0;
   (void)forEachPrimaryInput([&](const InputFile &input) -> bool {
-    if (llvm::sys::path::extension(input.getFileName()).endswith(extension))
+    if (llvm::sys::path::extension(input.getFileName()).ends_with(extension))
       ++n;
     return false;
   });
@@ -197,6 +202,16 @@ bool FrontendInputsAndOutputs::shouldTreatAsModuleInterface() const {
   StringRef InputExt = llvm::sys::path::extension(getFilenameOfFirstInput());
   file_types::ID InputType = file_types::lookupTypeForExtension(InputExt);
   return InputType == file_types::TY_SwiftModuleInterfaceFile;
+}
+
+bool FrontendInputsAndOutputs::shouldTreatAsNonPackageModuleInterface() const {
+  if (!hasSingleInput())
+    return false;
+
+  file_types::ID InputType =
+      file_types::lookupTypeFromFilename(getFilenameOfFirstInput());
+  return InputType == file_types::TY_SwiftModuleInterfaceFile ||
+         InputType == file_types::TY_PrivateSwiftModuleInterfaceFile;
 }
 
 bool FrontendInputsAndOutputs::shouldTreatAsSIL() const {
@@ -460,117 +475,8 @@ bool FrontendInputsAndOutputs::hasSupplementaryOutputPath(
   });
 }
 
-bool FrontendInputsAndOutputs::hasDependenciesPath() const {
-  return hasSupplementaryOutputPath(
-      [](const SupplementaryOutputPaths &outs) -> const std::string & {
-        return outs.DependenciesFilePath;
-      });
-}
-bool FrontendInputsAndOutputs::hasReferenceDependenciesPath() const {
-  return hasSupplementaryOutputPath(
-      [](const SupplementaryOutputPaths &outs) -> const std::string & {
-        return outs.ReferenceDependenciesFilePath;
-      });
-}
-bool FrontendInputsAndOutputs::hasClangHeaderOutputPath() const {
-  return hasSupplementaryOutputPath(
-      [](const SupplementaryOutputPaths &outs) -> const std::string & {
-        return outs.ClangHeaderOutputPath;
-      });
-}
-bool FrontendInputsAndOutputs::hasLoadedModuleTracePath() const {
-  return hasSupplementaryOutputPath(
-      [](const SupplementaryOutputPaths &outs) -> const std::string & {
-        return outs.LoadedModuleTracePath;
-      });
-}
-bool FrontendInputsAndOutputs::hasModuleOutputPath() const {
-  return hasSupplementaryOutputPath(
-      [](const SupplementaryOutputPaths &outs) -> const std::string & {
-        return outs.ModuleOutputPath;
-      });
-}
-bool FrontendInputsAndOutputs::hasModuleDocOutputPath() const {
-  return hasSupplementaryOutputPath(
-      [](const SupplementaryOutputPaths &outs) -> const std::string & {
-        return outs.ModuleDocOutputPath;
-      });
-}
-bool FrontendInputsAndOutputs::hasModuleSourceInfoOutputPath() const {
-  return hasSupplementaryOutputPath(
-      [](const SupplementaryOutputPaths &outs) -> const std::string & {
-        return outs.ModuleSourceInfoOutputPath;
-      });
-}
-bool FrontendInputsAndOutputs::hasModuleInterfaceOutputPath() const {
-  return hasSupplementaryOutputPath(
-      [](const SupplementaryOutputPaths &outs) -> const std::string & {
-        return outs.ModuleInterfaceOutputPath;
-      });
-}
-bool FrontendInputsAndOutputs::hasPrivateModuleInterfaceOutputPath() const {
-  return hasSupplementaryOutputPath(
-      [](const SupplementaryOutputPaths &outs) -> const std::string & {
-        return outs.PrivateModuleInterfaceOutputPath;
-      });
-}
-bool FrontendInputsAndOutputs::hasPackageModuleInterfaceOutputPath() const {
-  return hasSupplementaryOutputPath(
-      [](const SupplementaryOutputPaths &outs) -> const std::string & {
-        return outs.PackageModuleInterfaceOutputPath;
-      });
-}
-bool FrontendInputsAndOutputs::hasABIDescriptorOutputPath() const {
-  return hasSupplementaryOutputPath(
-      [](const SupplementaryOutputPaths &outs) -> const std::string & {
-        return outs.ABIDescriptorOutputPath;
-      });
-}
-bool FrontendInputsAndOutputs::hasAPIDescriptorOutputPath() const {
-  return hasSupplementaryOutputPath(
-      [](const SupplementaryOutputPaths &outs) -> const std::string & {
-        return outs.APIDescriptorOutputPath;
-      });
-}
-bool FrontendInputsAndOutputs::hasConstValuesOutputPath() const {
-  return hasSupplementaryOutputPath(
-      [](const SupplementaryOutputPaths &outs) -> const std::string & {
-        return outs.ConstValuesOutputPath;
-      });
-}
-bool FrontendInputsAndOutputs::hasModuleSemanticInfoOutputPath() const {
-  return hasSupplementaryOutputPath(
-      [](const SupplementaryOutputPaths &outs) -> const std::string & {
-        return outs.ModuleSemanticInfoOutputPath;
-      });
-}
-bool FrontendInputsAndOutputs::hasModuleSummaryOutputPath() const {
-  return hasSupplementaryOutputPath(
-      [](const SupplementaryOutputPaths &outs) -> const std::string & {
-        return outs.ModuleSummaryOutputPath;
-      });
-}
-bool FrontendInputsAndOutputs::hasTBDPath() const {
-  return hasSupplementaryOutputPath(
-      [](const SupplementaryOutputPaths &outs) -> const std::string & {
-        return outs.TBDPath;
-      });
-}
-bool FrontendInputsAndOutputs::hasYAMLOptRecordPath() const {
-  return hasSupplementaryOutputPath(
-      [](const SupplementaryOutputPaths &outs) -> const std::string & {
-        return outs.YAMLOptRecordPath;
-      });
-}
-bool FrontendInputsAndOutputs::hasBitstreamOptRecordPath() const {
-  return hasSupplementaryOutputPath(
-      [](const SupplementaryOutputPaths &outs) -> const std::string & {
-        return outs.BitstreamOptRecordPath;
-      });
-}
-
 bool FrontendInputsAndOutputs::hasDependencyTrackerPath() const {
-  return hasDependenciesPath() || hasReferenceDependenciesPath() ||
+  return hasDependenciesFilePath() || hasReferenceDependenciesFilePath() ||
          hasLoadedModuleTracePath();
 }
 

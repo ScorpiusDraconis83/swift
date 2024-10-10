@@ -10,16 +10,17 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "SourceKit/Support/UIdent.h"
 #include "sourcekitd/CodeCompletionResultsArray.h"
+#include "sourcekitd/DeclarationsArray.h"
 #include "sourcekitd/DictionaryKeys.h"
 #include "sourcekitd/DocStructureArray.h"
 #include "sourcekitd/DocSupportAnnotationArray.h"
-#include "sourcekitd/TokenAnnotationsArray.h"
 #include "sourcekitd/ExpressionTypeArray.h"
-#include "sourcekitd/VariableTypeArray.h"
 #include "sourcekitd/RawData.h"
 #include "sourcekitd/RequestResponsePrinterBase.h"
-#include "SourceKit/Support/UIdent.h"
+#include "sourcekitd/TokenAnnotationsArray.h"
+#include "sourcekitd/VariableTypeArray.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -165,7 +166,7 @@ void sourcekitd::printRequestObject(sourcekitd_object_t Obj, raw_ostream &OS) {
 //===----------------------------------------------------------------------===//
 
 ResponseBuilder::ResponseBuilder() {
-  Impl = xpc_dictionary_create(nullptr, nullptr, 0);
+  Impl = xpc_dictionary_create_empty();
 }
 
 ResponseBuilder::~ResponseBuilder() {
@@ -219,7 +220,7 @@ void ResponseBuilder::Dictionary::set(UIdent Key, int64_t val) {
 void ResponseBuilder::Dictionary::set(SourceKit::UIdent Key,
                                       ArrayRef<StringRef> Strs) {
   llvm::SmallString<128> Buf;
-  xpc_object_t arr = xpc_array_create(nullptr, 0);
+  xpc_object_t arr = xpc_array_create_empty();
   for (auto Str : Strs) {
     Buf = Str;
     xpc_array_set_string(arr, XPC_ARRAY_APPEND, Buf.c_str());
@@ -230,7 +231,7 @@ void ResponseBuilder::Dictionary::set(SourceKit::UIdent Key,
 
 void ResponseBuilder::Dictionary::set(SourceKit::UIdent Key,
                                       ArrayRef<std::string> Strs) {
-  xpc_object_t arr = xpc_array_create(nullptr, 0);
+  xpc_object_t arr = xpc_array_create_empty();
   for (auto Str : Strs) {
     xpc_array_set_string(arr, XPC_ARRAY_APPEND, Str.c_str());
   }
@@ -240,7 +241,7 @@ void ResponseBuilder::Dictionary::set(SourceKit::UIdent Key,
 
 void ResponseBuilder::Dictionary::set(SourceKit::UIdent Key,
                                       ArrayRef<SourceKit::UIdent> UIDs) {
-  xpc_object_t arr = xpc_array_create(nullptr, 0);
+  xpc_object_t arr = xpc_array_create_empty();
   for (auto UID : UIDs) {
     xpc_array_set_uint64(arr, XPC_ARRAY_APPEND, uintptr_t(SKDUIDFromUIdent(UID)));
   }
@@ -254,7 +255,7 @@ void ResponseBuilder::Dictionary::setBool(UIdent Key, bool val) {
 
 ResponseBuilder::Array
 ResponseBuilder::Dictionary::setArray(UIdent Key) {
-  xpc_object_t arr = xpc_array_create(nullptr, 0);
+  xpc_object_t arr = xpc_array_create_empty();
   xpc_dictionary_set_value(Impl, Key.c_str(), arr);
   xpc_release(arr);
   return Array(arr);
@@ -262,7 +263,7 @@ ResponseBuilder::Dictionary::setArray(UIdent Key) {
 
 ResponseBuilder::Dictionary
 ResponseBuilder::Dictionary::setDictionary(UIdent Key) {
-  xpc_object_t dict = xpc_dictionary_create(nullptr, nullptr, 0);
+  xpc_object_t dict = xpc_dictionary_create_empty();
   xpc_dictionary_set_value(Impl, Key.c_str(), dict);
   xpc_release(dict);
   return Dictionary(dict);
@@ -277,7 +278,7 @@ void ResponseBuilder::Dictionary::setCustomBuffer(
 }
 
 ResponseBuilder::Dictionary ResponseBuilder::Array::appendDictionary() {
-  xpc_object_t dict = xpc_dictionary_create(nullptr, nullptr, 0);
+  xpc_object_t dict = xpc_dictionary_create_empty();
   xpc_array_append_value(Impl, dict);
   xpc_release(dict);
   return Dictionary(dict);
@@ -287,22 +288,23 @@ sourcekitd_uid_t RequestDict::getUID(UIdent Key) const {
   return sourcekitd_uid_t(xpc_dictionary_get_uint64(Dict, Key.c_str()));
 }
 
-Optional<StringRef> RequestDict::getString(UIdent Key) const {
+std::optional<StringRef> RequestDict::getString(UIdent Key) const {
   xpc_object_t xobj = xpc_dictionary_get_value(Dict, Key.c_str());
   if (!xobj)
-    return None;
+    return std::nullopt;
   if (xpc_get_type(xobj) != XPC_TYPE_STRING)
-    return None;
+    return std::nullopt;
   return StringRef(xpc_string_get_string_ptr(xobj),
                    xpc_string_get_length(xobj));
 }
 
-Optional<RequestDict> RequestDict::getDictionary(SourceKit::UIdent Key) const {
+std::optional<RequestDict>
+RequestDict::getDictionary(SourceKit::UIdent Key) const {
   xpc_object_t xobj = xpc_dictionary_get_value(Dict, Key.c_str());
   if (!xobj)
-    return None;
+    return std::nullopt;
   if (xpc_get_type(xobj) != XPC_TYPE_DICTIONARY)
-    return None;
+    return std::nullopt;
   return RequestDict(xobj);
 }
 
@@ -370,10 +372,11 @@ bool RequestDict::getInt64(SourceKit::UIdent Key, int64_t &Val,
   return false;
 }
 
-Optional<int64_t> RequestDict::getOptionalInt64(SourceKit::UIdent Key) const {
+std::optional<int64_t>
+RequestDict::getOptionalInt64(SourceKit::UIdent Key) const {
   xpc_object_t xobj = xpc_dictionary_get_value(Dict, Key.c_str());
   if (!xobj)
-    return None;
+    return std::nullopt;
   return xpc_int64_get_value(xobj);
 }
 
@@ -616,11 +619,9 @@ static sourcekitd_variant_type_t XPCVar_get_type(sourcekitd_variant_t var) {
   if (type == XPC_TYPE_DATA) {
     switch(CUSTOM_BUF_KIND(obj)) {
     case CustomBufferKind::TokenAnnotationsArray:
-      return SOURCEKITD_VARIANT_TYPE_ARRAY;
+    case CustomBufferKind::DeclarationsArray:
     case CustomBufferKind::DocSupportAnnotationArray:
-      return SOURCEKITD_VARIANT_TYPE_ARRAY;
     case CustomBufferKind::CodeCompletionResultsArray:
-      return SOURCEKITD_VARIANT_TYPE_ARRAY;
     case CustomBufferKind::DocStructureArray:
     case CustomBufferKind::InheritedTypesArray:
     case CustomBufferKind::DocStructureElementArray:
@@ -769,6 +770,9 @@ static sourcekitd_variant_t variantFromXPCObject(xpc_object_t obj) {
     case CustomBufferKind::TokenAnnotationsArray:
       return {{ (uintptr_t)getVariantFunctionsForTokenAnnotationsArray(),
                 (uintptr_t)CUSTOM_BUF_START(obj), 0 }};
+    case CustomBufferKind::DeclarationsArray:
+      return {{(uintptr_t)getVariantFunctionsForDeclarationsArray(),
+               (uintptr_t)CUSTOM_BUF_START(obj), 0}};
     case CustomBufferKind::DocSupportAnnotationArray:
       return {{ (uintptr_t)getVariantFunctionsForDocSupportAnnotationArray(),
                 (uintptr_t)CUSTOM_BUF_START(obj), 0 }};

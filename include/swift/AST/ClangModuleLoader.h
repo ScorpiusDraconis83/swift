@@ -144,9 +144,10 @@ public:
   virtual clang::Sema &getClangSema() const = 0;
   virtual const clang::CompilerInstance &getClangInstance() const = 0;
   virtual void printStatistics() const = 0;
+  virtual void dumpSwiftLookupTables() const = 0;
 
   /// Returns the module that contains imports and declarations from all loaded
-  /// Objective-C header files.
+  /// header files.
   virtual ModuleDecl *getImportedHeaderModule() const = 0;
 
   /// Retrieves the Swift wrapper for the given Clang module, creating
@@ -283,7 +284,9 @@ public:
 
   virtual bool isUnsafeCXXMethod(const FuncDecl *func) = 0;
 
-  virtual llvm::Optional<Type>
+  virtual FuncDecl *getDefaultArgGenerator(const clang::ParmVarDecl *param) = 0;
+
+  virtual std::optional<Type>
   importFunctionReturnType(const clang::FunctionDecl *clangDecl,
                            DeclContext *dc) = 0;
 

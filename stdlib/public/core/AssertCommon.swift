@@ -74,7 +74,7 @@ func _isStdlibDebugChecksEnabled() -> Bool {
 internal func _fatalErrorFlags() -> UInt32 {
   // The current flags are:
   // (1 << 0): Report backtrace on fatal error
-#if os(iOS) || os(tvOS) || os(watchOS)
+#if os(iOS) || os(tvOS) || os(watchOS) || os(visionOS)
   return 0
 #else
   return _isDebugAssertConfiguration() ? 1 : 0
@@ -109,6 +109,11 @@ internal func _assertionFailure(
         Builtin.int_trap()
       }
     }
+  }
+#else
+  if _isDebugAssertConfiguration() {
+    _embeddedReportFatalErrorInFile(prefix: prefix, message: message,
+      file: file, line: line)
   }
 #endif
   Builtin.int_trap()
@@ -183,6 +188,10 @@ internal func _assertionFailure(
   _ prefix: StaticString, _ message: StaticString,
   flags: UInt32
 ) -> Never {
+  if _isDebugAssertConfiguration() {
+    _embeddedReportFatalError(prefix: prefix, message: message)
+  }
+
   Builtin.int_trap()
 }
 #endif
@@ -329,17 +338,6 @@ internal func _diagnoseUnexpectedEnumCase<SwitchedValue>(
 @_semantics("unavailable_code_reached")
 @usableFromInline // COMPILER_INTRINSIC
 internal func _diagnoseUnavailableCodeReached() -> Never {
-  _diagnoseUnavailableCodeReached_aeic()
-}
-
-// FIXME: Remove this with rdar://119892482
-/// An `@_alwaysEmitIntoClient` variant of `_diagnoseUnavailableCodeReached()`.
-/// This is temporarily needed by the compiler to reference from back deployed
-/// clients.
-@_alwaysEmitIntoClient
-@inline(never)
-@_semantics("unavailable_code_reached")
-internal func _diagnoseUnavailableCodeReached_aeic() -> Never {
   _assertionFailure(
     "Fatal error", "Unavailable code reached", flags: _fatalErrorFlags())
 }

@@ -13,14 +13,40 @@
 import SwiftSyntax
 import SwiftSyntaxMacros
 import SwiftDiagnostics
-import _StringProcessing // for String.contains(_:)
+import _StringProcessing
 
 public enum DebugDescriptionMacro {}
 public enum _DebugDescriptionPropertyMacro {}
 
+/// The member role is used only to perform diagnostics. The member role ensures any diagnostics are emitted once per
+/// type. The macro's core behavior begins with the `MemberAttributeMacro` conformance.
+extension DebugDescriptionMacro: MemberMacro {
+  public static func expansion(
+    of node: AttributeSyntax,
+    providingMembersOf declaration: some DeclGroupSyntax,
+    in context: some MacroExpansionContext
+  )
+  throws -> [DeclSyntax]
+  {
+    guard !declaration.is(ProtocolDeclSyntax.self) else {
+      let message: ErrorMessage = "cannot be attached to a protocol"
+      context.diagnose(node: node, error: message)
+      return []
+    }
+
+    guard declaration.asProtocol(WithGenericParametersSyntax.self)?.genericParameterClause == nil else {
+      let message: ErrorMessage = "cannot be attached to a generic definition"
+      context.diagnose(node: node, error: message)
+      return []
+    }
+
+    return []
+  }
+}
+
 /// A macro which orchestrates conversion of a description property to an LLDB type summary.
 ///
-/// The job of conversion is split across two macros. This macro performs some analysis on the attached
+/// The process of conversion is split across multiple macros/roles. This role performs some analysis on the attached
 /// type, and then delegates to `@_DebugDescriptionProperty` to perform the conversion step.
 extension DebugDescriptionMacro: MemberAttributeMacro {
   public static func expansion(
@@ -32,8 +58,12 @@ extension DebugDescriptionMacro: MemberAttributeMacro {
   throws -> [AttributeSyntax]
   {
     guard !declaration.is(ProtocolDeclSyntax.self) else {
-      let message: ErrorMessage = "cannot be attached to a protocol"
-      context.diagnose(node: node, error: message)
+      // Diagnostics for this case are emitted by the `MemberMacro` conformance.
+      return []
+    }
+
+    guard declaration.asProtocol(WithGenericParametersSyntax.self)?.genericParameterClause == nil else {
+      // Diagnostics for this case are emitted by the `MemberMacro` conformance.
       return []
     }
 
@@ -47,19 +77,7 @@ extension DebugDescriptionMacro: MemberAttributeMacro {
       return []
     }
 
-    guard propertyName == "debugDescription" || propertyName == "description" else {
-      return []
-    }
-
-    // Expansion is performed multiple times. Exit early to avoid emitting duplicate macros,
-    // which leads to duplicate symbol errors. To distinguish been invocations, inspect the
-    // current mangled name. This ignores the invocation that adds a "__vg" suffix to the member
-    // name, ex "description__vg". See https://github.com/apple/swift/pull/65559.
-    let mangledName = context.makeUniqueName("").text
-    let substring = "\(propertyName)__vg"
-    // Ex: "15description__vg"
-    let runlengthSubstring = "\(substring.count)\(substring)"
-    guard !mangledName.hasSubstring(runlengthSubstring) else {
+    guard DESCRIPTION_PROPERTIES.contains(propertyName) else {
       return []
     }
 
@@ -72,8 +90,8 @@ extension DebugDescriptionMacro: MemberAttributeMacro {
       }
     }
 
-    // `debugDescription` takes priority: skip `description` if `debugDescription` also exists.
-    if propertyName == "description" && properties["debugDescription"] != nil {
+    // Skip if this description property is not prioritized.
+    guard propertyName == designatedProperty(properties) else {
       return []
     }
 
@@ -84,15 +102,19 @@ extension DebugDescriptionMacro: MemberAttributeMacro {
       return []
     }
 
+    // Warning: To use a backslash escape in `typeIdentifier`, it needs to be double escaped. This is because
+    // the string is serialized to a String literal (an argument to `@_DebugDescriptionProperty`), which
+    // effectively "consumes" one level of escaping. To avoid mistakes, dots are matched with `[.]` instead
+    // of the more conventional `\.`.
     var typeIdentifier: String
     if let typeParameters = declaration.asProtocol(WithGenericParametersSyntax.self)?.genericParameterClause?.parameters, typeParameters.count > 0 {
       let typePatterns = Array(repeating: ".+", count: typeParameters.count).joined(separator: ",")
       // A regex matching that matches the generic type.
-      typeIdentifier = "^\(moduleName)\\.\(typeName)<\(typePatterns)>"
+      typeIdentifier = "^\(moduleName)[.]\(typeName)<\(typePatterns)>"
     } else if declaration.is(ExtensionDeclSyntax.self) {
       // When attached to an extension, the type may or may not be a generic type.
       // This regular expression handles both cases.
-      typeIdentifier = "^\(moduleName)\\.\(typeName)(<.+>)?$"
+      typeIdentifier = "^\(moduleName)[.]\(typeName)(<.+>)?$"
     } else {
       typeIdentifier = "\(moduleName).\(typeName)"
     }
@@ -167,12 +189,20 @@ extension _DebugDescriptionPropertyMacro: PeerMacro {
       return []
     }
 
+    // LLDB syntax is not allowed in debugDescription/description.
+    let allowLLDBSyntax = onlyBinding.name == "lldbDescription"
+
     // Iterate the string's segments, and convert property expressions into LLDB variable references.
     var summarySegments: [String] = []
     for segment in descriptionString.segments {
       switch segment {
       case let .stringSegment(segment):
-        summarySegments.append(segment.content.text)
+        var literal = segment.content.text
+        if !allowLLDBSyntax {
+          // To match debugDescription/description, escape `$` characters. LLDB must treat them as a literals they are.
+          literal = literal.escapedForLLDB()
+        }
+        summarySegments.append(literal)
       case let .expressionSegment(segment):
         guard let onlyLabeledExpr = segment.expressions.only, onlyLabeledExpr.label == nil else {
           // This catches `appendInterpolation` overrides.
@@ -222,21 +252,38 @@ extension _DebugDescriptionPropertyMacro: PeerMacro {
 
     // Serialize the type summary into a global record, in a custom section, for LLDB to load.
     let decl: DeclSyntax = """
+        #if !os(Windows)
         #if os(Linux)
         @_section(".lldbsummaries")
-        #elseif os(Windows)
-        @_section(".lldbsummaries")
         #else
-        @_section("__DATA_CONST,__lldbsummaries")
+        @_section("__TEXT,__lldbsummaries")
         #endif
         @_used
         static let _lldb_summary = (
             \(raw: encodeTypeSummaryRecord(typeIdentifier, summaryString))
         )
+        #endif
         """
 
     return [decl]
   }
+}
+
+/// The names of properties that can be converted to LLDB type summaries, in priority order.
+fileprivate let DESCRIPTION_PROPERTIES = [
+  "lldbDescription",
+  "debugDescription",
+  "description",
+]
+
+/// Identifies the prioritized description property, of available properties.
+fileprivate func designatedProperty(_ properties: [String: PatternBindingSyntax]) -> String? {
+  for name in DESCRIPTION_PROPERTIES {
+    if properties[name] != nil {
+      return name
+    }
+  }
+  return nil
 }
 
 // MARK: - Encoding
@@ -245,7 +292,7 @@ fileprivate let ENCODING_VERSION: UInt = 1
 
 /// Construct an LLDB type summary record.
 ///
-/// The record is serializeed as a tuple of `UInt8` bytes.
+/// The record is serialized as a tuple of `UInt8` bytes.
 ///
 /// The record contains the following:
 ///   * Version number of the record format
@@ -348,7 +395,7 @@ extension DeclGroupSyntax {
     case .actorDecl, .classDecl, .enumDecl, .structDecl:
       return self.asProtocol(NamedDeclSyntax.self)?.name.text
     case .extensionDecl:
-      return self.as(ExtensionDeclSyntax.self)?.extendedType.description
+      return self.as(ExtensionDeclSyntax.self)?.extendedType.trimmedDescription
     default:
       // New types of decls are not presumed to be valid.
       return nil
@@ -465,6 +512,28 @@ extension String {
   }
 }
 
+extension String {
+  fileprivate func escapedForLLDB() -> String {
+    guard #available(macOS 13, *) else {
+      guard self.firstIndex(of: "$") != nil else {
+        return self
+      }
+
+      var result = ""
+      for char in self {
+        if char == "$" {
+          result.append("\\$")
+        } else {
+          result.append(char)
+        }
+      }
+      return result
+    }
+
+    return self.replacing("$", with: "\\$")
+  }
+}
+
 extension Array where Element == String {
   /// Convert an ArrayExprSyntax consisting of StringLiteralExprSyntax to an Array<String>.
   fileprivate init?(expr: ExprSyntax) {
@@ -482,20 +551,5 @@ extension Collection {
   /// multiple elements, nil is returned.
   fileprivate var only: Element? {
     count == 1 ? first : nil
-  }
-}
-
-extension String {
-  fileprivate func hasSubstring(_ substring: String) -> Bool {
-    if #available(macOS 13, *) {
-      return self.contains(substring)
-    }
-
-    for index in self.indices {
-      if self.suffix(from: index).hasPrefix(substring) {
-        return true
-      }
-    }
-    return false
   }
 }

@@ -32,6 +32,7 @@
 #include "swift/AST/Module.h"
 #include "swift/AST/Type.h"
 #include "swift/AST/TypeVisitor.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/LLVM.h"
 
 #include "clang/AST/ASTContext.h"
@@ -158,7 +159,7 @@ const clang::Type *ClangTypeConverter::getFunctionType(
 
 const clang::Type *
 ClangTypeConverter::getFunctionType(ArrayRef<SILParameterInfo> params,
-                                    llvm::Optional<SILResultInfo> result,
+                                    std::optional<SILResultInfo> result,
                                     SILFunctionType::Representation repr) {
 
   // Using the interface type is sufficient as type parameters get mapped to
@@ -178,7 +179,7 @@ ClangTypeConverter::getFunctionType(ArrayRef<SILParameterInfo> params,
     if (pc.isNull())
       return nullptr;
     clang::FunctionProtoType::ExtParameterInfo extParamInfo;
-    if (p.isConsumed()) {
+    if (p.isConsumedInCallee()) {
       someParamIsConsumed = true;
       extParamInfo = extParamInfo.withIsConsumed(true);
     }
@@ -269,7 +270,7 @@ clang::QualType ClangTypeConverter::visitStructType(StructType *type) {
 
   // Map vector types to the corresponding C vectors.
 #define MAP_SIMD_TYPE(TYPE_NAME, _, BUILTIN_KIND)                      \
-  if (name.startswith(#TYPE_NAME)) {                                   \
+  if (name.starts_with(#TYPE_NAME)) {                                   \
     return getClangVectorType(ctx, clang::BuiltinType::BUILTIN_KIND,   \
                               clang::VectorType::GenericVector,        \
                               name.drop_front(sizeof(#TYPE_NAME)-1));  \
@@ -674,8 +675,8 @@ clang::QualType ClangTypeConverter::visitSILFunctionType(SILFunctionType *type) 
                         : repr);
     auto results = type->getResults();
     auto optionalResult = results.empty()
-                              ? llvm::None
-                              : llvm::Optional<SILResultInfo>(results[0]);
+                              ? std::nullopt
+                              : std::optional<SILResultInfo>(results[0]);
     clangTy = getFunctionType(type->getParameters(), optionalResult, newRepr);
   }
   return clang::QualType(clangTy, 0);
@@ -838,7 +839,11 @@ clang::QualType ClangTypeConverter::convert(Type type) {
     if (auto clangDecl = decl->getClangDecl()) {
       auto &ctx = ClangASTContext;
       if (auto clangTypeDecl = dyn_cast<clang::TypeDecl>(clangDecl)) {
-        return ctx.getTypeDeclType(clangTypeDecl).getUnqualifiedType();
+        auto qualType = ctx.getTypeDeclType(clangTypeDecl);
+        if (type->isForeignReferenceType()) {
+          qualType = ctx.getPointerType(qualType);
+        }
+        return qualType.getUnqualifiedType();
       } else if (auto ifaceDecl = dyn_cast<clang::ObjCInterfaceDecl>(clangDecl)) {
         auto clangType  = ctx.getObjCInterfaceType(ifaceDecl);
         return ctx.getObjCObjectPointerType(clangType);
@@ -896,6 +901,19 @@ ClangTypeConverter::getClangTemplateArguments(
     }
 
     auto replacement = genericArgs[templateParam->getIndex()];
+
+    // Ban ObjCBool type from being substituted into C++ templates.
+    if (auto nominal = replacement->getAs<NominalType>()) {
+      if (auto nominalDecl = nominal->getDecl()) {
+        if (nominalDecl->getName().is("ObjCBool") &&
+            nominalDecl->getModuleContext()->getName() ==
+                nominalDecl->getASTContext().Id_ObjectiveC) {
+          failedTypes.push_back(replacement);
+          continue;
+        }
+      }
+    }
+
     auto qualType = convert(replacement);
     if (qualType.isNull()) {
       failedTypes.push_back(replacement);
@@ -906,7 +924,7 @@ ClangTypeConverter::getClangTemplateArguments(
   }
   if (failedTypes.empty())
     return nullptr;
-  // Clear "templateArgs" to prevent the clients from accidently reading a
+  // Clear "templateArgs" to prevent the clients from accidentally reading a
   // partially converted set of template arguments.
   templateArgs.clear();
   auto errorInfo = std::make_unique<TemplateInstantiationError>();

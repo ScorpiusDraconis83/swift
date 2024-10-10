@@ -14,17 +14,18 @@
 #include "RefactoringActions.h"
 #include "Utils.h"
 #include "swift/AST/DiagnosticsRefactoring.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/IDETool/CompilerInvocation.h"
 
 using namespace swift::refactoring;
 
 static Type sanitizeType(Type Ty) {
   // Transform lvalue type to inout type so that we can print it properly.
-  return Ty.transform([](Type Ty) {
+  return Ty.transformRec([](Type Ty) -> std::optional<Type> {
     if (Ty->is<LValueType>()) {
       return Type(InOutType::get(Ty->getRValueType()->getCanonicalType()));
     }
-    return Ty;
+    return std::nullopt;
   });
 }
 
@@ -95,7 +96,7 @@ getNotableRegions(StringRef SourceText, unsigned NameOffset, StringRef Name) {
   if (Instance->setup(Invocation, InstanceSetupError))
     llvm_unreachable(InstanceSetupError.c_str());
 
-  unsigned BufferId = Instance->getPrimarySourceFile()->getBufferID().value();
+  unsigned BufferId = Instance->getPrimarySourceFile()->getBufferID();
   SourceManager &SM = Instance->getSourceMgr();
   SourceLoc NameLoc = SM.getLocForOffset(BufferId, NameOffset);
   auto LineAndCol = SM.getLineAndColumnInBuffer(NameLoc);
@@ -164,7 +165,7 @@ bool RefactoringActionExtractFunction::performChange() {
   }
 
   // Correct the given name if collision happens.
-  PreferredName = correctNewDeclName(InsertToDC, PreferredName);
+  PreferredName = correctNewDeclName(InsertLoc, InsertToDC, PreferredName);
 
   // Collect the parameters to pass down to the new function.
   std::vector<ReferencedDecl> Parameters;

@@ -31,7 +31,7 @@ using namespace swift::constraints::inference;
 SemaTest::SemaTest()
     : Context(*ASTContext::get(LangOpts, TypeCheckerOpts, SILOpts,
                                SearchPathOpts, ClangImporterOpts,
-                               SymbolGraphOpts, SourceMgr, Diags)) {
+                               SymbolGraphOpts, CASOpts, SourceMgr, Diags)) {
   INITIALIZE_LLVM();
 
   registerParseRequestFunctions(Context.evaluator);
@@ -47,8 +47,9 @@ SemaTest::SemaTest()
   auto *module =
       ModuleDecl::create(Context.getIdentifier("SemaTests"), Context);
 
+  auto bufferID = Context.SourceMgr.addMemBufferCopy("// nothing\n");
   MainFile = new (Context) SourceFile(*module, SourceFileKind::Main,
-                                      /*buffer=*/llvm::None);
+                                      bufferID);
 
   AttributedImport<ImportedModule> stdlibImport{{ImportPath::Access(), stdlib},
                                                 /*options=*/{}};

@@ -174,6 +174,7 @@ public struct Range<Bound: Comparable> {
   ///
   /// - Parameter bounds: A tuple of the lower and upper bounds of the range.
   @inlinable
+  @unsafe
   public init(uncheckedBounds bounds: (lower: Bound, upper: Bound)) {
     _debugPrecondition(bounds.lower <= bounds.upper,
       "Range requires lowerBound <= upperBound")
@@ -1039,7 +1040,6 @@ extension PartialRangeThrough: Sendable where Bound: Sendable { }
 extension PartialRangeFrom: Sendable where Bound: Sendable { }
 extension PartialRangeFrom.Iterator: Sendable where Bound: Sendable { }
 
-#if !$Embedded
 extension Range where Bound == String.Index {
   @_alwaysEmitIntoClient // Swift 5.7
   internal var _encodedOffsetRange: Range<Int> {
@@ -1050,4 +1050,3 @@ extension Range where Bound == String.Index {
       _uncheckedBounds: (lowerBound._encodedOffset, upperBound._encodedOffset))
   }
 }
-#endif

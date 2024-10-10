@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/SILOptimizer/Analysis/ArraySemantic.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/SILArgument.h"
@@ -263,20 +264,20 @@ SILValue swift::ArraySemanticsCall::getIndex() const {
   return SemanticsCall->getArgument(0);
 }
 
-llvm::Optional<int64_t> swift::ArraySemanticsCall::getConstantIndex() const {
+std::optional<int64_t> swift::ArraySemanticsCall::getConstantIndex() const {
   auto *IndexStruct = dyn_cast<StructInst>(getIndex());
   if (!IndexStruct)
-    return llvm::None;
+    return std::nullopt;
   auto StructOpds = IndexStruct->getElements();
   if (StructOpds.size() != 1)
-    return llvm::None;
+    return std::nullopt;
   auto *Literal = dyn_cast<IntegerLiteralInst>(StructOpds[0]);
   if (!Literal)
-    return llvm::None;
+    return std::nullopt;
 
   auto Val = Literal->getValue();
   if (Val.getNumWords()>1)
-    return llvm::None;
+    return std::nullopt;
 
   return Val.getSExtValue();
 }
@@ -815,7 +816,8 @@ bool swift::ArraySemanticsCall::replaceByAppendingValues(
     SILValue Args[] = {AllocStackInst, ArrRef};
     Builder.createApply(Loc, FnRef, Subs, Args);
     Builder.createDeallocStack(Loc, AllocStackInst);
-    if (!isConsumedParameter(AppendFnTy->getParameters()[0].getConvention())) {
+    if (!isConsumedParameterInCaller(
+            AppendFnTy->getParameters()[0].getConvention())) {
       ValLowering.emitDestroyValue(Builder, Loc, CopiedVal);
     }
   }

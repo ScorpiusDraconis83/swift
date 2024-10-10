@@ -42,6 +42,7 @@ namespace swift {
     llvm::VersionTuple UserModuleVersion;
     std::set<std::string> AllowableClients;
     std::string SDKName;
+    std::string SDKVersion;
 
     StringRef GroupInfoPath;
     StringRef ImportedHeader;
@@ -159,6 +160,7 @@ namespace swift {
     bool IsOSSA = false;
     bool SkipNonExportableDecls = false;
     bool ExplicitModuleBuild = false;
+    bool EnableSerializationRemarks = false;
   };
 
 } // end namespace swift

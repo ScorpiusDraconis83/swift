@@ -20,8 +20,8 @@
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/ForeignAsyncConvention.h"
 #include "swift/AST/ForeignErrorConvention.h"
-#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/PointerUnion.h"
+#include <optional>
 
 namespace swift {
 
@@ -71,7 +71,7 @@ public:
     ExplicitlyGKInspectable,
     /// Is it a member of an @objc extension of a class.
     MemberOfObjCExtension,
-    /// Is it a member of an \@\_objcImplementation extension.
+    /// Is it a member of an \@objc \@implementation extension.
     MemberOfObjCImplementationExtension,
     /// Has an explicit '@objc' attribute added by an access note, rather than
     /// written in source code.
@@ -185,8 +185,8 @@ unsigned getObjCDiagnosticAttrKind(ObjCReason reason);
 /// and figure out its foreign error convention (if any).
 bool isRepresentableInObjC(
     const AbstractFunctionDecl *AFD, ObjCReason Reason,
-    llvm::Optional<ForeignAsyncConvention> &asyncConvention,
-    llvm::Optional<ForeignErrorConvention> &errorConvention);
+    std::optional<ForeignAsyncConvention> &asyncConvention,
+    std::optional<ForeignErrorConvention> &errorConvention);
 
 /// Determine whether the given variable can be represented in Objective-C.
 bool isRepresentableInObjC(const VarDecl *VD, ObjCReason Reason);
@@ -212,9 +212,8 @@ bool fixDeclarationName(InFlightDiagnostic &diag, const ValueDecl *decl,
 ///
 /// For properties, the selector should be a zero-parameter selector of the
 /// given property's name.
-bool fixDeclarationObjCName(InFlightDiagnostic &diag, const ValueDecl *decl,
-                            llvm::Optional<ObjCSelector> nameOpt,
-                            llvm::Optional<ObjCSelector> targetNameOpt,
+bool fixDeclarationObjCName(InFlightDiagnostic &diag, const Decl *decl,
+                            ObjCSelector name, ObjCSelector targetName,
                             bool ignoreImpliedName = false);
 
 } // end namespace swift

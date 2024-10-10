@@ -29,6 +29,7 @@
 #include "swift/AST/Decl.h"
 #include "swift/AST/IRGenOptions.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/ClangImporter/ClangImporter.h"
 #include "swift/Demangling/ManglingMacros.h"
 #include "swift/IRGen/Linking.h"
@@ -459,20 +460,7 @@ getProtocolRefsList(llvm::Constant *protocol) {
     return std::make_pair(0, nullptr);
   }
 
-  if (!protocol->getContext().supportsTypedPointers()) {
-    auto protocolRefsVar = cast<llvm::GlobalVariable>(objCProtocolList);
-    auto sizeListPair =
-        cast<llvm::ConstantStruct>(protocolRefsVar->getInitializer());
-    auto size =
-        cast<llvm::ConstantInt>(sizeListPair->getOperand(0))->getZExtValue();
-    auto protocolRefsList =
-        cast<llvm::ConstantArray>(sizeListPair->getOperand(1));
-    return std::make_pair(size, protocolRefsList);
-  }
-
-  auto bitcast = cast<llvm::ConstantExpr>(objCProtocolList);
-  assert(bitcast->getOpcode() == llvm::Instruction::BitCast);
-  auto protocolRefsVar = cast<llvm::GlobalVariable>(bitcast->getOperand(0));
+  auto protocolRefsVar = cast<llvm::GlobalVariable>(objCProtocolList);
   auto sizeListPair =
       cast<llvm::ConstantStruct>(protocolRefsVar->getInitializer());
   auto size =
@@ -675,6 +663,7 @@ namespace {
       case SILDeclRef::Kind::PropertyWrapperInitFromProjectedValue:
       case SILDeclRef::Kind::EntryPoint:
       case SILDeclRef::Kind::AsyncEntryPoint:
+      case SILDeclRef::Kind::IsolatedDeallocator:
         llvm_unreachable("Method does not have a selector");
 
       case SILDeclRef::Kind::Destroyer:
@@ -790,6 +779,8 @@ Callee irgen::getObjCMethodCallee(IRGenFunction &IGF,
                                   llvm::Value *selfValue,
                                   CalleeInfo &&info) {
   SILDeclRef method = methodInfo.getMethod();
+  // Note that isolated deallocator is never called directly, only from regular
+  // deallocator
   assert((method.kind == SILDeclRef::Kind::Initializer
           || method.kind == SILDeclRef::Kind::Allocator
           || method.kind == SILDeclRef::Kind::Func
@@ -961,6 +952,7 @@ static llvm::Function *emitObjCPartialApplicationForwarder(IRGenModule &IGM,
   case ParameterConvention::Indirect_In:
   case ParameterConvention::Indirect_Inout:
   case ParameterConvention::Indirect_InoutAliasable:
+  case ParameterConvention::Indirect_In_CXX:
   case ParameterConvention::Pack_Guaranteed:
   case ParameterConvention::Pack_Owned:
   case ParameterConvention::Pack_Inout:
@@ -972,7 +964,7 @@ static llvm::Function *emitObjCPartialApplicationForwarder(IRGenModule &IGM,
   llvm::Value *context = params.takeLast();
   Address dataAddr = layout.emitCastTo(subIGF, context);
   auto &fieldLayout = layout.getElement(0);
-  Address selfAddr = fieldLayout.project(subIGF, dataAddr, llvm::None);
+  Address selfAddr = fieldLayout.project(subIGF, dataAddr, std::nullopt);
   Explosion selfParams;
   if (retainsSelf)
     cast<LoadableTypeInfo>(selfTI).loadAsCopy(subIGF, selfAddr, selfParams);
@@ -1112,7 +1104,7 @@ void irgen::emitObjCPartialApplication(IRGenFunction &IGF,
   llvm::Value *data = IGF.emitUnmanagedAlloc(layout, "closure",
                                              Descriptor);
   // FIXME: non-fixed offsets
-  NonFixedOffsets offsets = llvm::None;
+  NonFixedOffsets offsets = std::nullopt;
   Address dataAddr = layout.emitCastTo(IGF, data);
   auto &fieldLayout = layout.getElement(0);
   auto &fieldType = layout.getElementTypes()[0];
@@ -1725,7 +1717,7 @@ void IRGenFunction::emitBlockRelease(llvm::Value *value) {
 }
 
 void IRGenFunction::emitForeignReferenceTypeLifetimeOperation(
-    ValueDecl *fn, llvm::Value *value) {
+    ValueDecl *fn, llvm::Value *value, bool needsNullCheck) {
   assert(fn->getClangDecl() && isa<clang::FunctionDecl>(fn->getClangDecl()));
 
   auto clangFn = cast<clang::FunctionDecl>(fn->getClangDecl());
@@ -1736,6 +1728,28 @@ void IRGenFunction::emitForeignReferenceTypeLifetimeOperation(
       cast<llvm::FunctionType>(llvmFn->getFunctionType())->getParamType(0);
   value = Builder.CreateBitCast(value, argType);
 
-  auto call = Builder.CreateCall(llvmFn->getFunctionType(), llvmFn, value);
+  llvm::CallInst *call = nullptr;
+  if (needsNullCheck) {
+    // Check if the pointer is null.
+    auto nullValue = llvm::Constant::getNullValue(argType);
+    auto hasValue = Builder.CreateICmpNE(value, nullValue);
+
+    auto nonNullValueBB = createBasicBlock("lifetime.nonnull-value");
+    auto contBB = createBasicBlock("lifetime.cont");
+
+    // If null, just continue.
+    Builder.CreateCondBr(hasValue, nonNullValueBB, contBB);
+
+    // If non-null, emit a call to release/retain function.
+    Builder.emitBlock(nonNullValueBB);
+    call = Builder.CreateCall(llvmFn->getFunctionType(), llvmFn, value);
+
+    Builder.CreateBr(contBB);
+
+    Builder.emitBlock(contBB);
+  } else {
+    call = Builder.CreateCall(llvmFn->getFunctionType(), llvmFn, value);
+  }
+
   call->setDoesNotThrow();
 }

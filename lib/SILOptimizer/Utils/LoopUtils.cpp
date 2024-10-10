@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "sil-loop-utils"
+#include "swift/Basic/Assertions.h"
 #include "swift/SILOptimizer/Utils/LoopUtils.h"
 #include "swift/SILOptimizer/Utils/BasicBlockOptUtils.h"
 #include "swift/SIL/BasicBlockUtils.h"
@@ -251,7 +252,21 @@ bool swift::canDuplicateLoopInstruction(SILLoop *L, SILInstruction *I) {
 
     return alloc && L->contains(alloc);
   }
-
+  // In OSSA, partial_apply is not considered stack allocating. Nonetheless,
+  // prevent it from being cloned so OSSA lowering can directly convert it to a
+  // single allocation.
+  if (auto *PA = dyn_cast<PartialApplyInst>(I)) {
+    if (PA->isOnStack()) {
+      assert(PA->getFunction()->hasOwnership());
+      return false;
+    }
+  }
+  // Like partial_apply [onstack], mark_dependence [nonescaping] creates a
+  // borrow scope. We currently assume that a set of dominated scope-ending uses
+  // can be found.
+  if (auto *MD = dyn_cast<MarkDependenceInst>(I)) {
+    return !MD->isNonEscaping();
+  }
   // CodeGen can't build ssa for objc methods.
   if (auto *Method = dyn_cast<MethodInst>(I)) {
     if (Method->getMember().isForeign) {
@@ -265,9 +280,9 @@ bool swift::canDuplicateLoopInstruction(SILLoop *L, SILInstruction *I) {
 
   // We can't have a phi of two openexistential instructions of different UUID.
   if (isa<OpenExistentialAddrInst>(I) || isa<OpenExistentialRefInst>(I) ||
-      isa<OpenExistentialMetatypeInst>(I) ||
-      isa<OpenExistentialValueInst>(I) || isa<OpenExistentialBoxInst>(I) ||
-      isa<OpenExistentialBoxValueInst>(I)) {
+      isa<OpenExistentialMetatypeInst>(I) || isa<OpenExistentialValueInst>(I) ||
+      isa<OpenExistentialBoxInst>(I) || isa<OpenExistentialBoxValueInst>(I) ||
+      isa<OpenPackElementInst>(I)) {
     SingleValueInstruction *OI = cast<SingleValueInstruction>(I);
     for (auto *UI : OI->getUses())
       if (!L->contains(UI->getUser()))
@@ -293,11 +308,17 @@ bool swift::canDuplicateLoopInstruction(SILLoop *L, SILInstruction *I) {
   if (auto BAI = dyn_cast<BeginApplyInst>(I)) {
     for (auto UI : BAI->getTokenResult()->getUses()) {
       auto User = UI->getUser();
-      assert(isa<EndApplyInst>(User) || isa<AbortApplyInst>(User));
+      assert(isa<EndApplyInst>(User) || isa<AbortApplyInst>(User) ||
+             isa<EndBorrowInst>(User));
       if (!L->contains(User))
         return false;
     }
     return true;
+  }
+
+  if (auto *bi = dyn_cast<BuiltinInst>(I)) {
+    if (bi->getBuiltinInfo().ID == BuiltinValueKind::Once)
+      return false;
   }
 
   if (isa<DynamicMethodBranchInst>(I))

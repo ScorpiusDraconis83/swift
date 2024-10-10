@@ -26,7 +26,7 @@ func bad_containers_3(bc: BadContainer3) {
 
 struct BadIterator1 {}
 
-struct BadContainer4 : Sequence { // expected-error{{type 'BadContainer4' does not conform to protocol 'Sequence'}}
+struct BadContainer4 : Sequence { // expected-error{{type 'BadContainer4' does not conform to protocol 'Sequence'}} expected-note {{add stubs for conformance}}
   typealias Iterator = BadIterator1 // expected-note{{possibly intended match 'BadContainer4.Iterator' (aka 'BadIterator1') does not conform to 'IteratorProtocol'}}
   func makeIterator() -> BadIterator1 { }
 }
@@ -328,6 +328,26 @@ do {
     test {
       for t in repeat each ts where !ts.isEmpty {}
       // expected-error@-1 {{'where' clause in pack iteration is not supported}}
+    }
+  }
+  
+  func nested<each T, each U>(value: repeat each T, value1: repeat each U) {
+    for e1 in repeat each value {
+      for _ in [] {}
+      for e2 in repeat each value1 {
+        let y = e1 // Ok
+      }
+      let x = e1 // Ok
+    }
+  }
+}
+
+// https://github.com/apple/swift/issues/73207
+do {
+  func test(_ levels: [Range<Int>]) {
+    for (i, leaves): (Int, Range<Int>) in levels[8 ..< 15].enumerated() { // Ok
+      _ = i
+      _ = leaves
     }
   }
 }

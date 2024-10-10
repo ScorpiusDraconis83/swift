@@ -21,9 +21,8 @@
 #include "swift/Basic/Debug.h"
 #include "swift/Basic/LLVM.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/None.h"
-#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/PointerUnion.h"
+#include <optional>
 
 namespace swift {
 class CaptureInfo;
@@ -58,7 +57,7 @@ public:
 
   /// Construct an AnyFunctionRef from a decl context that might be
   /// some sort of function.
-  static llvm::Optional<AnyFunctionRef> fromDeclContext(DeclContext *dc) {
+  static std::optional<AnyFunctionRef> fromDeclContext(DeclContext *dc) {
     if (auto fn = dyn_cast<AbstractFunctionDecl>(dc)) {
       return AnyFunctionRef(fn);
     }
@@ -67,43 +66,13 @@ public:
       return AnyFunctionRef(ace);
     }
 
-    return llvm::None;
+    return std::nullopt;
   }
 
   CaptureInfo getCaptureInfo() const {
     if (auto *AFD = TheFunction.dyn_cast<AbstractFunctionDecl *>())
       return AFD->getCaptureInfo();
     return TheFunction.get<AbstractClosureExpr *>()->getCaptureInfo();
-  }
-
-  void setCaptureInfo(CaptureInfo captures) const {
-    if (auto *AFD = TheFunction.dyn_cast<AbstractFunctionDecl *>()) {
-      AFD->setCaptureInfo(captures);
-      return;
-    }
-    TheFunction.get<AbstractClosureExpr *>()->setCaptureInfo(captures);
-  }
-
-  void getLocalCaptures(SmallVectorImpl<CapturedValue> &Result) const {
-    getCaptureInfo().getLocalCaptures(Result);
-  }
-
-  bool hasType() const {
-    if (auto *AFD = TheFunction.dyn_cast<AbstractFunctionDecl *>())
-      return AFD->hasInterfaceType();
-    return !TheFunction.get<AbstractClosureExpr *>()->getType().isNull();
-  }
-
-  bool hasSingleExpressionBody() const {
-    if (auto *AFD = TheFunction.dyn_cast<AbstractFunctionDecl *>())
-      return AFD->hasSingleExpressionBody();
-    return TheFunction.get<AbstractClosureExpr *>()->hasSingleExpressionBody();
-  }
-
-  Expr *getSingleExpressionBody() const {
-    if (auto *AFD = TheFunction.dyn_cast<AbstractFunctionDecl *>())
-      return AFD->getSingleExpressionBody();
-    return TheFunction.get<AbstractClosureExpr *>()->getSingleExpressionBody();
   }
 
   ParameterList *getParameters() const {
@@ -152,34 +121,32 @@ public:
     return cast<AutoClosureExpr>(ACE)->getBody();
   }
 
-  void setParsedBody(BraceStmt *stmt, bool isSingleExpression) {
+  void setParsedBody(BraceStmt *stmt) {
     if (auto *AFD = TheFunction.dyn_cast<AbstractFunctionDecl *>()) {
       AFD->setBody(stmt, AbstractFunctionDecl::BodyKind::Parsed);
-      AFD->setHasSingleExpressionBody(isSingleExpression);
       return;
     }
 
     auto *ACE = TheFunction.get<AbstractClosureExpr *>();
     if (auto *CE = dyn_cast<ClosureExpr>(ACE)) {
-      CE->setBody(stmt, isSingleExpression);
-      CE->setBodyState(ClosureExpr::BodyState::ReadyForTypeChecking);
+      CE->setBody(stmt);
+      CE->setBodyState(ClosureExpr::BodyState::Parsed);
       return;
     }
 
     llvm_unreachable("autoclosures don't have statement bodies");
   }
 
-  void setTypecheckedBody(BraceStmt *stmt, bool isSingleExpression) {
+  void setTypecheckedBody(BraceStmt *stmt) {
     if (auto *AFD = TheFunction.dyn_cast<AbstractFunctionDecl *>()) {
       AFD->setBody(stmt, AbstractFunctionDecl::BodyKind::TypeChecked);
-      AFD->setHasSingleExpressionBody(isSingleExpression);
       return;
     }
 
     auto *ACE = TheFunction.get<AbstractClosureExpr *>();
     if (auto *CE = dyn_cast<ClosureExpr>(ACE)) {
-      CE->setBody(stmt, isSingleExpression);
-      CE->setBodyState(ClosureExpr::BodyState::TypeCheckedWithSignature);
+      CE->setBody(stmt);
+      CE->setBodyState(ClosureExpr::BodyState::TypeChecked);
       return;
     }
 
@@ -200,20 +167,8 @@ public:
     return TheFunction.dyn_cast<AbstractClosureExpr*>();
   }
 
-  /// Return true if this closure is passed as an argument to a function and is
-  /// known not to escape from that function.  In this case, captures can be
-  /// more efficient.
-  bool isKnownNoEscape() const {
-    if (hasType() && !getType()->hasError())
-      return getType()->castTo<AnyFunctionType>()->isNoEscape();
-    return false;
-  }
-
   /// Whether this function is @Sendable.
   bool isSendable() const {
-    if (!hasType())
-      return false;
-
     if (auto *fnType = getType()->getAs<AnyFunctionType>())
       return fnType->isSendable();
 
@@ -305,9 +260,10 @@ private:
                                          ->getReferenceStorageReferent();
           if (mapIntoContext)
             valueTy = AD->mapTypeIntoContext(valueTy);
-          YieldTypeFlags flags(AD->getAccessorKind() == AccessorKind::Modify
-                                 ? ParamSpecifier::InOut
-                                 : ParamSpecifier::LegacyShared);
+          YieldTypeFlags flags(
+              isYieldingDefaultMutatingAccessor(AD->getAccessorKind())
+                  ? ParamSpecifier::InOut
+                  : ParamSpecifier::LegacyShared);
           buffer.push_back(AnyFunctionType::Yield(valueTy, flags));
           return buffer;
         }
@@ -349,4 +305,3 @@ struct DenseMapInfo<swift::AnyFunctionRef> {
 }
 
 #endif // LLVM_SWIFT_AST_ANY_FUNCTION_REF_H
-

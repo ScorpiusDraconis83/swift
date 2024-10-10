@@ -17,6 +17,7 @@
 #define DEBUG_TYPE "cowarray-opts"
 
 #include "ArrayOpt.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/CFG.h"
 #include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/InstructionUtils.h"
@@ -105,7 +106,7 @@ class COWArrayOpt {
   RCIdentityFunctionInfo *RCIA;
   SILFunction *Function;
   SILLoop *Loop;
-  llvm::Optional<SmallVector<SILBasicBlock *, 8>> LoopExitingBlocks;
+  std::optional<SmallVector<SILBasicBlock *, 8>> LoopExitingBlocks;
   SILBasicBlock *Preheader;
   DominanceInfo *DomTree;
   bool HasChanged = false;
@@ -153,10 +154,13 @@ class COWArrayOpt {
   // analyzing.
   SILValue CurrentArrayAddr;
 public:
-  COWArrayOpt(RCIdentityFunctionInfo *RCIA, SILLoop *L, DominanceAnalysis *DA)
+  COWArrayOpt(RCIdentityFunctionInfo *RCIA, SILLoop *L, DominanceAnalysis *DA,
+              PostDominanceAnalysis *PDA)
       : RCIA(RCIA), Function(L->getHeader()->getParent()), Loop(L),
         Preheader(L->getLoopPreheader()), DomTree(DA->get(Function)),
-        ColdBlocks(DA), CachedSafeLoop(false, false), ReachingBlocks(Function) {}
+        ColdBlocks(DA, PDA), CachedSafeLoop(false, false), ReachingBlocks(Function) {
+    ColdBlocks.analyze(Function);
+  }
 
   bool run();
 
@@ -494,7 +498,7 @@ ArraySemanticsCall getEndMutationCall(const UserRange &AddressUsers) {
 
 /// Returns true if this instruction is a safe array use if all of its users are
 /// also safe array users.
-static llvm::Optional<SILInstructionResultArray>
+static std::optional<SILInstructionResultArray>
 isTransitiveSafeUser(SILInstruction *I) {
   switch (I->getKind()) {
   case SILInstructionKind::StructExtractInst:
@@ -510,7 +514,7 @@ isTransitiveSafeUser(SILInstruction *I) {
   case SILInstructionKind::BeginBorrowInst:
     return I->getResults();
   default:
-    return llvm::None;
+    return std::nullopt;
   }
 }
 
@@ -1062,6 +1066,7 @@ class COWArrayOptPass : public SILFunctionTransform {
                             << getFunction()->getName() << "\n");
 
     auto *DA = PM->getAnalysis<DominanceAnalysis>();
+    auto *PDA = PM->getAnalysis<PostDominanceAnalysis>();
     auto *LA = PM->getAnalysis<SILLoopAnalysis>();
     auto *RCIA =
       PM->getAnalysis<RCIdentityAnalysis>()->get(getFunction());
@@ -1083,7 +1088,7 @@ class COWArrayOptPass : public SILFunctionTransform {
 
     bool HasChanged = false;
     for (auto *L : Loops)
-      HasChanged |= COWArrayOpt(RCIA, L, DA).run();
+      HasChanged |= COWArrayOpt(RCIA, L, DA, PDA).run();
 
     if (HasChanged)
       invalidateAnalysis(SILAnalysis::InvalidationKind::CallsAndInstructions);

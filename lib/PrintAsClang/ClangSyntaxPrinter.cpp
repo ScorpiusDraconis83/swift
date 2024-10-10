@@ -18,9 +18,12 @@
 #include "swift/AST/Module.h"
 #include "swift/AST/SwiftNameTranslation.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "clang/AST/ASTContext.h"
+#include "clang/AST/Decl.h"
 #include "clang/AST/DeclTemplate.h"
 #include "clang/AST/NestedNameSpecifier.h"
+#include "llvm/Support/Casting.h"
 
 using namespace swift;
 using namespace cxx_synthesis;
@@ -78,7 +81,6 @@ void ClangSyntaxPrinter::printModuleNamespaceQualifiersIfNeeded(
 
 bool ClangSyntaxPrinter::printNominalTypeOutsideMemberDeclTemplateSpecifiers(
     const NominalTypeDecl *typeDecl) {
-  // FIXME: Full qualifiers for nested types?
   if (!typeDecl->isGeneric())
     return true;
   printGenericSignature(
@@ -125,6 +127,26 @@ void ClangSyntaxPrinter::printClangTypeReference(const clang::Decl *typeDecl) {
   }
 }
 
+bool ClangSyntaxPrinter::printNestedTypeNamespaceQualifiers(
+    const ValueDecl *D) const {
+  bool first = true;
+  while (auto parent = dyn_cast_or_null<NominalTypeDecl>(
+             D->getDeclContext()->getAsDecl())) {
+    // C++ namespaces are imported as enums.
+    if (parent->hasClangNode() &&
+        isa<clang::NamespaceDecl>(parent->getClangNode().getAsDecl()))
+      break;
+    if (!first)
+      os << "::";
+    first = false;
+    os << "__";
+    printBaseName(parent);
+    os << "Nested";
+    D = parent;
+  }
+  return first;
+}
+
 void ClangSyntaxPrinter::printNominalTypeReference(
     const NominalTypeDecl *typeDecl, const ModuleDecl *moduleContext) {
   if (typeDecl->hasClangNode()) {
@@ -133,7 +155,8 @@ void ClangSyntaxPrinter::printNominalTypeReference(
   }
   printModuleNamespaceQualifiersIfNeeded(typeDecl->getModuleContext(),
                                          moduleContext);
-  // FIXME: Full qualifiers for nested types?
+  if (!printNestedTypeNamespaceQualifiers(typeDecl))
+    os << "::";
   ClangSyntaxPrinter(os).printBaseName(typeDecl);
   if (typeDecl->isGeneric())
     printGenericSignatureParams(
@@ -179,6 +202,18 @@ void ClangSyntaxPrinter::printNamespace(
   printNamespace([&](raw_ostream &os) { os << name; }, bodyPrinter, trivia);
 }
 
+void ClangSyntaxPrinter::printParentNamespaceForNestedTypes(
+    const ValueDecl *D, llvm::function_ref<void(raw_ostream &OS)> bodyPrinter,
+    NamespaceTrivia trivia) const {
+  if (!isa_and_nonnull<NominalTypeDecl>(D->getDeclContext()->getAsDecl())) {
+    bodyPrinter(os);
+    return;
+  }
+  printNamespace(
+      [=](raw_ostream &os) { printNestedTypeNamespaceQualifiers(D); },
+      bodyPrinter, trivia);
+}
+
 void ClangSyntaxPrinter::printExternC(
     llvm::function_ref<void(raw_ostream &OS)> bodyPrinter) const {
   os << "#ifdef __cplusplus\n";
@@ -210,7 +245,7 @@ void ClangSyntaxPrinter::printInlineForHelperFunction() const {
 }
 
 void ClangSyntaxPrinter::printNullability(
-    llvm::Optional<OptionalTypeKind> kind,
+    std::optional<OptionalTypeKind> kind,
     NullabilityPrintKind printKind) const {
   if (!kind)
     return;
@@ -312,7 +347,7 @@ void ClangSyntaxPrinter::printGenericTypeParamTypeName(
 }
 
 void ClangSyntaxPrinter::printGenericSignature(
-    const CanGenericSignature &signature) {
+    GenericSignature signature) {
   os << "template<";
   llvm::interleaveComma(signature.getInnermostGenericParams(), os,
                         [&](const GenericTypeParamType *genericParamType) {
@@ -334,7 +369,7 @@ void ClangSyntaxPrinter::printGenericSignature(
 }
 
 void ClangSyntaxPrinter::printGenericSignatureInnerStaticAsserts(
-    const CanGenericSignature &signature) {
+    GenericSignature signature) {
   os << "#ifndef __cpp_concepts\n";
   llvm::interleave(
       signature.getInnermostGenericParams(), os,
@@ -348,7 +383,7 @@ void ClangSyntaxPrinter::printGenericSignatureInnerStaticAsserts(
 }
 
 void ClangSyntaxPrinter::printGenericSignatureParams(
-    const CanGenericSignature &signature) {
+    GenericSignature signature) {
   os << '<';
   llvm::interleaveComma(signature.getInnermostGenericParams(), os,
                         [&](const GenericTypeParamType *genericParamType) {
@@ -382,7 +417,8 @@ void ClangSyntaxPrinter::printPrimaryCxxTypeName(
     const NominalTypeDecl *type, const ModuleDecl *moduleContext) {
   printModuleNamespaceQualifiersIfNeeded(type->getModuleContext(),
                                          moduleContext);
-  // FIXME: Print class qualifiers for nested class references.
+  if (!printNestedTypeNamespaceQualifiers(type))
+    os << "::";
   printBaseName(type);
 }
 

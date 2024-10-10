@@ -1,8 +1,14 @@
-// RUN: %target-typecheck-verify-swift  -disable-availability-checking
-// RUN: %target-swift-frontend  -disable-availability-checking %s -emit-sil -o /dev/null -verify
-// RUN: %target-swift-frontend  -disable-availability-checking %s -emit-sil -o /dev/null -verify -strict-concurrency=targeted
-// RUN: %target-swift-frontend  -disable-availability-checking %s -emit-sil -o /dev/null -verify -strict-concurrency=complete -verify-additional-prefix complete-tns-
-// RUN: %target-swift-frontend  -disable-availability-checking %s -emit-sil -o /dev/null -verify -strict-concurrency=complete -enable-experimental-feature RegionBasedIsolation  -verify-additional-prefix complete-tns-
+// Typecheck.
+// RUN: %target-typecheck-verify-swift  -disable-availability-checking -verify-additional-prefix without-transferring-
+
+// Emit SIL with minimal strict concurrency.
+// RUN: %target-swift-frontend  -disable-availability-checking %s -emit-sil -o /dev/null -verify -verify-additional-prefix without-transferring-
+
+// Emit SIL with targeted concurrency.
+// RUN: %target-swift-frontend  -disable-availability-checking %s -emit-sil -o /dev/null -verify -strict-concurrency=targeted -verify-additional-prefix without-transferring-
+
+// Emit SIL with strict concurrency + region based isolation + transferring
+// RUN: %target-swift-frontend  -disable-availability-checking %s -emit-sil -o /dev/null -verify -strict-concurrency=complete  -verify-additional-prefix complete-tns-
 
 // REQUIRES: concurrency
 // REQUIRES: asserts
@@ -28,10 +34,10 @@ func testConversions(f: @escaping @SomeGlobalActor (Int) -> Void, g: @escaping (
 }
 
 @SomeGlobalActor func onSomeGlobalActor() -> Int { 5 }
-@SomeGlobalActor(unsafe) func onSomeGlobalActorUnsafe() -> Int { 5 }
+@preconcurrency @SomeGlobalActor func onSomeGlobalActorUnsafe() -> Int { 5 }
 
 @OtherGlobalActor func onOtherGlobalActor() -> Int { 5 } // expected-note{{calls to global function 'onOtherGlobalActor()' from outside of its actor context are implicitly asynchronous}}
-@OtherGlobalActor(unsafe) func onOtherGlobalActorUnsafe() -> Int { 5 }  // expected-note 2{{calls to global function 'onOtherGlobalActorUnsafe()' from outside of its actor context are implicitly asynchronous}}
+@preconcurrency @OtherGlobalActor func onOtherGlobalActorUnsafe() -> Int { 5 }  // expected-note 2{{calls to global function 'onOtherGlobalActorUnsafe()' from outside of its actor context are implicitly asynchronous}}
 // expected-complete-tns-note @-1 {{calls to global function 'onOtherGlobalActorUnsafe()' from outside of its actor context are implicitly asynchronous}}
 
 func someSlowOperation() async -> Int { 5 }
@@ -71,7 +77,7 @@ func testClosures(i: Int) async {
   }
 
   acceptOnSomeGlobalActor { () -> Int in
-    let i = onOtherGlobalActorUnsafe() // expected-error{{call to global actor 'OtherGlobalActor'-isolated global function 'onOtherGlobalActorUnsafe()' in a synchronous global actor 'SomeGlobalActor'-isolated context}}
+    let i = onOtherGlobalActorUnsafe() // expected-warning{{call to global actor 'OtherGlobalActor'-isolated global function 'onOtherGlobalActorUnsafe()' in a synchronous global actor 'SomeGlobalActor'-isolated context}}
     return i
   }
 }
@@ -93,12 +99,12 @@ func testClosuresOld() {
   }
 
   acceptOnSomeGlobalActor { () -> Int in
-    let i = onOtherGlobalActorUnsafe() // expected-complete-tns-error {{call to global actor 'OtherGlobalActor'-isolated global function 'onOtherGlobalActorUnsafe()' in a synchronous global actor 'SomeGlobalActor'-isolated context}}
+    let i = onOtherGlobalActorUnsafe() // expected-complete-tns-warning {{call to global actor 'OtherGlobalActor'-isolated global function 'onOtherGlobalActorUnsafe()' in a synchronous global actor 'SomeGlobalActor'-isolated context}}
     return i
   }
 
   acceptOnSomeGlobalActor { @SomeGlobalActor () -> Int in
-    let i = onOtherGlobalActorUnsafe() // expected-error{{call to global actor 'OtherGlobalActor'-isolated global function 'onOtherGlobalActorUnsafe()' in a synchronous global actor 'SomeGlobalActor'-isolated context}}
+    let i = onOtherGlobalActorUnsafe() // expected-warning{{call to global actor 'OtherGlobalActor'-isolated global function 'onOtherGlobalActorUnsafe()' in a synchronous global actor 'SomeGlobalActor'-isolated context}}
     return i
   }
 }
@@ -321,7 +327,10 @@ func stripActor(_ expr: @Sendable @autoclosure () -> (() -> ())) async {
   return await stripActor(mainActorFn) // expected-warning {{converting function value of type '@MainActor () -> ()' to '() -> ()' loses global actor 'MainActor'}}
 }
 
-// NOTE: this warning is correct, but is only being caught by TypeCheckConcurrency's extra check.
+// We used to not emit an error here with strict-concurrency enabled since we
+// were inferring the async let to main actor isolated (which was incorrect). We
+// now always treat async let as non-isolated, so we get the same error in all
+// contexts.
 @MainActor func exampleWhereConstraintSolverHasWrongDeclContext_v2() async -> Int {
   async let a: () = noActor(mainActorFn) // expected-warning {{converting function value of type '@MainActor () -> ()' to '() -> ()' loses global actor 'MainActor'}}
   await a

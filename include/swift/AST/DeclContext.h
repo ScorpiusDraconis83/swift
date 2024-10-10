@@ -29,11 +29,11 @@
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/STLExtras.h"
 #include "swift/Basic/SourceLoc.h"
-#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/PointerEmbeddedInt.h"
 #include "llvm/ADT/PointerIntPair.h"
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/Support/raw_ostream.h"
+#include <optional>
 
 #include <type_traits>
 
@@ -79,11 +79,10 @@ namespace swift {
   class Initializer;
   class ClassDecl;
   class SerializedAbstractClosureExpr;
-  class SerializedPatternBindingInitializer;
-  class SerializedDefaultArgumentInitializer;
   class SerializedTopLevelCodeDecl;
   class StructDecl;
   class AccessorDecl;
+  class ClosureExpr;
 
   template <typename T>
   struct AvailableDuringLoweringDeclFilter;
@@ -99,7 +98,8 @@ enum class DeclContextKind : unsigned {
   SubscriptDecl,
   EnumElementDecl,
   AbstractFunctionDecl,
-  SerializedLocal,
+  SerializedAbstractClosure,
+  SerializedTopLevelCodeDecl,
   MacroDecl,
   Last_LocalDeclContextKind = MacroDecl,
   Package,
@@ -108,16 +108,6 @@ enum class DeclContextKind : unsigned {
   GenericTypeDecl,
   ExtensionDecl,
   Last_DeclContextKind = ExtensionDecl
-};
-
-/// Kinds of DeclContexts after deserialization.
-///
-/// \see SerializedLocalDeclContext.
-enum class LocalDeclContextKind : uint8_t {
-  AbstractClosure,
-  PatternBindingInitializer,
-  DefaultArgumentInitializer,
-  TopLevelCodeDecl
 };
 
 /// Describes the kind of a particular conformance.
@@ -162,6 +152,8 @@ enum class ConformanceEntryKind : unsigned {
 
   /// Implied by an explicitly-specified conformance.
   Implied,
+
+  Last_Kind = Implied
 };
 
 /// Describes the kind of conformance lookup desired.
@@ -253,10 +245,11 @@ class alignas(1 << DeclContextAlignInBits) DeclContext
     FileUnit,
     Package,
     Initializer,
-    SerializedLocal,
+    SerializedAbstractClosure,
+    SerializedTopLevelCodeDecl,
     // If you add a new AST hierarchies, then update the static_assert() below.
   };
-  static_assert(unsigned(ASTHierarchy::SerializedLocal) <
+  static_assert(unsigned(ASTHierarchy::SerializedTopLevelCodeDecl) <
                 (1 << DeclContextAlignInBits),
                 "ASTHierarchy exceeds bits available");
 
@@ -285,8 +278,10 @@ class alignas(1 << DeclContextAlignInBits) DeclContext
       return ASTHierarchy::Expr;
     case DeclContextKind::Initializer:
       return ASTHierarchy::Initializer;
-    case DeclContextKind::SerializedLocal:
-      return ASTHierarchy::SerializedLocal;
+    case DeclContextKind::SerializedAbstractClosure:
+      return ASTHierarchy::SerializedAbstractClosure;
+    case DeclContextKind::SerializedTopLevelCodeDecl:
+      return ASTHierarchy::SerializedTopLevelCodeDecl;
     case DeclContextKind::FileUnit:
       return ASTHierarchy::FileUnit;
     case DeclContextKind::Package:
@@ -501,6 +496,16 @@ public:
     return const_cast<DeclContext *>(this)->getTopmostDeclarationDeclContext();
   }
 
+  /// This routine looks through closure, initializer, and local function
+  /// contexts to find the outermost function declaration.
+  ///
+  /// \returns the outermost function, or null if there is no such context.
+  LLVM_READONLY
+  DeclContext *getOutermostFunctionContext();
+  const DeclContext *getOutermostFunctionContext() const {
+    return const_cast<DeclContext *>(this)->getOutermostFunctionContext();
+  }
+
   /// Returns the innermost context that is an AbstractFunctionDecl whose
   /// body has been skipped.
   LLVM_READONLY
@@ -508,6 +513,14 @@ public:
   const DeclContext *getInnermostSkippedFunctionContext() const {
     return
         const_cast<DeclContext *>(this)->getInnermostSkippedFunctionContext();
+  }
+
+  /// Returns the innermost context that is a ClosureExpr, which defines how
+  /// self behaves, unless within a type context that redefines self.
+  LLVM_READONLY
+  ClosureExpr *getInnermostClosureForSelfCapture();
+  const ClosureExpr *getInnermostClosureForSelfCapture() const {
+    return const_cast<DeclContext *>(this)->getInnermostClosureForSelfCapture();
   }
 
   /// Returns the semantic parent of this context.  A context has a
@@ -667,6 +680,9 @@ public:
   /// Looks up a precedence group with a given \p name.
   PrecedenceGroupLookupResult lookupPrecedenceGroup(Identifier name) const;
 
+  /// Returns true if the parent module of \p decl is imported by this context.
+  bool isDeclImported(const Decl *decl) const;
+
   /// Return the ASTContext for a specified DeclContext by
   /// walking up to the enclosing module and returning its ASTContext.
   LLVM_READONLY
@@ -706,31 +722,6 @@ public:
   
   // Some Decls are DeclContexts, but not all. See swift/AST/Decl.h
   static bool classof(const Decl *D);
-};
-
-/// SerializedLocalDeclContext - the base class for DeclContexts that were
-/// serialized to preserve AST structure and accurate mangling after
-/// deserialization.
-class SerializedLocalDeclContext : public DeclContext {
-private:
-  unsigned LocalKind : 3;
-
-protected:
-  unsigned SpareBits : 29;
-
-public:
-  SerializedLocalDeclContext(LocalDeclContextKind LocalKind,
-                             DeclContext *Parent)
-    : DeclContext(DeclContextKind::SerializedLocal, Parent),
-      LocalKind(static_cast<unsigned>(LocalKind)) {}
-
-  LocalDeclContextKind getLocalDeclContextKind() const {
-    return static_cast<LocalDeclContextKind>(LocalKind);
-  }
-
-  static bool classof(const DeclContext *DC) {
-    return DC->getContextKind() == DeclContextKind::SerializedLocal;
-  }
 };
 
 /// An iterator that walks through a list of declarations stored
@@ -980,7 +971,7 @@ public:
 
   /// Return a hash of all tokens in the body for dependency analysis, if
   /// available.
-  llvm::Optional<Fingerprint> getBodyFingerprint() const;
+  std::optional<Fingerprint> getBodyFingerprint() const;
 
 private:
   /// Add a member to the list for iteration purposes, but do not notify the
@@ -1019,6 +1010,20 @@ namespace llvm {
 
     static inline ::swift::DeclContext *doCast(const FromTy &val) {
       return ::swift::DeclContext::castDeclToDeclContext(val);
+    }
+  };
+
+  template<class FromTy>
+  struct CastInfo<::swift::GenericContext, FromTy, std::enable_if_t<is_simple_type<FromTy>::value>>
+      : public CastIsPossible<::swift::GenericContext, FromTy>,
+        public DefaultDoCastIfPossible<::swift::GenericContext *, FromTy,
+                                       CastInfo<::swift::GenericContext, FromTy>> {
+    static inline ::swift::GenericContext *castFailed() { return nullptr; }
+
+    static inline ::swift::GenericContext *doCast(const FromTy &val) {
+      auto *genCtxt = val->getAsGenericContext();
+      assert(genCtxt);
+      return const_cast<::swift::GenericContext *>(genCtxt);
     }
   };
 

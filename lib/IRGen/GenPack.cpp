@@ -16,11 +16,13 @@
 
 #include "GenPack.h"
 #include "GenProto.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/IRGenOptions.h"
 #include "swift/AST/PackConformance.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/IRGen/GenericRequirement.h"
 #include "swift/SIL/SILModule.h"
 #include "swift/SIL/SILType.h"
@@ -323,6 +325,7 @@ static void bindElementSignatureRequirementsAtIndex(
         case GenericRequirement::Kind::Shape:
         case GenericRequirement::Kind::Metadata:
         case GenericRequirement::Kind::WitnessTable:
+        case GenericRequirement::Kind::Value:
           break;
         case GenericRequirement::Kind::MetadataPack: {
           auto ty = requirement.getTypeParameter();
@@ -351,12 +354,10 @@ static void bindElementSignatureRequirementsAtIndex(
                       patternPackArchetype)
                   ->getCanonicalType();
           llvm::Value *_metadata = nullptr;
-          auto packConformance =
-              context.signature->lookupConformance(ty, proto);
+          auto packConformance = ProtocolConformanceRef(proto);
           auto *wtablePack = emitWitnessTableRef(IGF, patternPackArchetype,
                                                  &_metadata, packConformance);
-          auto elementConformance =
-              context.signature->lookupConformance(ty, proto);
+          auto elementConformance = ProtocolConformanceRef(proto);
           auto *wtable = bindWitnessTableAtIndex(
               IGF, elementArchetype, elementConformance, wtablePack, index);
           assert(wtable);
@@ -500,10 +501,10 @@ irgen::emitTypeMetadataPack(IRGenFunction &IGF, CanPackType packType,
   return {pack, shape};
 }
 
-static llvm::Optional<unsigned> countForShape(llvm::Value *shape) {
+static std::optional<unsigned> countForShape(llvm::Value *shape) {
   if (auto *constant = dyn_cast<llvm::ConstantInt>(shape))
     return constant->getValue().getZExtValue();
-  return llvm::None;
+  return std::nullopt;
 }
 
 MetadataResponse
@@ -573,8 +574,7 @@ static llvm::Value *emitPackExpansionElementWitnessTable(
   auto instantiatedPatternTy =
       context.environment->mapContextualPackTypeIntoElementContext(patternTy);
   auto instantiatedConformance =
-      context.environment->getGenericSignature()->lookupConformance(
-          instantiatedPatternTy, conformance.getRequirement());
+      lookupConformance(instantiatedPatternTy, conformance.getRequirement());
 
   // Emit the element witness table.
   auto *wtable = emitWitnessTableRef(IGF, instantiatedPatternTy,
@@ -1041,7 +1041,7 @@ void irgen::bindOpenedElementArchetypesAtIndex(IRGenFunction &IGF,
     openablePackParams.insert(genericParam->getCanonicalType());
   });
 
-  auto subs = environment->getPackElementContextSubstitutions();
+  auto subs = environment->getOuterSubstitutions();
 
   // Find the archetypes and conformances which must be bound.
   llvm::SmallSetVector<CanType, 2> types;
@@ -1081,6 +1081,7 @@ void irgen::bindOpenedElementArchetypesAtIndex(IRGenFunction &IGF,
         case GenericRequirement::Kind::Shape:
         case GenericRequirement::Kind::Metadata:
         case GenericRequirement::Kind::WitnessTable:
+        case GenericRequirement::Kind::Value:
           break;
         }
       });
@@ -1214,9 +1215,8 @@ static unsigned getConstantLabelsLength(CanTupleType type) {
 /// blank space in the static label string. We replace this with the
 /// appropriate number of blank spaces, given the dynamic length of
 /// the pack.
-llvm::Optional<StackAddress>
-irgen::emitDynamicTupleTypeLabels(IRGenFunction &IGF,
-                                  CanTupleType type,
+std::optional<StackAddress>
+irgen::emitDynamicTupleTypeLabels(IRGenFunction &IGF, CanTupleType type,
                                   CanPackType packType,
                                   llvm::Value *shapeExpression) {
   bool hasLabels = false;
@@ -1225,7 +1225,7 @@ irgen::emitDynamicTupleTypeLabels(IRGenFunction &IGF,
   }
 
   if (!hasLabels)
-    return llvm::None;
+    return std::nullopt;
 
   // Elements of pack expansion type are unlabeled, so the length of
   // the label string is the number of elements in the pack, plus the

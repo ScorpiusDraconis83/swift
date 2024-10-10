@@ -19,6 +19,7 @@
 #include "swift/Frontend/SerializedDiagnosticConsumer.h"
 #include "swift/AST/DiagnosticConsumer.h"
 #include "swift/AST/DiagnosticsFrontend.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
@@ -233,7 +234,7 @@ namespace serialized_diagnostics {
 /// Sanitize a filename for the purposes of the serialized diagnostics reader.
 static StringRef sanitizeFilename(
     StringRef filename, SmallString<32> &scratch) {
-  if (!filename.endswith("/") && !filename.endswith("\\"))
+  if (!filename.ends_with("/") && !filename.ends_with("\\"))
     return filename;
 
   scratch = filename;

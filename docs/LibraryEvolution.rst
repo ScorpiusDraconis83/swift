@@ -29,7 +29,7 @@ Library evolution was formally described in `SE-0260 <SE0260_>`_, but this
 document should be kept up to date as new features are added to the language.
 
 .. _library evolution: https://swift.org/blog/abi-stability-and-more/
-.. _SE0260: https://github.com/apple/swift-evolution/blob/main/proposals/0260-library-evolution.md
+.. _SE0260: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0260-library-evolution.md
 
 .. contents:: :local:
 
@@ -108,7 +108,7 @@ with a single app target are not forced to think about access control, anyone
 writing a bundled library should (ideally) not be required to use any of the
 annotations described below in order to achieve full performance.
 
-.. _SE0193: https://github.com/apple/swift-evolution/blob/main/proposals/0193-cross-module-inlining-and-specialization.md
+.. _SE0193: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0193-cross-module-inlining-and-specialization.md
 .. _Swift Package Manager: https://swift.org/package-manager/
 
 .. note::
@@ -218,7 +218,7 @@ any future use of the function must take this into account.
 Although they are not a supported feature for arbitrary libraries at this time,
 public `transparent`_ functions are implicitly marked ``@inlinable``.
 
-.. _transparent: https://github.com/apple/swift/blob/main/docs/TransparentAttr.md
+.. _transparent: https://github.com/swiftlang/swift/blob/main/docs/TransparentAttr.md
 
 
 Restrictions on Inlinable Functions
@@ -543,6 +543,9 @@ This limitation is similar to the limitation for stored properties on structs.
 Adding or removing the ``@objc`` attribute from an enum is not permitted; this
 affects the enum's memory representation and is not backwards-compatible.
 
+Adding or removing ``indirect`` to any of the cases or the enum itself is not
+permitted; this affects the enum's memory representation and is not
+backwards-compatible.
 
 Initializers
 ------------
@@ -586,7 +589,6 @@ Adding or removing ``@frozen`` from an existing enum is forbidden.
 Even for default "non-frozen" enums, adding new cases should not be done
 lightly. Any clients attempting to do an exhaustive switch over all enum cases
 will likely not handle new cases well.
-
 
 Protocols
 ~~~~~~~~~

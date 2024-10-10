@@ -22,6 +22,9 @@
 #include <objc/runtime.h>
 #include <objc/message.h>
 #include <objc/objc.h>
+#if __has_include(<objc/objc-internal.h>)
+#include <objc/objc-internal.h>
+#endif
 #endif
 #include "llvm/ADT/StringRef.h"
 #include "swift/Basic/Lazy.h"
@@ -376,6 +379,11 @@ STANDARD_OBJC_METHOD_IMPLS_FOR_SWIFT_OBJECTS
 }
 
 - (NSUInteger)hash {
+  if (runtime::bincompat::useLegacySwiftObjCHashing()) {
+    // Legacy behavior: Don't proxy to Swift Hashable
+    return (NSUInteger)self;
+  }
+
   auto selfMetadata = _swift_getClassOfAllocated(self);
 
   // If it's Hashable, use that
@@ -423,6 +431,14 @@ STANDARD_OBJC_METHOD_IMPLS_FOR_SWIFT_OBJECTS
   if (self == other) {
     return YES;
   }
+  if (other == nil) {
+    return NO;
+  }
+  if (runtime::bincompat::useLegacySwiftObjCHashing()) {
+    // Legacy behavior: Don't proxy to Swift Hashable or Equatable
+    return NO; // We know the ids are different
+  }
+
 
   // Get Swift type for self and other
   auto selfMetadata = _swift_getClassOfAllocated(self);
@@ -1171,22 +1187,6 @@ swift_dynamicCastObjCClassImpl(const void *object,
   if (object == nullptr)
     return nullptr;
 
-  if ([id_const_cast(object) isKindOfClass:[__SwiftValue class]]) {
-    // Source is a `__SwiftValue` container
-    // Unwrap, then use the most general casting machine to do the heavy lifting
-    auto typeValue = getValueFromSwiftValue(reinterpret_cast<__SwiftValue *>(object));
-    const void *result = nullptr;
-    if (swift_dynamicCast(reinterpret_cast<OpaqueValue *>(&result),
-			  const_cast<OpaqueValue *>(typeValue.second),
-			  typeValue.first,
-			  targetType,
-			  DynamicCastFlags::TakeOnSuccess)) {
-      return result;
-    } else {
-      return nullptr;
-    }
-  }
-
   if ([id_const_cast(object) isKindOfClass:class_const_cast(targetType)]) {
     return object;
   }
@@ -1350,15 +1350,6 @@ id swift_dynamicCastObjCProtocolUnconditional(id object,
                                               Protocol * const *protocols,
                                               const char *filename,
                                               unsigned line, unsigned column) {
-  if (numProtocols == 0) {
-    return object;
-  }
-  if (object_isClass(object)) {
-    // ObjC classes never conform to protocols
-    Class sourceType = object_getClass(object);
-    swift_dynamicCastFailure(sourceType, class_getName(sourceType),
-	                     protocols[0], protocol_getName(protocols[0]));
-  }
   for (size_t i = 0; i < numProtocols; ++i) {
     if (![object conformsToProtocol:protocols[i]]) {
       Class sourceType = object_getClass(object);
@@ -1380,10 +1371,6 @@ id swift_dynamicCastObjCProtocolConditional(id object,
       return nil;
     }
   }
-  if (object_isClass(object)) {
-    // ObjC classes never conform to protocols
-    return nil;
-  }
   for (size_t i = 0; i < numProtocols; ++i) {
     if (![object conformsToProtocol:protocols[i]]) {
       return nil;
@@ -1393,12 +1380,25 @@ id swift_dynamicCastObjCProtocolConditional(id object,
   return object;
 }
 
+// Check whether the current ObjC runtime supports lazy realization. If it does,
+// then we can avoid forcing realization of classes before we use them.
+static bool objcSupportsLazyRealization() {
+#if OBJC_SUPPORTSLAZYREALIZATION_DEFINED
+  return SWIFT_LAZY_CONSTANT(_objc_supportsLazyRealization());
+#else
+  return false;
+#endif
+}
+
 void swift::swift_instantiateObjCClass(const ClassMetadata *_c) {
   static const objc_image_info ImageInfo = {0, 0};
 
-  // Ensure the superclass is realized.
   Class c = class_const_cast(_c);
-  [class_getSuperclass(c) class];
+
+  if (!objcSupportsLazyRealization()) {
+    // Ensure the superclass is realized.
+    [class_getSuperclass(c) class];
+  }
 
   // Register the class.
   Class registered = objc_readClassPair(c, &ImageInfo);
@@ -1408,14 +1408,16 @@ void swift::swift_instantiateObjCClass(const ClassMetadata *_c) {
 }
 
 Class swift::swift_getInitializedObjCClass(Class c) {
-  // Used when we have class metadata and we want to ensure a class has been
-  // initialized by the Objective-C runtime. We need to do this because the
-  // class "c" might be valid metadata, but it hasn't been initialized yet.
-  // Send a message that's likely not to be overridden to minimize potential
-  // side effects. Ignore the return value in case it is overridden to
-  // return something different. See
-  // https://github.com/apple/swift/issues/52863 for an example.
-  [c self];
+  if (!objcSupportsLazyRealization()) {
+    // Used when we have class metadata and we want to ensure a class has been
+    // initialized by the Objective-C runtime. We need to do this because the
+    // class "c" might be valid metadata, but it hasn't been initialized yet.
+    // Send a message that's likely not to be overridden to minimize potential
+    // side effects. Ignore the return value in case it is overridden to
+    // return something different. See
+    // https://github.com/apple/swift/issues/52863 for an example.
+    [c self];
+  }
   return c;
 }
 
@@ -1493,11 +1495,11 @@ bool swift::swift_isUniquelyReferencedNonObjC_nonNull(const void* object) {
 }
 
 #if SWIFT_OBJC_INTEROP
-// It would be nice to weak link instead of doing this, but we can't do that
-// until the new API is in the versions of libobjc that we're linking against.
 static bool isUniquelyReferenced(id object) {
 #if OBJC_ISUNIQUELYREFERENCED_DEFINED
-  return objc_isUniquelyReferenced(object);
+  if (!SWIFT_RUNTIME_WEAK_CHECK(objc_isUniquelyReferenced))
+    return false;
+  return SWIFT_RUNTIME_WEAK_USE(objc_isUniquelyReferenced(object));
 #else
   auto objcIsUniquelyRefd = SWIFT_LAZY_CONSTANT(reinterpret_cast<bool (*)(id)>(
       dlsym(RTLD_NEXT, "objc_isUniquelyReferenced")));
@@ -1775,7 +1777,7 @@ const ClassMetadata *swift::getRootSuperclass() {
 }
 
 #define OVERRIDE_OBJC COMPATIBILITY_OVERRIDE
-#include COMPATIBILITY_OVERRIDE_INCLUDE_PATH
+#include "../CompatibilityOverride/CompatibilityOverrideIncludePath.h"
 
 #define OVERRIDE_FOREIGN COMPATIBILITY_OVERRIDE
-#include COMPATIBILITY_OVERRIDE_INCLUDE_PATH
+#include "../CompatibilityOverride/CompatibilityOverrideIncludePath.h"

@@ -58,7 +58,7 @@ unsigned LocatorPathElt::getNewSummaryFlags() const {
   case ConstraintLocator::UnresolvedMember:
   case ConstraintLocator::ParentType:
   case ConstraintLocator::ExistentialConstraintType:
-  case ConstraintLocator::ProtocolCompositionSuperclassType:
+  case ConstraintLocator::ProtocolCompositionMemberType:
   case ConstraintLocator::LValueConversion:
   case ConstraintLocator::DynamicType:
   case ConstraintLocator::SubscriptMember:
@@ -112,6 +112,7 @@ unsigned LocatorPathElt::getNewSummaryFlags() const {
   case ConstraintLocator::ThrownErrorType:
   case ConstraintLocator::FallbackType:
   case ConstraintLocator::KeyPathSubscriptIndex:
+  case ConstraintLocator::ExistentialMemberAccessConversion:
     return 0;
 
   case ConstraintLocator::FunctionArgument:
@@ -277,9 +278,11 @@ void LocatorPathElt::dump(raw_ostream &out) const {
     out << "existential constraint type";
     break;
 
-  case ConstraintLocator::ProtocolCompositionSuperclassType:
-    out << "protocol composition superclass type";
+  case ConstraintLocator::ProtocolCompositionMemberType: {
+    auto memberElt = elt.castTo<LocatorPathElt::ProtocolCompositionMemberType>();
+    out << "protocol composition member " << llvm::utostr(memberElt.getIndex());
     break;
+  }
 
   case ConstraintLocator::LValueConversion:
     out << "@lvalue-to-inout conversion";
@@ -304,9 +307,7 @@ void LocatorPathElt::dump(raw_ostream &out) const {
     break;
   }
   case ConstraintLocator::ProtocolRequirement: {
-    auto reqElt = elt.castTo<LocatorPathElt::ProtocolRequirement>();
-    out << "protocol requirement ";
-    reqElt.getDecl()->dumpRef(out);
+    out << "protocol requirement";
     break;
   }
   case ConstraintLocator::Witness: {
@@ -534,6 +535,9 @@ void LocatorPathElt::dump(raw_ostream &out) const {
     out << "key path subscript index parameter";
     break;
   }
+  case ConstraintLocator::ExistentialMemberAccessConversion:
+    out << "existential member access conversion";
+    break;
   }
 }
 
@@ -638,6 +642,11 @@ bool ConstraintLocator::isForContextualType() const {
   return isLastElement<LocatorPathElt::ContextualType>();
 }
 
+bool ConstraintLocator::isForContextualType(ContextualTypePurpose ctp) const {
+  auto elt = getLastElementAs<LocatorPathElt::ContextualType>();
+  return elt && elt->getPurpose() == ctp;
+}
+
 bool ConstraintLocator::isForAssignment() const {
   return directlyAt<AssignExpr>();
 }
@@ -711,35 +720,19 @@ bool ConstraintLocator::isForSingleValueStmtConjunctionOrBrace() const {
   return ::isForSingleValueStmtConjunction(getAnchor(), path);
 }
 
-llvm::Optional<SingleValueStmtBranchKind>
-ConstraintLocator::isForSingleValueStmtBranch() const {
+bool ConstraintLocator::isForSingleValueStmtBranch() const {
+  if (!isExpr<SingleValueStmtExpr>(getAnchor()))
+    return false;
+
   // Ignore a trailing ContextualType path element.
   auto path = getPath();
   if (isLastElement<LocatorPathElt::ContextualType>())
     path = path.drop_back();
 
   if (path.empty())
-    return llvm::None;
+    return false;
 
-  auto resultElt = path.back().getAs<LocatorPathElt::SingleValueStmtResult>();
-  if (!resultElt)
-    return llvm::None;
-
-  auto *SVE = getAsExpr<SingleValueStmtExpr>(getAnchor());
-  if (!SVE)
-    return llvm::None;
-
-  // Check to see if we have an explicit result, i.e 'then <expr>'.
-  SmallVector<ThenStmt *, 4> scratch;
-  auto *TS = SVE->getThenStmts(scratch)[resultElt->getIndex()];
-  if (!TS->isImplicit())
-    return SingleValueStmtBranchKind::Explicit;
-
-  if (auto *CE = dyn_cast<ClosureExpr>(SVE->getDeclContext())) {
-    if (CE->hasSingleExpressionBody() && !hasExplicitResult(CE))
-      return SingleValueStmtBranchKind::ImplicitInSingleExprClosure;
-  }
-  return SingleValueStmtBranchKind::Implicit;
+  return path.back().is<LocatorPathElt::SingleValueStmtResult>();
 }
 
 NullablePtr<Pattern> ConstraintLocator::getPatternMatch() const {
@@ -823,7 +816,7 @@ void ConstraintLocatorBuilder::dump(SourceManager *SM, llvm::raw_ostream &out) c
     prev->dump(SM, out);
   }
   if (element) {
-    out << " -> ";
+    out << " → ";
     element->dump(out);
   }
 }

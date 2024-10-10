@@ -191,12 +191,10 @@ extension Unicode.Scalar :
   /// - Parameter forceASCII: Pass `true` if you need the result to use only
   ///   ASCII characters; otherwise, pass `false`.
   /// - Returns: A string representation of the scalar.
-  @_unavailableInEmbedded
   public func escaped(asASCII forceASCII: Bool) -> String {
     _escaped(asASCII: forceASCII) ?? String(self)
   }
 
-  @_unavailableInEmbedded
   internal func _escaped(asASCII forceASCII: Bool) -> String? {
     func lowNibbleAsHex(_ v: UInt32) -> String {
       let nibble = v & 15
@@ -280,7 +278,6 @@ extension Unicode.Scalar :
   }
 }
 
-@_unavailableInEmbedded
 extension Unicode.Scalar: CustomStringConvertible, CustomDebugStringConvertible {
   /// A textual representation of the Unicode scalar.
   @inlinable
@@ -295,7 +292,6 @@ extension Unicode.Scalar: CustomStringConvertible, CustomDebugStringConvertible 
   }
 }
 
-@_unavailableInEmbedded
 extension Unicode.Scalar: LosslessStringConvertible {
   @inlinable
   public init?(_ description: String) {
@@ -539,4 +535,3 @@ extension Unicode.Scalar {
     }
   }
 }
-

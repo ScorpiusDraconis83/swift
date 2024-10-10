@@ -17,6 +17,7 @@
 #include "swift/AST/RawComment.h"
 #include "swift/Basic/BasicSourceInfo.h"
 #include "swift/Basic/Debug.h"
+#include "swift/Basic/Version.h"
 
 #include "llvm/ADT/PointerIntPair.h"
 
@@ -124,20 +125,9 @@ public:
                             const ModuleDecl *importedModule,
                             llvm::SmallSetVector<Identifier, 4> &spiGroups) const {};
 
-  /// Checks whether this file imports \c module as \c @_weakLinked.
-  virtual bool importsModuleAsWeakLinked(const ModuleDecl *module) const {
-    // For source files, this should be overridden to inspect the import
-    // declarations in the file. Other kinds of file units, like serialized
-    // modules, can just use this default implementation since the @_weakLinked
-    // attribute is not transitive. If module C is imported @_weakLinked by
-    // module B, that does not imply that module A imports module C @_weakLinked
-    // if it imports module B.
-    return false;
-  }
-
-  virtual llvm::Optional<Fingerprint>
+  virtual std::optional<Fingerprint>
   loadFingerprint(const IterableDeclContext *IDC) const {
-    return llvm::None;
+    return std::nullopt;
   }
 
 protected:
@@ -164,34 +154,34 @@ public:
   /// This function is an implementation detail for comment serialization.
   /// If you just want to get a comment attached to a decl, use
   /// \c Decl::getRawComment() or \c Decl::getSemanticBriefComment().
-  virtual llvm::Optional<CommentInfo> getCommentForDecl(const Decl *D) const {
-    return llvm::None;
+  virtual std::optional<CommentInfo> getCommentForDecl(const Decl *D) const {
+    return std::nullopt;
   }
 
   /// For a serialized AST file, returns \c true if an adjacent swiftdoc has been
   /// loaded. Otherwise, returns \c false.
   virtual bool hasLoadedSwiftDoc() const { return false; }
 
-  virtual llvm::Optional<StringRef> getGroupNameForDecl(const Decl *D) const {
-    return llvm::None;
+  virtual std::optional<StringRef> getGroupNameForDecl(const Decl *D) const {
+    return std::nullopt;
   }
 
-  virtual llvm::Optional<StringRef>
+  virtual std::optional<StringRef>
   getSourceFileNameForDecl(const Decl *D) const {
-    return llvm::None;
+    return std::nullopt;
   }
 
-  virtual llvm::Optional<unsigned> getSourceOrderForDecl(const Decl *D) const {
-    return llvm::None;
+  virtual std::optional<unsigned> getSourceOrderForDecl(const Decl *D) const {
+    return std::nullopt;
   }
 
-  virtual llvm::Optional<StringRef> getGroupNameByUSR(StringRef USR) const {
-    return llvm::None;
+  virtual std::optional<StringRef> getGroupNameByUSR(StringRef USR) const {
+    return std::nullopt;
   }
 
-  virtual llvm::Optional<ExternalSourceLocs::RawLocs>
+  virtual std::optional<ExternalSourceLocs::RawLocs>
   getExternalRawLocsForDecl(const Decl *D) const {
-    return llvm::None;
+    return std::nullopt;
   }
 
   virtual void collectAllGroups(SmallVectorImpl<StringRef> &Names) const {}
@@ -282,9 +272,13 @@ public:
   getImportedModules(SmallVectorImpl<ImportedModule> &imports,
                      ModuleDecl::ImportFilter filter) const {}
 
-  /// Lists modules that are not imported from this file and used in API.
+  /// Looks up which external macros are defined by this file.
   virtual void
-  getMissingImportedModules(SmallVectorImpl<ImportedModule> &imports) const {}
+  getExternalMacros(SmallVectorImpl<ExternalMacroPlugin> &macros) const {}
+
+  /// Lists modules that are not imported from this file and used in API.
+  virtual void getImplicitImportsForModuleInterface(
+      SmallVectorImpl<ImportedModule> &imports) const {}
 
   /// \see ModuleDecl::getImportedModulesForLookup
   virtual void getImportedModulesForLookup(
@@ -343,6 +337,12 @@ public:
   /// verified.
   virtual StringRef getExportedModuleName() const {
     return getParentModule()->getRealName().str();
+  }
+
+  /// Returns the public facing name of this module, only if it is set
+  /// explicitly.
+  virtual StringRef getPublicModuleName() const {
+    return {};
   }
 
   SWIFT_DEBUG_DUMPER(dumpDisplayDecls());
@@ -417,6 +417,10 @@ protected:
     assert(classof(this) && "invalid kind");
   }
 public:
+  /// Returns the language version that was used to compile the contents of this
+  /// file. An empty `Version` is returned if the information is not available.
+  virtual version::Version getLanguageVersionBuiltWith() const = 0;
+
   /// Returns an arbitrary string representing the storage backing this file.
   ///
   /// This is usually a filesystem path.

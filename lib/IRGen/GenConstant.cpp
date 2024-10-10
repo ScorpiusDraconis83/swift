@@ -27,6 +27,9 @@
 #include "StructLayout.h"
 #include "Callee.h"
 #include "ConstantBuilder.h"
+#include "DebugTypeInfo.h"
+#include "swift/IRGen/Linking.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Range.h"
 #include "swift/SIL/SILModule.h"
 #include "llvm/Support/BLAKE3.h"
@@ -104,10 +107,14 @@ llvm::Constant *irgen::emitConstantFP(IRGenModule &IGM, FloatLiteralInst *FLI) {
 
 llvm::Constant *irgen::emitAddrOfConstantString(IRGenModule &IGM,
                                                 StringLiteralInst *SLI) {
-  switch (SLI->getEncoding()) {
+  auto encoding = SLI->getEncoding();
+  bool useOSLogEncoding = encoding == StringLiteralInst::Encoding::UTF8_OSLOG;
+
+  switch (encoding) {
   case StringLiteralInst::Encoding::Bytes:
   case StringLiteralInst::Encoding::UTF8:
-    return IGM.getAddrOfGlobalString(SLI->getValue());
+  case StringLiteralInst::Encoding::UTF8_OSLOG:
+    return IGM.getAddrOfGlobalString(SLI->getValue(), false, useOSLogEncoding);
 
   case StringLiteralInst::Encoding::ObjCSelector:
     llvm_unreachable("cannot get the address of an Objective-C selector");
@@ -178,7 +185,7 @@ Explosion emitConstantStructOrTuple(IRGenModule &IGM, InstTy inst,
 
   for (unsigned i = 0, e = inst->getElements().size(); i != e; ++i) {
     auto operand = inst->getOperand(i);
-    llvm::Optional<unsigned> index = nextIndex(IGM, type, i);
+    std::optional<unsigned> index = nextIndex(IGM, type, i);
     if (index.has_value()) {
       unsigned idx = index.value();
       assert(elements[idx].empty() &&
@@ -349,6 +356,12 @@ Explosion irgen::emitConstantValue(IRGenModule &IGM, SILValue operand,
   } else if (auto *CFI = dyn_cast<ConvertFunctionInst>(operand)) {
     return emitConstantValue(IGM, CFI->getOperand(), flatten);
 
+  } else if (auto *URCI = dyn_cast<UncheckedRefCastInst>(operand)) {
+    return emitConstantValue(IGM, URCI->getOperand(), flatten);
+
+  } else if (auto *UCI = dyn_cast<UpcastInst>(operand)) {
+    return emitConstantValue(IGM, UCI->getOperand(), flatten);
+
   } else if (auto *T2TFI = dyn_cast<ThinToThickFunctionInst>(operand)) {
     SILType type = operand->getType();
     auto *sTy = cast<llvm::StructType>(IGM.getTypeInfo(type).getStorageType());
@@ -372,9 +385,13 @@ Explosion irgen::emitConstantValue(IRGenModule &IGM, SILValue operand,
     SILFunction *fn = FRI->getReferencedFunction();
 
     llvm::Constant *fnPtr = IGM.getAddrOfSILFunction(fn, NotForDefinition);
-    assert(!fn->isAsync() && "TODO: support async functions");
-
     CanSILFunctionType fnType = FRI->getType().getAs<SILFunctionType>();
+
+    if (irgen::classifyFunctionPointerKind(fn).isAsyncFunctionPointer()) {
+      llvm::Constant *asyncFnPtr = IGM.getAddrOfAsyncFunctionPointer(fn);
+      fnPtr = llvm::ConstantExpr::getBitCast(asyncFnPtr, fnPtr->getType());
+    }
+
     auto authInfo = PointerAuthInfo::forFunctionPointer(IGM, fnType);
     if (authInfo.isSigned()) {
       auto constantDiscriminator =
@@ -395,6 +412,14 @@ Explosion irgen::emitConstantValue(IRGenModule &IGM, SILValue operand,
       return llvm::ConstantPointerNull::get(IGM.OpaquePtrTy);
     }
 
+    Address addr = IGM.getAddrOfSILGlobalVariable(var, ti, NotForDefinition);
+    return addr.getAddress();
+  } else if (auto *gVal = dyn_cast<GlobalValueInst>(operand)) {
+    assert(IGM.canMakeStaticObjectReadOnly(gVal->getType()));
+    SILGlobalVariable *var = gVal->getReferencedGlobal();
+    auto &ti = IGM.getTypeInfo(var->getLoweredType());
+    auto expansion = IGM.getResilienceExpansionForLayout(var);
+    assert(ti.isFixedSize(expansion));
     Address addr = IGM.getAddrOfSILGlobalVariable(var, ti, NotForDefinition);
     return addr.getAddress();
   } else if (auto *atp = dyn_cast<AddressToPointerInst>(operand)) {
@@ -430,23 +455,39 @@ llvm::Constant *irgen::emitConstantObject(IRGenModule &IGM, ObjectInst *OI,
   // Construct the object header.
   llvm::StructType *ObjectHeaderTy = cast<llvm::StructType>(sTy->getElementType(0));
 
-  if (IGM.canMakeStaticObjectsReadOnly()) {
+  if (IGM.canMakeStaticObjectReadOnly(OI->getType())) {
     if (!IGM.swiftImmortalRefCount) {
-      auto *var = new llvm::GlobalVariable(IGM.Module, IGM.Int8Ty,
-                                        /*constant*/ true, llvm::GlobalValue::ExternalLinkage,
-                                        /*initializer*/ nullptr, "_swiftImmortalRefCount");
-      IGM.swiftImmortalRefCount = var;
+      if (IGM.Context.LangOpts.hasFeature(Feature::Embedded)) {
+        // = HeapObject.immortalRefCount
+        IGM.swiftImmortalRefCount = llvm::ConstantInt::get(IGM.IntPtrTy, -1);
+      } else {
+        IGM.swiftImmortalRefCount = llvm::ConstantExpr::getPtrToInt(
+            new llvm::GlobalVariable(IGM.Module, IGM.Int8Ty,
+              /*constant*/ true, llvm::GlobalValue::ExternalLinkage,
+              /*initializer*/ nullptr, "_swiftImmortalRefCount"),
+            IGM.IntPtrTy);
+      }
     }
     if (!IGM.swiftStaticArrayMetadata) {
-      // type metadata for class __StaticArrayStorage
-      auto *var = new llvm::GlobalVariable(IGM.Module, IGM.TypeMetadataStructTy,
-                                        /*constant*/ true, llvm::GlobalValue::ExternalLinkage,
-                                        /*initializer*/ nullptr, "$ss20__StaticArrayStorageCN");
-      IGM.swiftStaticArrayMetadata = var;
+      auto *classDecl = IGM.getStaticArrayStorageDecl();
+      assert(classDecl && "no __StaticArrayStorage in stdlib");
+      CanType classTy = CanType(ClassType::get(classDecl, Type(), IGM.Context));
+      if (IGM.Context.LangOpts.hasFeature(Feature::Embedded)) {
+        LinkEntity entity = LinkEntity::forTypeMetadata(classTy, TypeMetadataAddress::AddressPoint,
+                                                        /*forceShared=*/ true);
+        // In embedded swift, the metadata for the array buffer class only needs to be very minimal:
+        // No vtable needed, because the object is never destructed. It only contains the null super-
+        // class pointer.
+        llvm::Constant *superClass = llvm::ConstantPointerNull::get(IGM.Int8PtrTy);
+        IGM.swiftStaticArrayMetadata = IGM.getAddrOfLLVMVariable(entity, superClass, DebugTypeInfo());
+      } else {
+        LinkEntity entity = LinkEntity::forTypeMetadata(classTy, TypeMetadataAddress::AddressPoint);
+        IGM.swiftStaticArrayMetadata = IGM.getAddrOfLLVMVariable(entity, NotForDefinition, DebugTypeInfo());
+      }
     }
     elements[0].add(llvm::ConstantStruct::get(ObjectHeaderTy, {
       IGM.swiftStaticArrayMetadata,
-      llvm::ConstantExpr::getPtrToInt(IGM.swiftImmortalRefCount, IGM.IntPtrTy)}));
+      IGM.swiftImmortalRefCount }));
   } else {
     elements[0].add(llvm::Constant::getNullValue(ObjectHeaderTy));
   }
@@ -458,6 +499,6 @@ void ConstantAggregateBuilderBase::addUniqueHash(StringRef data) {
   llvm::BLAKE3 hasher;
   hasher.update(data);
   auto rawHash = hasher.final();
-  auto truncHash = llvm::makeArrayRef(rawHash).slice(0, NumBytes_UniqueHash);
+  auto truncHash = llvm::ArrayRef(rawHash).slice(0, NumBytes_UniqueHash);
   add(llvm::ConstantDataArray::get(IGM().getLLVMContext(), truncHash));
 }

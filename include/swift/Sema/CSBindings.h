@@ -223,6 +223,9 @@ struct PotentialBindings {
 
   TypeVariableType *TypeVar;
 
+  /// The set of all constraints that have been added via infer().
+  llvm::SmallPtrSet<Constraint *, 2> Constraints;
+
   /// The set of potential bindings.
   llvm::SmallVector<PotentialBinding, 4> Bindings;
 
@@ -288,7 +291,7 @@ private:
   /// Attempt to infer a new binding and other useful information
   /// (i.e. whether bindings should be delayed) from the given
   /// relational constraint.
-  llvm::Optional<PotentialBinding> inferFromRelational(Constraint *constraint);
+  std::optional<PotentialBinding> inferFromRelational(Constraint *constraint);
 
 public:
   void infer(Constraint *constraint);
@@ -383,7 +386,7 @@ public:
 
   /// The set of transitive protocol requirements inferred through
   /// subtype/conversion/equivalence relations with other type variables.
-  llvm::Optional<llvm::SmallPtrSet<Constraint *, 4>> TransitiveProtocols;
+  std::optional<llvm::SmallPtrSet<Constraint *, 4>> TransitiveProtocols;
 
   BindingSet(const PotentialBindings &info)
       : CS(info.CS), TypeVar(info.TypeVar), Info(info) {
@@ -576,7 +579,10 @@ public:
 
   /// Finalize binding computation for this type variable by
   /// inferring bindings from context e.g. transitive bindings.
-  void finalize(
+  ///
+  /// \returns true if finalization successful (which makes binding set viable),
+  /// and false otherwise.
+  bool finalize(
       llvm::SmallDenseMap<TypeVariableType *, BindingSet> &inferredBindings);
 
   static BindingScore formBindingScore(const BindingSet &b);

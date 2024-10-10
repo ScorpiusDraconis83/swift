@@ -24,6 +24,7 @@
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Parse/Lexer.h"
 
 using namespace swift;
@@ -190,58 +191,6 @@ TypeChecker::lookupPrecedenceGroupForInfixOperator(DeclContext *DC, Expr *E,
   return nullptr;
 }
 
-/// Find LHS as if we append binary operator to existing pre-folded expression.
-/// Returns found expression, or \c nullptr if the operator is not applicable.
-///
-/// For example, given '(== R (* A B))':
-/// 'findLHS(DC, expr, "+")' returns '(* A B)'.
-/// 'findLHS(DC, expr, "<<")' returns 'B'.
-/// 'findLHS(DC, expr, '==')' returns nullptr.
-Expr *TypeChecker::findLHS(DeclContext *DC, Expr *E, Identifier name) {
-  auto right = lookupPrecedenceGroupForOperator(DC, name, E->getEndLoc());
-  if (!right)
-    return nullptr;
-
-  while (true) {
-
-    // Look through implicit conversions.
-    if (auto ICE = dyn_cast<ImplicitConversionExpr>(E)) {
-      E = ICE->getSyntacticSubExpr();
-      continue;
-    }
-    if (auto ACE = dyn_cast<AutoClosureExpr>(E)) {
-      E = ACE->getSingleExpressionBody();
-      continue;
-    }
-
-    auto left = lookupPrecedenceGroupForInfixOperator(DC, E, /*diagnose=*/true);
-    if (!left)
-      // LHS is not binary expression.
-      return E;
-    switch (DC->getASTContext().associateInfixOperators(left, right)) {
-      case swift::Associativity::None:
-        return nullptr;
-      case swift::Associativity::Left:
-        return E;
-      case swift::Associativity::Right:
-        break;
-    }
-    // Find the RHS of the current binary expr.
-    if (auto *assignExpr = dyn_cast<AssignExpr>(E)) {
-      E = assignExpr->getSrc();
-    } else if (auto *ternary = dyn_cast<TernaryExpr>(E)) {
-      E = ternary->getElseExpr();
-    } else if (auto *binaryExpr = dyn_cast<BinaryExpr>(E)) {
-      E = binaryExpr->getRHS();
-    } else {
-      // E.g. 'fn() as Int << 2'.
-      // In this case '<<' has higher precedence than 'as', but the LHS should
-      // be 'fn() as Int' instead of 'Int'.
-      return E;
-    }
-  }
-}
-
 // The way we compute isEndOfSequence relies on the assumption that
 // the sequence-folding algorithm never recurses with a prefix of the
 // entire sequence.
@@ -341,9 +290,9 @@ static Expr *makeBinOp(ASTContext &Ctx, Expr *Op, Expr *LHS, Expr *RHS,
   if (auto *ternary = dyn_cast<TernaryExpr>(Op)) {
     // Resolve the ternary expression.
     if (!Ctx.CompletionCallback) {
-      // In code completion we might call preCheckExpression twice - once for
+      // In code completion we might call preCheckTarget twice - once for
       // the first pass and once for the second pass. This is fine since
-      // preCheckExpression idempotent.
+      // preCheckTarget is idempotent.
       assert(!ternary->isFolded() && "already folded if expr in sequence?!");
     }
     ternary->setCondExpr(LHS);
@@ -354,9 +303,9 @@ static Expr *makeBinOp(ASTContext &Ctx, Expr *Op, Expr *LHS, Expr *RHS,
   if (auto *assign = dyn_cast<AssignExpr>(Op)) {
     // Resolve the assignment expression.
     if (!Ctx.CompletionCallback) {
-      // In code completion we might call preCheckExpression twice - once for
+      // In code completion we might call preCheckTarget twice - once for
       // the first pass and once for the second pass. This is fine since
-      // preCheckExpression idempotent.
+      // preCheckTarget is idempotent.
       assert(!assign->isFolded() && "already folded assign expr in sequence?!");
     }
     assign->setDest(LHS);
@@ -367,9 +316,9 @@ static Expr *makeBinOp(ASTContext &Ctx, Expr *Op, Expr *LHS, Expr *RHS,
   if (auto *as = dyn_cast<ExplicitCastExpr>(Op)) {
     // Resolve the 'as' or 'is' expression.
     if (!Ctx.CompletionCallback) {
-      // In code completion we might call preCheckExpression twice - once for
+      // In code completion we might call preCheckTarget twice - once for
       // the first pass and once for the second pass. This is fine since
-      // preCheckExpression idempotent.
+      // preCheckTarget is idempotent.
       assert(!as->isFolded() && "already folded 'as' expr in sequence?!");
     }
     assert(RHS == as && "'as' with non-type RHS?!");
@@ -380,9 +329,9 @@ static Expr *makeBinOp(ASTContext &Ctx, Expr *Op, Expr *LHS, Expr *RHS,
   if (auto *arrow = dyn_cast<ArrowExpr>(Op)) {
     // Resolve the '->' expression.
     if (!Ctx.CompletionCallback) {
-      // In code completion we might call preCheckExpression twice - once for
+      // In code completion we might call preCheckTarget twice - once for
       // the first pass and once for the second pass. This is fine since
-      // preCheckExpression idempotent.
+      // preCheckTarget is idempotent.
       assert(!arrow->isFolded() && "already folded '->' expr in sequence?!");
     }
     arrow->setArgsExpr(LHS);
@@ -469,12 +418,8 @@ static Expr *foldSequence(DeclContext *DC,
     }
     
     // Pull out the next binary operator.
-    Op op2{S[0], TypeChecker::lookupPrecedenceGroupForInfixOperator(
-                     DC, S[0], /*diagnose=*/true)};
-
-    // If the second operator's precedence is lower than the
-    // precedence bound, break out of the loop.
-    if (!precedenceBound.shouldConsider(op2.precedence)) break;
+    Op op2 = getNextOperator();
+    if (!op2) break;
 
     // If we're missing precedence info for either operator, treat them
     // as non-associative.
@@ -581,17 +526,6 @@ bool TypeChecker::requireArrayLiteralIntrinsics(ASTContext &ctx,
   return true;
 }
 
-Expr *TypeChecker::buildCheckedRefExpr(VarDecl *value, DeclContext *UseDC,
-                                       DeclNameLoc loc, bool Implicit) {
-  auto type = constraints::ConstraintSystem::getUnopenedTypeOfReference(
-      value, Type(), UseDC,
-      [&](VarDecl *var) -> Type { return value->getTypeInContext(); });
-  auto semantics = value->getAccessSemanticsFromContext(UseDC,
-                                                       /*isAccessOnSelf*/false);
-  return new (value->getASTContext())
-      DeclRefExpr(value, loc, Implicit, semantics, type);
-}
-
 Expr *TypeChecker::buildRefExpr(ArrayRef<ValueDecl *> Decls,
                                 DeclContext *UseDC, DeclNameLoc NameLoc,
                                 bool Implicit, FunctionRefKind functionRefKind) {
@@ -632,26 +566,27 @@ static Type lookupDefaultLiteralType(const DeclContext *dc,
   return cast<TypeAliasDecl>(TD)->getDeclaredInterfaceType();
 }
 
-static llvm::Optional<KnownProtocolKind>
-getKnownProtocolKindIfAny(const ProtocolDecl *protocol) {
-#define EXPRESSIBLE_BY_LITERAL_PROTOCOL_WITH_NAME(Id, _, __, ___)              \
-  if (protocol == TypeChecker::getProtocol(protocol->getASTContext(),          \
-                                           SourceLoc(),                        \
-                                           KnownProtocolKind::Id))             \
-    return KnownProtocolKind::Id;
+Type TypeChecker::getDefaultType(ProtocolDecl *protocol, DeclContext *dc) {
+  auto knownKind = protocol->getKnownProtocolKind();
+  if (!knownKind)
+    return Type();
+
+  switch (knownKind.value()) {
+#define EXPRESSIBLE_BY_LITERAL_PROTOCOL_WITH_NAME(Id, _, __, ___) \
+  case KnownProtocolKind::Id: \
+    break;
+#define PROTOCOL_WITH_NAME(Id, _) \
+  case KnownProtocolKind::Id: \
+    return Type();
+
 #include "swift/AST/KnownProtocols.def"
 #undef EXPRESSIBLE_BY_LITERAL_PROTOCOL_WITH_NAME
-
-  return llvm::None;
-}
-
-Type TypeChecker::getDefaultType(ProtocolDecl *protocol, DeclContext *dc) {
-  if (auto knownProtocolKindIfAny = getKnownProtocolKindIfAny(protocol)) {
-    return evaluateOrDefault(
-        protocol->getASTContext().evaluator,
-        DefaultTypeRequest{knownProtocolKindIfAny.value(), dc}, nullptr);
+#undef PROTOCOL_WITH_NAME
   }
-  return Type();
+
+  return evaluateOrDefault(
+      protocol->getASTContext().evaluator,
+      DefaultTypeRequest{knownKind.value(), dc}, nullptr);
 }
 
 static std::pair<const char *, bool> lookupDefaultTypeInfoForKnownProtocol(
@@ -696,6 +631,15 @@ swift::DefaultTypeRequest::evaluate(Evaluator &evaluator,
 }
 
 Expr *TypeChecker::foldSequence(SequenceExpr *expr, DeclContext *dc) {
+  // First resolve any unresolved decl references in operator positions.
+  for (auto i : indices(expr->getElements())) {
+    if (i % 2 == 0)
+      continue;
+    auto *elt = expr->getElement(i);
+    if (auto *UDRE = dyn_cast<UnresolvedDeclRefExpr>(elt))
+      elt = TypeChecker::resolveDeclRefExpr(UDRE, dc);
+    expr->setElement(i, elt);
+  }
   ArrayRef<Expr*> Elts = expr->getElements();
   assert(Elts.size() > 1 && "inadequate number of elements in sequence");
   assert((Elts.size() & 1) == 1 && "even number of elements in sequence");
@@ -709,8 +653,59 @@ Expr *TypeChecker::foldSequence(SequenceExpr *expr, DeclContext *dc) {
   return Result;
 }
 
+static SourceFile *createDefaultArgumentSourceFile(StringRef macroExpression,
+                                                   SourceLoc insertionPoint,
+                                                   ASTNode target,
+                                                   DeclContext *dc) {
+  ASTContext &ctx = dc->getASTContext();
+  SourceManager &sourceMgr = ctx.SourceMgr;
+
+  llvm::SmallString<256> builder;
+  unsigned line, column;
+  std::tie(line, column) = sourceMgr.getLineAndColumnInBuffer(insertionPoint);
+  auto file = dc->getParentSourceFile()->getFilename();
+
+  // find a way to pass the file:line:column to macro expansion
+  // so that we can share same buffer for the same default argument
+  builder.append(line - 1, '\n');
+  builder.append(column - 1, ' ');
+  builder.append(macroExpression);
+
+  std::unique_ptr<llvm::MemoryBuffer> buffer;
+  buffer = llvm::MemoryBuffer::getMemBufferCopy(builder.str(), file);
+
+  // Dump default argument to standard output, if requested.
+  if (ctx.LangOpts.DumpMacroExpansions) {
+    llvm::errs() << buffer->getBufferIdentifier()
+                 << "\n------------------------------\n"
+                 << buffer->getBuffer()
+                 << "\n------------------------------\n";
+  }
+
+  // Create a new source buffer with the contents of the default argument
+  unsigned macroBufferID = sourceMgr.addNewSourceBuffer(std::move(buffer));
+  auto macroBufferRange = sourceMgr.getRangeForBuffer(macroBufferID);
+  GeneratedSourceInfo sourceInfo{GeneratedSourceInfo::DefaultArgument,
+                                 {insertionPoint, 0},
+                                 macroBufferRange,
+                                 target.getOpaqueValue(),
+                                 dc,
+                                 nullptr};
+  sourceMgr.setGeneratedSourceInfo(macroBufferID, sourceInfo);
+
+  // Create a source file to hold the macro buffer. This is automatically
+  // registered with the enclosing module.
+  auto sourceFile = new (ctx) SourceFile(
+      *dc->getParentModule(), SourceFileKind::DefaultArgument, macroBufferID,
+      /*parsingOpts=*/{}, /*isPrimary=*/false);
+  sourceFile->setImports(dc->getParentSourceFile()->getImports());
+  return sourceFile;
+}
+
 static Expr *synthesizeCallerSideDefault(const ParamDecl *param,
-                                         SourceLoc loc) {
+                                         DefaultArgumentExpr *defaultExpr,
+                                         DeclContext *dc) {
+  SourceLoc loc = defaultExpr->getLoc();
   auto &ctx = param->getASTContext();
   switch (param->getDefaultArgumentKind()) {
 #define MAGIC_IDENTIFIER(NAME, STRING, SYNTAX_KIND) \
@@ -719,6 +714,25 @@ static Expr *synthesizeCallerSideDefault(const ParamDecl *param,
         MagicIdentifierLiteralExpr(MagicIdentifierLiteralExpr::NAME, loc, \
                                    /*implicit=*/true);
 #include "swift/AST/MagicIdentifierKinds.def"
+
+  case DefaultArgumentKind::ExpressionMacro: {
+    // FIXME: ApolloZhu serialize and deserialize expressions instead
+    SmallString<128> scratch;
+    const StringRef text = param->getDefaultValueStringRepresentation(scratch);
+    SourceFile *defaultArgSourceFile =
+        createDefaultArgumentSourceFile(text, loc, defaultExpr, dc);
+    auto topLevelItems = defaultArgSourceFile->getTopLevelItems();
+    for (auto item : topLevelItems) {
+      if (auto *expr = item.dyn_cast<Expr *>())
+        if (auto *callerSideMacroExpansionExpr =
+                dyn_cast<MacroExpansionExpr>(expr)) {
+          callerSideMacroExpansionExpr->setImplicit();
+          return callerSideMacroExpansionExpr;
+        }
+    }
+    llvm_unreachable("default argument source file missing caller side macro "
+                     "expansion expression");
+  }
 
   case DefaultArgumentKind::NilLiteral:
     return new (ctx) NilLiteralExpr(loc, /*Implicit=*/true);
@@ -749,15 +763,15 @@ Expr *CallerSideDefaultArgExprRequest::evaluate(
   auto paramTy = defaultExpr->getType();
 
   // Re-create the default argument using the location info of the call site.
-  auto *initExpr =
-      synthesizeCallerSideDefault(param, defaultExpr->getLoc());
   auto *dc = defaultExpr->ContextOrCallerSideExpr.get<DeclContext *>();
+  auto *initExpr = synthesizeCallerSideDefault(param, defaultExpr, dc);
   assert(dc && "Expected a DeclContext before type-checking caller-side arg");
 
   auto &ctx = param->getASTContext();
   DiagnosticTransaction transaction(ctx.Diags);
   if (!TypeChecker::typeCheckParameterDefault(initExpr, dc, paramTy,
-                                              param->isAutoClosure())) {
+                                              param->isAutoClosure(),
+                                              /*atCallerSide=*/true)) {
     if (param->hasDefaultExpr()) {
       // HACK: If we were unable to type-check the default argument in context,
       // then retry by type-checking it within the parameter decl, which should
@@ -769,11 +783,15 @@ Expr *CallerSideDefaultArgExprRequest::evaluate(
     }
     return new (ctx) ErrorExpr(initExpr->getSourceRange(), paramTy);
   }
+  if (param->getDefaultArgumentKind() == DefaultArgumentKind::ExpressionMacro) {
+    TypeChecker::contextualizeCallSideDefaultArgument(dc, initExpr);
+    TypeChecker::checkCallerSideDefaultArgumentEffects(dc, initExpr);
+  }
   return initExpr;
 }
 
-bool ClosureHasExplicitResultRequest::evaluate(Evaluator &evaluator,
-                                               ClosureExpr *closure) const {
+bool ClosureHasResultExprRequest::evaluate(Evaluator &evaluator,
+                                           ClosureExpr *closure) const {
   // A walker that looks for 'return' statements that aren't
   // nested within closures or nested declarations.
   class FindReturns : public ASTWalker {
@@ -785,19 +803,16 @@ bool ClosureHasExplicitResultRequest::evaluate(Evaluator &evaluator,
     }
 
     PreWalkResult<Expr *> walkToExprPre(Expr *expr) override {
-      return Action::SkipChildren(expr);
+      return Action::SkipNode(expr);
     }
 
     PreWalkAction walkToDeclPre(Decl *decl) override {
-      return Action::SkipChildren();
+      return Action::SkipNode();
     }
 
     PreWalkResult<Stmt *> walkToStmtPre(Stmt *stmt) override {
       // Record return statements.
       if (auto ret = dyn_cast<ReturnStmt>(stmt)) {
-        if (ret->isImplicit())
-          return Action::Continue(stmt);
-
         // If it has a result, remember that we saw one, but keep
         // traversing in case there's a no-result return somewhere.
         if (ret->hasResult()) {

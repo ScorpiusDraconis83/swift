@@ -18,6 +18,7 @@
 #ifndef SWIFT_BASIC_LANGOPTIONS_H
 #define SWIFT_BASIC_LANGOPTIONS_H
 
+#include "swift/Basic/CXXStdlibKind.h"
 #include "swift/Basic/Feature.h"
 #include "swift/Basic/FixedBitSet.h"
 #include "swift/Basic/FunctionBodySkipping.h"
@@ -28,40 +29,28 @@
 #include "clang/CAS/CASOptions.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/Hashing.h"
-#include "llvm/ADT/None.h"
-#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
-#include "llvm/TargetParser/Triple.h"
+#include "llvm/Option/ArgList.h"
 #include "llvm/Support/Regex.h"
 #include "llvm/Support/VersionTuple.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/TargetParser/Triple.h"
 #include <atomic>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace swift {
 
-  enum class DiagnosticBehavior : uint8_t;
+  struct DiagnosticBehavior;
+  class DiagnosticEngine;
 
   /// Kind of implicit platform conditions.
   enum class PlatformConditionKind {
-#define PLATFORM_CONDITION(LABEL, IDENTIFIER) LABEL,
-#include "swift/AST/PlatformConditionKinds.def"
-  };
-
-  /// Describes which Swift 3 Objective-C inference warnings should be
-  /// emitted.
-  enum class Swift3ObjCInferenceWarnings {
-    /// No warnings; this is the default.
-    None,
-    /// "Minimal" warnings driven by uses of declarations that make use of
-    /// the Objective-C entry point directly.
-    Minimal,
-    /// "Complete" warnings that add "@objc" for every entry point that
-    /// Swift 3 would have inferred as "@objc" but Swift 4 will not.
-    Complete,
+  #define PLATFORM_CONDITION(LABEL, IDENTIFIER) LABEL,
+  #include "swift/AST/PlatformConditionKinds.def"
   };
 
   /// Describes how strict concurrency checking should be.
@@ -149,7 +138,7 @@ namespace swift {
     /// a zippered binary that can be loaded into both macCatalyst and
     /// macOS processes. A value of 'None' means no zippering will be
     /// performed.
-    llvm::Optional<llvm::Triple> TargetVariant;
+    std::optional<llvm::Triple> TargetVariant;
 
     /// The target triple to instantiate the internal clang instance.
     /// When not specified, the compiler will use the value of -target to
@@ -159,13 +148,13 @@ namespace swift {
     /// the loading module.
     /// The lowering triple may result in multiple versions of the same Clang
     /// modules being built.
-    llvm::Optional<llvm::Triple> ClangTarget;
+    std::optional<llvm::Triple> ClangTarget;
 
     /// The SDK version, if known.
-    llvm::Optional<llvm::VersionTuple> SDKVersion;
+    std::optional<llvm::VersionTuple> SDKVersion;
 
     /// The target variant SDK version, if known.
-    llvm::Optional<llvm::VersionTuple> VariantSDKVersion;
+    std::optional<llvm::VersionTuple> VariantSDKVersion;
 
     /// The SDK canonical name, if known.
     std::string SDKName;
@@ -185,7 +174,10 @@ namespace swift {
     ///
 
     /// User-overridable language version to compile for.
-    version::Version EffectiveLanguageVersion = version::Version::getCurrentLanguageVersion();
+    version::Version EffectiveLanguageVersion = version::Version{5, 10};
+
+    /// Swift runtime version to compile for.
+    version::Version RuntimeVersion = version::Version::getCurrentLanguageVersion();
 
     /// PackageDescription version to compile for.
     version::Version PackageDescriptionVersion;
@@ -197,15 +189,11 @@ namespace swift {
     bool DisableAvailabilityChecking = false;
 
     /// Optimization mode for unavailable declarations.
-    UnavailableDeclOptimization UnavailableDeclOptimizationMode =
-        UnavailableDeclOptimization::None;
+    std::optional<UnavailableDeclOptimization> UnavailableDeclOptimizationMode;
 
     /// Causes the compiler to use weak linkage for symbols belonging to
     /// declarations introduced at the deployment target.
     bool WeakLinkAtTarget = false;
-
-    /// Should conformance availability violations be diagnosed as errors?
-    bool EnableConformanceAvailabilityErrors = false;
 
     /// Should the editor placeholder error be downgraded to a warning?
     bool WarnOnEditorPlaceholder = false;
@@ -229,7 +217,14 @@ namespace swift {
 
     /// Diagnostic level to report when a public declarations doesn't declare
     /// an introduction OS version.
-    llvm::Optional<DiagnosticBehavior> RequireExplicitAvailability = llvm::None;
+    enum class RequireExplicitAvailabilityDiagnosticBehavior : uint8_t {
+      Ignore,
+      Warning,
+      Error,
+    };
+    RequireExplicitAvailabilityDiagnosticBehavior
+        RequireExplicitAvailabilityBehavior =
+            RequireExplicitAvailabilityDiagnosticBehavior::Ignore;
 
     /// Introduction platform and version to suggest as fix-it
     /// when using RequireExplicitAvailability.
@@ -254,6 +249,9 @@ namespace swift {
     /// Emit remarks about contextual inconsistencies in loaded modules.
     bool EnableModuleRecoveryRemarks = false;
 
+    /// Emit remarks for unexpected conditions when serializing a module.
+    bool EnableModuleSerializationRemarks = false;
+
     /// Emit remarks about the source of each element exposed by the module API.
     bool EnableModuleApiImportRemarks = false;
 
@@ -272,6 +270,10 @@ namespace swift {
 
     /// Enable features useful for running in the debugger.
     bool DebuggerSupport = false;
+
+    /// Used only by the debugger. When set, the module loader will try to
+    /// import non-public transitive dependencies.
+    bool ImportNonPublicDependencies = false;
 
     /// Enable the MemoryBufferSerializedModuleImporter.
     /// Only used by lldb-moduleimport-test.
@@ -327,6 +329,19 @@ namespace swift {
     /// to the Swift language version.
     version::Version cxxInteropCompatVersion;
 
+    void setCxxInteropFromArgs(llvm::opt::ArgList &Args,
+                               swift::DiagnosticEngine &Diags);
+
+    /// The C++ standard library used for the current build. This can differ
+    /// from the default C++ stdlib on a particular platform when `-Xcc
+    /// -stdlib=xyz` was passed to the compiler.
+    CXXStdlibKind CXXStdlib = CXXStdlibKind::Unknown;
+    CXXStdlibKind PlatformDefaultCXXStdlib = CXXStdlibKind::Unknown;
+
+    bool isUsingPlatformDefaultCXXStdlib() const {
+      return CXXStdlib == PlatformDefaultCXXStdlib;
+    }
+
     bool CForeignReferenceTypes = false;
 
     /// Imports getters and setters as computed properties.
@@ -335,6 +350,9 @@ namespace swift {
     /// Should the compiler require C++ interoperability to be enabled
     /// when importing Swift modules that enable C++ interoperability.
     bool RequireCxxInteropToImportCxxInteropModule = true;
+
+    // Workaround for bug when building SwiftCompilerSources (rdar://128013193)
+    bool CxxInteropUseOpaquePointerForMoveOnly = false;
 
     /// On Darwin platforms, use the pre-stable ABI's mark bit for Swift
     /// classes instead of the stable ABI's bit. This is needed when
@@ -388,6 +406,11 @@ namespace swift {
     /// Enable experimental eager Clang module diagnostics.
     bool EnableExperimentalEagerClangModuleDiagnostics = false;
 
+    /// Force ClangImporter's import-as-member extensions to load thier members
+    /// immediately, bypassing their SwiftLookupTables. This emulates an
+    /// implementation quirk of previous compilers.
+    bool DisableNamedLazyImportAsMemberLoading = false;
+
     /// Enable inference of Sendable conformances for public types.
     bool EnableInferPublicSendable = false;
 
@@ -401,6 +424,9 @@ namespace swift {
     /// Disable the implicit import of the _Backtracing module.
     bool DisableImplicitBacktracingModuleImport =
         !SWIFT_IMPLICIT_BACKTRACING_IMPORT;
+
+    /// Disable the implicit import of the Cxx module.
+    bool DisableImplicitCxxModuleImport = false;
 
     // Whether to use checked continuations when making an async call from
     // Swift into ObjC. If false, will use unchecked continuations instead.
@@ -432,25 +458,11 @@ namespace swift {
     /// behavior. This is a staging flag, and will be removed in the future.
     bool EnableNewOperatorLookup = false;
 
-    /// The set of features that have been enabled.
-    FixedBitSet<numFeatures(), Feature> Features;
-
-    /// Temporary flag to support LLDB's transition to using \c Features.
-    bool EnableBareSlashRegexLiterals = false;
-
     /// Use Clang function types for computing canonical types.
     /// If this option is false, the clang function types will still be computed
     /// but will not be used for checking type equality.
     /// [TODO: Clang-type-plumbing] Turn on for feature rollout.
     bool UseClangFunctionTypes = false;
-
-    /// If set to true, the diagnosis engine can assume the emitted diagnostics
-    /// will be used in editor. This usually leads to more aggressive fixit.
-    bool DiagnosticsEditorMode = false;
-
-    /// Whether to enable Swift 3 @objc inference, e.g., for members of
-    /// Objective-C-derived classes and 'dynamic' members.
-    bool EnableSwift3ObjCInference = false;
 
     /// Access or distribution level of the whole module being parsed.
     LibraryLevel LibraryLevel = LibraryLevel::Other;
@@ -458,20 +470,17 @@ namespace swift {
     /// The name of the package this module belongs to.
     std::string PackageName;
 
-    /// Warn about cases where Swift 3 would infer @objc but later versions
-    /// of Swift do not.
-    Swift3ObjCInferenceWarnings WarnSwift3ObjCInference =
-      Swift3ObjCInferenceWarnings::None;
+    /// Allow importing a non-package interface from the same package.
+    bool AllowNonPackageInterfaceImportFromSamePackage = false;
 
     /// Diagnose implicit 'override'.
     bool WarnImplicitOverrides = false;
 
+    /// Diagnose use of declarations that are soft-deprecated.
+    bool WarnSoftDeprecated = false;
+
     /// Diagnose uses of NSCoding with classes that have unstable mangled names.
     bool EnableNSKeyedArchiverDiagnostics = true;
-
-    /// Diagnose switches over non-frozen enums that do not have catch-all
-    /// cases.
-    bool EnableNonFrozenEnumExhaustivityDiagnostics = false;
 
     /// Regex for the passes that should report passed and missed optimizations.
     ///
@@ -503,6 +512,12 @@ namespace swift {
 
     /// Enable verification when every SubstitutionMap is constructed.
     bool VerifyAllSubstitutionMaps = false;
+
+    /// If set to true, the source manager will avoid memory mapping source files
+    /// with the expectation they may change on disk. This is most useful when
+    /// opening files under sourcekitd on Windows, as memory mapping on Windows
+    /// prevents files from being written.
+    bool OpenSourcesAsVolatile = false;
 
     /// Load swiftmodule files in memory as volatile and avoid mmap.
     bool EnableVolatileModules = false;
@@ -538,6 +553,9 @@ namespace swift {
     };
     ASTVerifierOverrideKind ASTVerifierOverride =
         ASTVerifierOverrideKind::NoOverride;
+
+    /// Dumps request evaluator cache statistics at the end of compilation.
+    bool AnalyzeRequestEvaluator = false;
 
     /// Enables dumping rewrite systems from the requirement machine.
     bool DumpRequirementMachine = false;
@@ -582,11 +600,15 @@ namespace swift {
     /// rewrite system.
     bool EnableRequirementMachineOpaqueArchetypes = false;
 
-    /// Enable warnings for redundant requirements in generic signatures.
-    bool WarnRedundantRequirements = false;
+    /// Enable implicit lifetime dependence for ~Escapable return types.
+    bool EnableExperimentalLifetimeDependenceInference = true;
 
-    /// Enable experimental associated type inference improvements.
-    bool EnableExperimentalAssociatedTypeInference = false;
+    /// Skips decls that cannot be referenced externally.
+    bool SkipNonExportableDecls = false;
+
+    /// True if -allow-non-resilient-access is passed and built
+    /// from source.
+    bool AllowNonResilientAccess = false;
 
     /// Enables dumping type witness systems from associated type inference.
     bool DumpTypeWitnessSystems = false;
@@ -604,8 +626,24 @@ namespace swift {
     /// type-checking, SIL verification, and IR emission,
     bool BypassResilienceChecks = false;
 
+    /// Disables `DynamicActorIsolation` feature.
+    bool DisableDynamicActorIsolation = false;
+
+    /// Whether or not to allow experimental features that are only available
+    /// in "production".
+#ifdef NDEBUG
+    bool RestrictNonProductionExperimentalFeatures = true;
+#else
+    bool RestrictNonProductionExperimentalFeatures = false;
+#endif
+
     bool isConcurrencyModelTaskToThread() const {
       return ActiveConcurrencyModel == ConcurrencyModel::TaskToThread;
+    }
+
+    bool isDynamicActorIsolationCheckingEnabled() const {
+      return !DisableDynamicActorIsolation &&
+             hasFeature(Feature::DynamicActorIsolation);
     }
 
     LangOptions();
@@ -629,6 +667,8 @@ namespace swift {
       } else if (Target.isiOS()) {
         return Target.getiOSVersion();
       } else if (Target.isWatchOS()) {
+        return Target.getOSVersion();
+      } else if (Target.isXROS()) {
         return Target.getOSVersion();
       }
       return llvm::VersionTuple(/*Major=*/0, /*Minor=*/0, /*Subminor=*/0);
@@ -693,6 +733,12 @@ namespace swift {
     /// by name.
     bool hasFeature(llvm::StringRef featureName) const;
 
+    /// Enable the given feature.
+    void enableFeature(Feature feature) { Features.insert(feature); }
+
+    /// Disable the given feature.
+    void disableFeature(Feature feature) { Features.remove(feature); }
+
     /// Sets the "_hasAtomicBitWidth" conditional.
     void setHasAtomicBitWidth(llvm::Triple triple);
 
@@ -701,18 +747,23 @@ namespace swift {
       switch (maxWidth) {
       case 128:
         AtomicBitWidths.emplace_back("_128");
+        AtomicBitWidthValues.push_back(128);
         LLVM_FALLTHROUGH;
       case 64:
         AtomicBitWidths.emplace_back("_64");
+        AtomicBitWidthValues.push_back(64);
         LLVM_FALLTHROUGH;
       case 32:
         AtomicBitWidths.emplace_back("_32");
+        AtomicBitWidthValues.push_back(32);
         LLVM_FALLTHROUGH;
       case 16:
         AtomicBitWidths.emplace_back("_16");
+        AtomicBitWidthValues.push_back(16);
         LLVM_FALLTHROUGH;
       case 8:
         AtomicBitWidths.emplace_back("_8");
+        AtomicBitWidthValues.push_back(8);
         break;
       default:
         return;
@@ -722,6 +773,11 @@ namespace swift {
     /// Removes all atomic bit widths.
     void clearAtomicBitWidths() {
       AtomicBitWidths.clear();
+      AtomicBitWidthValues.clear();
+    }
+
+    llvm::ArrayRef<unsigned> getAtomicBitWidthValues() const {
+      return AtomicBitWidthValues;
     }
 
     /// Returns true if the given platform condition argument represents
@@ -762,9 +818,15 @@ namespace swift {
 
   private:
     llvm::SmallVector<std::string, 2> AtomicBitWidths;
+    llvm::SmallVector<unsigned, 2> AtomicBitWidthValues;
     llvm::SmallVector<std::pair<PlatformConditionKind, std::string>, 10>
         PlatformConditionValues;
     llvm::SmallVector<std::string, 2> CustomConditionalCompilationFlags;
+
+    /// The set of features that have been enabled. Doesn't include upcoming
+    /// features, which are checked against the language version in
+    /// `hasFeature`.
+    FixedBitSet<numFeatures(), Feature> Features;
   };
 
   class TypeCheckerOptions final {
@@ -810,6 +872,10 @@ namespace swift {
 
     /// Debug the generic signatures computed by the generic signature builder.
     bool DebugGenericSignatures = false;
+
+    /// If this is set, we skip the inverse transform and print explicit
+    /// Copyable/Escapable requirements in the above.
+    bool DebugInverseRequirements = false;
 
     /// Whether we are debugging the constraint solver.
     ///
@@ -898,12 +964,6 @@ namespace swift {
     /// import, but it can affect Clang's IR generation of static functions.
     std::string Optimization;
 
-    /// clang CASOptions.
-    llvm::Optional<clang::CASOptions> CASOpts;
-
-    /// Cache key for imported bridging header.
-    std::string BridgingHeaderPCHCacheKey;
-
     /// Disable validating the persistent PCH.
     bool PCHDisableValidation = false;
 
@@ -974,6 +1034,10 @@ namespace swift {
 
     /// Using ClangIncludeTreeRoot for compilation.
     bool HasClangIncludeTreeRoot = false;
+
+    /// Whether the dependency scanner should construct all swift-frontend
+    /// invocations directly from clang cc1 args.
+    bool ClangImporterDirectCC1Scan = false;
 
     /// Return a hash code of any components from these options that should
     /// contribute to a Swift Bridging PCH hash.

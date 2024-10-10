@@ -17,6 +17,7 @@
 #include "swift/AST/Module.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/Stmt.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Parse/Lexer.h"
 #include "swift/SIL/FormalLinkage.h"
 #include "swift/SIL/SILModule.h"
@@ -107,18 +108,29 @@ static bool shouldProfile(SILDeclRef Constant) {
     auto *M = DC->getParentModule();
     if (auto *SF = M->getSourceFileContainingLocation(N.getStartLoc())) {
       auto &SM = M->getASTContext().SourceMgr;
-      if (SM.hasGeneratedSourceInfo(*SF->getBufferID())) {
+      if (SM.hasGeneratedSourceInfo(SF->getBufferID())) {
         LLVM_DEBUG(llvm::dbgs() << "Skipping ASTNode: generated code\n");
         return false;
       }
     }
   }
 
-  // Do not profile AST nodes in unavailable contexts.
   if (auto *D = DC->getInnermostDeclarationDeclContext()) {
+    // Do not profile AST nodes in unavailable contexts.
     if (D->getSemanticUnavailableAttr()) {
       LLVM_DEBUG(llvm::dbgs() << "Skipping ASTNode: unavailable context\n");
       return false;
+    }
+
+    // Do not profile functions that have had their bodies replaced (e.g
+    // function body macros).
+    // TODO: If/when preamble macros become an official feature, we'll
+    // need to be more nuanced here.
+    if (auto *AFD = dyn_cast<AbstractFunctionDecl>(D)) {
+      if (AFD->getOriginalBodySourceRange() != AFD->getBodySourceRange()) {
+        LLVM_DEBUG(llvm::dbgs() << "Skipping function: body replaced\n");
+        return false;
+      }
     }
   }
 
@@ -216,7 +228,7 @@ visitFunctionDecl(ASTWalker &Walker, AbstractFunctionDecl *AFD, F Func) {
     Func();
     return ASTWalker::Action::Continue();
   }
-  return ASTWalker::Action::SkipChildren();
+  return ASTWalker::Action::SkipNode();
 }
 
 /// Whether to walk the children of a given expression.
@@ -247,9 +259,12 @@ bool shouldSkipExpr(Expr *E) {
 /// Whether the children of a decl that isn't explicitly handled should be
 /// walked.
 static bool shouldWalkIntoUnhandledDecl(const Decl *D) {
-  // We want to walk into the initializer for a pattern binding decl. This
-  // allows us to map LazyInitializerExprs.
-  return isa<PatternBindingDecl>(D);
+  // We want to walk into initializers for bindings, and the expansions of
+  // MacroExpansionDecls, which will be nested within MacroExpansionExprs in
+  // local contexts. We won't record any regions within the macro expansion,
+  // but still need to walk to get accurate counter information in case e.g
+  // there's a throwing function call in the expansion.
+  return isa<PatternBindingDecl>(D) || isa<MacroExpansionDecl>(D);
 }
 
 /// Whether the expression \c E could potentially throw an error.
@@ -328,7 +343,7 @@ struct MapRegionCounters : public ASTWalker {
       mapRegion(TLCD->getBody());
       return Action::Continue();
     }
-    return Action::VisitChildrenIf(shouldWalkIntoUnhandledDecl(D));
+    return Action::VisitNodeIf(shouldWalkIntoUnhandledDecl(D));
   }
 
   PreWalkResult<Stmt *> walkToStmtPre(Stmt *S) override {
@@ -352,7 +367,7 @@ struct MapRegionCounters : public ASTWalker {
     // We don't walk into parameter lists. Default arguments should be visited
     // directly.
     // FIXME: We don't yet profile default argument generators at all.
-    return Action::SkipChildren();
+    return Action::SkipNode();
   }
 
   PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
@@ -373,14 +388,7 @@ struct MapRegionCounters : public ASTWalker {
     if (isa<LazyInitializerExpr>(E))
       mapRegion(E);
 
-    auto WalkResult = shouldWalkIntoExpr(E, Parent, Constant);
-    if (WalkResult.Action.Action == PreWalkAction::SkipChildren) {
-      // We need to manually do the post-visit here since the ASTWalker will
-      // skip it.
-      // FIXME: The ASTWalker should do a post-visit.
-      walkToExprPost(E);
-    }
-    return WalkResult;
+    return shouldWalkIntoExpr(E, Parent, Constant);
   }
 
   PostWalkResult<Expr *> walkToExprPost(Expr *E) override {
@@ -467,23 +475,27 @@ private:
 
   /// The counter for an incomplete region. Note we do not store counters
   /// for nodes, as we need to be able to fix them up after popping the regions.
-  llvm::Optional<CounterExpr> Counter;
+  std::optional<CounterExpr> Counter;
 
   /// The region's starting location.
-  llvm::Optional<SourceLoc> StartLoc;
+  std::optional<SourceLoc> StartLoc;
 
   /// The region's ending location.
-  llvm::Optional<SourceLoc> EndLoc;
+  std::optional<SourceLoc> EndLoc;
 
-  SourceMappingRegion(Kind RegionKind, llvm::Optional<CounterExpr> Counter,
-                      llvm::Optional<SourceLoc> StartLoc)
+  /// Whether the region is within a macro expansion. Such regions do not
+  /// get recorded, but are needed to track the counters within the expansion.
+  bool IsInMacroExpansion = false;
+
+  SourceMappingRegion(Kind RegionKind, std::optional<CounterExpr> Counter,
+                      std::optional<SourceLoc> StartLoc)
       : RegionKind(RegionKind), Counter(Counter), StartLoc(StartLoc) {
     assert((!StartLoc || StartLoc->isValid()) &&
            "Expected start location to be valid");
   }
 
   SourceMappingRegion(Kind RegionKind, ASTNode Node, SourceRange Range,
-                      llvm::Optional<CounterExpr> Counter,
+                      std::optional<CounterExpr> Counter,
                       const SourceManager &SM)
       : RegionKind(RegionKind), Node(Node), Counter(Counter) {
     assert(Range.isValid());
@@ -500,8 +512,8 @@ public:
 
     // Note we don't store counters for nodes, as we need to be able to fix them
     // up later.
-    return SourceMappingRegion(Kind::Node, Node, Range, /*Counter*/ llvm::None,
-                               SM);
+    return SourceMappingRegion(Kind::Node, Node, Range,
+                               /*Counter*/ std::nullopt, SM);
   }
 
   /// Create a source region for an ASTNode that is only present for scoping of
@@ -509,19 +521,27 @@ public:
   /// regions.
   static SourceMappingRegion
   scopingOnly(ASTNode Node, const SourceManager &SM,
-              llvm::Optional<CounterExpr> Counter = llvm::None) {
+              std::optional<CounterExpr> Counter = std::nullopt) {
     return SourceMappingRegion(Kind::ScopingOnly, Node, Node.getSourceRange(),
                                Counter, SM);
   }
 
   /// Create a refined region for a given counter.
   static SourceMappingRegion refined(CounterExpr Counter,
-                                     llvm::Optional<SourceLoc> StartLoc) {
+                                     std::optional<SourceLoc> StartLoc) {
     return SourceMappingRegion(Kind::Refined, Counter, StartLoc);
   }
 
   SourceMappingRegion(SourceMappingRegion &&Region) = default;
   SourceMappingRegion &operator=(SourceMappingRegion &&RHS) = default;
+
+  bool isInMacroExpansion() const {
+    return IsInMacroExpansion;
+  }
+
+  void setIsInMacroExpansion() {
+    IsInMacroExpansion = true;
+  }
 
   /// Whether this region is for scoping only.
   bool isForScopingOnly() const { return RegionKind == Kind::ScopingOnly; }
@@ -690,7 +710,7 @@ struct PGOMapping : public ASTWalker {
       setKnownExecutionCount(TLCD->getBody());
       return Action::Continue();
     }
-    return Action::VisitChildrenIf(shouldWalkIntoUnhandledDecl(D));
+    return Action::VisitNodeIf(shouldWalkIntoUnhandledDecl(D));
   }
 
   LazyInitializerWalking getLazyInitializerWalkingBehavior() override {
@@ -761,7 +781,7 @@ struct PGOMapping : public ASTWalker {
     // We don't walk into parameter lists. Default arguments should be visited
     // directly.
     // FIXME: We don't yet profile default argument generators at all.
-    return Action::SkipChildren();
+    return Action::SkipNode();
   }
 
   PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
@@ -795,14 +815,7 @@ struct PGOMapping : public ASTWalker {
     if (isa<LazyInitializerExpr>(E))
       setKnownExecutionCount(E);
 
-    auto WalkResult = shouldWalkIntoExpr(E, Parent, Constant);
-    if (WalkResult.Action.Action == PreWalkAction::SkipChildren) {
-      // We need to manually do the post-visit here since the ASTWalker will
-      // skip it.
-      // FIXME: The ASTWalker should do a post-visit.
-      walkToExprPost(E);
-    }
-    return WalkResult;
+    return shouldWalkIntoExpr(E, Parent, Constant);
   }
 
   PostWalkResult<Expr *> walkToExprPost(Expr *E) override {
@@ -824,6 +837,7 @@ struct PGOMapping : public ASTWalker {
 struct CoverageMapping : public ASTWalker {
 private:
   const SourceManager &SM;
+  SourceFile *SF;
 
   /// The SIL function being profiled.
   SILDeclRef Constant;
@@ -846,9 +860,15 @@ private:
   /// A stack of active repeat-while loops.
   std::vector<RepeatWhileStmt *> RepeatWhileStack;
 
-  llvm::Optional<CounterExpr> ExitCounter;
+  std::optional<CounterExpr> ExitCounter;
 
   Stmt *ImplicitTopLevelBody = nullptr;
+
+  /// The number of parent MacroExpansionExprs.
+  unsigned MacroDepth = 0;
+
+  /// Whether the current walk is within a macro expansion.
+  bool isInMacroExpansion() const { return MacroDepth > 0; }
 
   /// Return true if \c Ref has an associated counter.
   bool hasCounter(ProfileCounterRef Ref) { return CounterExprs.count(Ref); }
@@ -941,23 +961,23 @@ private:
   ///
   /// Returns the delta of the count on entering \c Node and exiting, or null if
   /// there was no change.
-  llvm::Optional<CounterExpr> setExitCount(ASTNode Node) {
+  std::optional<CounterExpr> setExitCount(ASTNode Node) {
     // A `try?` absorbs child error branches, so we can assume the exit count is
     // the same as the entry count in that case.
     // NOTE: This assumes there is no other kind of control flow that can happen
     // in a nested expression, which is true today, but may not always be.
     if (Node.isExpr(ExprKind::OptionalTry))
-      return llvm::None;
+      return std::nullopt;
 
     ExitCounter = getCurrentCounter();
     if (hasCounter(Node) && getRegion().getNode() != Node)
       return CounterExpr::Sub(getCounter(Node), *ExitCounter, CounterBuilder);
-    return llvm::None;
+    return std::nullopt;
   }
 
   /// Adjust the count for control flow when exiting a scope.
   void adjustForNonLocalExits(ASTNode Scope,
-                              llvm::Optional<CounterExpr> ControlFlowAdjust) {
+                              std::optional<CounterExpr> ControlFlowAdjust) {
     // If there are no regions left, there's nothing to adjust.
     if (RegionStack.empty())
       return;
@@ -965,7 +985,7 @@ private:
     // If the region is for a brace, check to see if we have a parent labeled
     // statement, in which case the exit count needs to account for any direct
     // jumps to it though e.g break statements.
-    llvm::Optional<CounterExpr> JumpsToLabel;
+    std::optional<CounterExpr> JumpsToLabel;
     if (Scope.isStmt(StmtKind::Brace)) {
       if (auto *ParentStmt = Parent.getAsStmt()) {
         if (auto *DCS = dyn_cast<DoCatchStmt>(ParentStmt)) {
@@ -1006,6 +1026,10 @@ private:
 
   /// Push a region onto the stack.
   void pushRegion(SourceMappingRegion Region) {
+    // Note on the region whether we're currently in a macro expansion.
+    if (isInMacroExpansion())
+      Region.setIsInMacroExpansion();
+
     LLVM_DEBUG({
       llvm::dbgs() << "Pushed region: ";
       Region.print(llvm::dbgs(), SM);
@@ -1017,12 +1041,12 @@ private:
   /// Replace the current region at \p Start with a new counter. If \p Start is
   /// \c None, or the counter is semantically zero, an 'incomplete' region is
   /// formed, which is not recorded unless followed by additional AST nodes.
-  void replaceCount(CounterExpr Counter, llvm::Optional<SourceLoc> Start) {
+  void replaceCount(CounterExpr Counter, std::optional<SourceLoc> Start) {
     // If the counter is zero, form an 'incomplete' region with no starting
     // location. This prevents forming unreachable regions unless there is a
     // following statement or expression to extend the region.
     if (Start && Counter.isZero())
-      Start = llvm::None;
+      Start = std::nullopt;
 
     pushRegion(SourceMappingRegion::refined(Counter, Start));
   }
@@ -1039,6 +1063,11 @@ private:
       Region.print(llvm::dbgs(), SM);
       llvm::dbgs() << "\n";
     });
+
+    // Don't record regions in macro expansions, they don't have source
+    // locations that can be meaningfully mapped to source code.
+    if (Region.isInMacroExpansion())
+      return;
 
     // Don't bother recording regions that are only present for scoping.
     if (Region.isForScopingOnly())
@@ -1115,7 +1144,7 @@ private:
       if (Region.getNode())
         break;
     }
-    replaceCount(CounterExpr::Zero(), /*Start*/ llvm::None);
+    replaceCount(CounterExpr::Zero(), /*Start*/ std::nullopt);
   }
 
   Expr *getConditionNode(StmtCondition SC) {
@@ -1125,9 +1154,10 @@ private:
 
 public:
   CoverageMapping(
-      const SourceManager &SM, SILDeclRef Constant,
+      SourceFile *SF, SILDeclRef Constant,
       const llvm::DenseMap<ProfileCounterRef, unsigned> &ConcreteCounters)
-      : SM(SM), Constant(Constant), ConcreteCounters(ConcreteCounters) {}
+    : SM(SF->getASTContext().SourceMgr), SF(SF), Constant(Constant),
+      ConcreteCounters(ConcreteCounters) {}
 
   LazyInitializerWalking getLazyInitializerWalkingBehavior() override {
     // We want to walk lazy initializers present in the synthesized getter for
@@ -1149,20 +1179,33 @@ public:
   /// source regions.
   SILCoverageMap *emitSourceRegions(SILModule &M, StringRef Name,
                                     StringRef PGOFuncName, uint64_t Hash,
-                                    SourceFile *SF, StringRef Filename) {
+                                    StringRef Filename) {
     if (SourceRegions.empty())
       return nullptr;
 
-    using MappedRegion = SILCoverageMap::MappedRegion;
+    auto FileSourceRange = SM.getRangeForBuffer(SF->getBufferID());
+    auto isLocInFile = [&](SourceLoc Loc) {
+      return FileSourceRange.contains(Loc) || FileSourceRange.getEnd() == Loc;
+    };
 
+    using MappedRegion = SILCoverageMap::MappedRegion;
     std::vector<MappedRegion> Regions;
     SourceRange OuterRange;
     for (const auto &Region : SourceRegions) {
       assert(Region.hasStartLoc() && "invalid region");
       assert(Region.hasEndLoc() && "incomplete region");
 
-      // Build up the outer range from the union of all coverage regions.
       SourceRange Range(Region.getStartLoc(), Region.getEndLoc());
+
+      // Make sure we haven't ended up with any source locations outside the
+      // SourceFile (e.g for generated code such as macros), asserting in an
+      // asserts build, dropping in a non-asserts build.
+      if (!isLocInFile(Range.Start) || !isLocInFile(Range.End)) {
+        assert(false && "range outside of file");
+        continue;
+      }
+
+      // Build up the outer range from the union of all coverage regions.
       if (!OuterRange) {
         OuterRange = Range;
       } else {
@@ -1179,14 +1222,37 @@ public:
                                            Counter.getLLVMCounter()));
     }
     // Add any skipped regions present in the outer range.
-    for (auto IfConfig : SF->getIfConfigsWithin(OuterRange)) {
-      for (auto SkipRange : IfConfig.getRangesWithoutActiveBody(SM)) {
-        auto Start = SM.getLineAndColumnInBuffer(SkipRange.getStart());
-        auto End = SM.getLineAndColumnInBuffer(SkipRange.getEnd());
-        assert(Start.first <= End.first && "region start and end out of order");
-        Regions.push_back(MappedRegion::skipped(Start.first, Start.second,
-                                                End.first, End.second));
+    for (auto clause : SF->getIfConfigClausesWithin(OuterRange)) {
+      CharSourceRange SkipRange;
+      switch (clause.getKind()) {
+      case IfConfigClauseRangeInfo::ActiveClause:
+      case IfConfigClauseRangeInfo::EndDirective:
+        SkipRange = clause.getDirectiveRange(SM);
+        break;
+      case IfConfigClauseRangeInfo::InactiveClause:
+        SkipRange = clause.getWholeRange(SM);
+        break;
       }
+      if (SkipRange.getByteLength() == 0)
+        continue;
+
+      auto Start = SM.getLineAndColumnInBuffer(SkipRange.getStart());
+      auto End = SM.getLineAndColumnInBuffer(SkipRange.getEnd());
+      assert(Start.first <= End.first && "region start and end out of order");
+
+      // If this is consecutive with the last one, expand it.
+      if (!Regions.empty()) {
+        auto &last = Regions.back();
+        if (last.RegionKind == MappedRegion::Kind::Skipped &&
+            last.EndLine == Start.first && last.EndCol == Start.second) {
+          last.EndLine = End.first;
+          last.EndCol = End.second;
+          continue;
+        }
+      }
+
+      Regions.push_back(MappedRegion::skipped(Start.first, Start.second,
+                                              End.first, End.second));
     }
     return SILCoverageMap::create(M, SF, Filename, Name, PGOFuncName, Hash,
                                   Regions, CounterBuilder.getExpressions());
@@ -1202,7 +1268,7 @@ public:
       ImplicitTopLevelBody = TLCD->getBody();
       return Action::Continue();
     }
-    return Action::VisitChildrenIf(shouldWalkIntoUnhandledDecl(D));
+    return Action::VisitNodeIf(shouldWalkIntoUnhandledDecl(D));
   }
 
   PostWalkAction walkToDeclPost(Decl *D) override {
@@ -1265,7 +1331,7 @@ public:
         auto ThenDelta =
             CounterExpr::Sub(ThenCounter, getExitCounter(), CounterBuilder);
 
-        llvm::Optional<CounterExpr> ElseDelta;
+        std::optional<CounterExpr> ElseDelta;
         if (auto *Else = IS->getElseStmt()) {
           auto ElseCounter = CounterExpr::Sub(ParentCounter, ThenCounter,
                                               CounterBuilder);
@@ -1326,8 +1392,6 @@ public:
           replaceCount(AfterIf, getEndLoc(IS));
       }
       // Already visited the children.
-      // FIXME: The ASTWalker should do a post-walk for SkipChildren.
-      walkToStmtPost(S);
       return Action::SkipChildren(S);
 
     } else if (auto *GS = dyn_cast<GuardStmt>(S)) {
@@ -1488,7 +1552,7 @@ public:
     // benefit in these cases, as they're unlikely to have side effects, and
     // the values can be exercized explicitly, but we should probably at least
     // have a consistent behavior for both no matter what we choose here.
-    return Action::SkipChildren();
+    return Action::SkipNode();
   }
 
   PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
@@ -1513,10 +1577,14 @@ public:
 
     if (hasCounter(E)) {
       pushRegion(SourceMappingRegion::forNode(E, SM));
-    } else if (isa<OptionalTryExpr>(E)) {
+    } else if (isa<OptionalTryExpr>(E) || isa<MacroExpansionExpr>(E)) {
       // If we have a `try?`, that doesn't already have a counter, record it
       // as a scoping-only region. We need it to scope child error branches,
       // but don't need it in the resulting set of regions.
+      //
+      // If we have a macro expansion, also push a scoping-only region. We'll
+      // discard any regions recorded within the macro, but will adjust for any
+      // control flow that may have happened within the macro.
       assignCounter(E, getCurrentCounter());
       pushRegion(SourceMappingRegion::scopingOnly(E, SM));
     }
@@ -1549,18 +1617,13 @@ public:
         Else->walk(*this);
       }
       // Already visited the children.
-      // FIXME: The ASTWalker should do a post-walk for SkipChildren.
-      walkToExprPost(TE);
       return Action::SkipChildren(TE);
     }
-    auto WalkResult = shouldWalkIntoExpr(E, Parent, Constant);
-    if (WalkResult.Action.Action == PreWalkAction::SkipChildren) {
-      // We need to manually do the post-visit here since the ASTWalker will
-      // skip it.
-      // FIXME: The ASTWalker should do a post-visit.
-      walkToExprPost(E);
-    }
-    return WalkResult;
+
+    if (isa<MacroExpansionExpr>(E))
+      MacroDepth += 1;
+
+    return shouldWalkIntoExpr(E, Parent, Constant);
   }
 
   PostWalkResult<Expr *> walkToExprPost(Expr *E) override {
@@ -1574,6 +1637,11 @@ public:
       replaceCount(
           CounterExpr::Sub(getCurrentCounter(), ThrowCount, CounterBuilder),
           Lexer::getLocForEndOfToken(SM, E->getEndLoc()));
+    }
+
+    if (isa<MacroExpansionExpr>(E)) {
+      assert(isInMacroExpansion());
+      MacroDepth -= 1;
     }
 
     if (hasCounter(E))
@@ -1590,6 +1658,7 @@ getEquivalentPGOLinkage(FormalLinkage Linkage) {
   switch (Linkage) {
   case FormalLinkage::PublicUnique:
   case FormalLinkage::PublicNonUnique:
+  case FormalLinkage::PackageUnique:
     return llvm::GlobalValue::ExternalLinkage;
 
   case FormalLinkage::HiddenUnique:
@@ -1611,7 +1680,6 @@ static void walkNode(NodeToProfile Node, ASTWalker &Walker) {
 }
 
 void SILProfiler::assignRegionCounters() {
-  const auto &SM = M.getASTContext().SourceMgr;
   auto *DC = forDecl.getInnermostDeclContext();
   auto *SF = DC->getParentSourceFile();
   assert(SF && "Not within a SourceFile?");
@@ -1648,10 +1716,10 @@ void SILProfiler::assignRegionCounters() {
   PGOFuncHash = 0x0;
 
   if (EmitCoverageMapping) {
-    CoverageMapping Coverage(SM, forDecl, RegionCounterMap);
+    CoverageMapping Coverage(SF, forDecl, RegionCounterMap);
     walkNode(Root, Coverage);
     CovMap = Coverage.emitSourceRegions(M, CurrentFuncName, PGOFuncName,
-                                        PGOFuncHash, SF, CurrentFileName);
+                                        PGOFuncHash, CurrentFileName);
   }
 
   if (llvm::IndexedInstrProfReader *IPR = M.getPGOReader()) {
@@ -1685,13 +1753,13 @@ ProfileCounter SILProfiler::getExecutionCount(ASTNode Node) {
   return getExecutionCount(ProfileCounterRef::node(Node));
 }
 
-llvm::Optional<ASTNode> SILProfiler::getPGOParent(ASTNode Node) {
+std::optional<ASTNode> SILProfiler::getPGOParent(ASTNode Node) {
   if (!Node || !M.getPGOReader() || !hasRegionCounters()) {
-    return llvm::None;
+    return std::nullopt;
   }
   auto it = RegionCondToParentMap.find(Node);
   if (it == RegionCondToParentMap.end()) {
-    return llvm::None;
+    return std::nullopt;
   }
   return it->getSecond();
 }

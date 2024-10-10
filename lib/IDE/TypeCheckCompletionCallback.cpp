@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "swift/Basic/Assertions.h"
 #include "swift/IDE/TypeCheckCompletionCallback.h"
 #include "swift/IDE/CompletionLookup.h"
 #include "swift/Sema/CompletionContextFinder.h"
@@ -47,8 +48,11 @@ void TypeCheckCompletionCallback::fallbackTypeCheck(DeclContext *DC) {
 
 Type swift::ide::getTypeForCompletion(const constraints::Solution &S,
                                       ASTNode Node) {
+  // Use the contextual type, unless it is still unresolved, in which case fall
+  // back to getting the type from the expression.
   if (auto ContextualType = S.getContextualType(Node)) {
-    return ContextualType;
+    if (!ContextualType->hasUnresolvedType())
+      return ContextualType;
   }
 
   if (!S.hasType(Node)) {
@@ -152,20 +156,8 @@ void WithSolutionSpecificVarTypesRAII::setInterfaceType(VarDecl *VD, Type Ty) {
                                             std::move(Ty));
 }
 
-bool swift::ide::isImplicitSingleExpressionReturn(ConstraintSystem &CS,
-                                                  Expr *CompletionExpr) {
-  Expr *ParentExpr = CS.getParentExpr(CompletionExpr);
-  if (!ParentExpr)
-    return CS.getContextualTypePurpose(CompletionExpr) == CTP_ReturnSingleExpr;
-
-  if (auto *ParentCE = dyn_cast<ClosureExpr>(ParentExpr)) {
-    if (ParentCE->hasSingleExpressionBody() &&
-        ParentCE->getSingleExpressionBody() == CompletionExpr) {
-      ASTNode Last = ParentCE->getBody()->getLastElement();
-      return !Last.isStmt(StmtKind::Return) || Last.isImplicit();
-    }
-  }
-  return false;
+bool swift::ide::isImpliedResult(const Solution &S, Expr *CompletionExpr) {
+  return S.isImpliedResult(CompletionExpr).has_value();
 }
 
 bool swift::ide::isContextAsync(const constraints::Solution &S,

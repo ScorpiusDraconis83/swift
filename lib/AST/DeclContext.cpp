@@ -25,6 +25,7 @@
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/Types.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Basic/Statistic.h"
 #include "llvm/ADT/DenseMap.h"
@@ -252,6 +253,22 @@ Decl *DeclContext::getTopmostDeclarationDeclContext() {
   return topmost;
 }
 
+DeclContext *DeclContext::getOutermostFunctionContext() {
+  AbstractFunctionDecl *result = nullptr;
+  auto dc = this;
+  do {
+    if (auto afd = dyn_cast<AbstractFunctionDecl>(dc))
+      result = afd;
+
+    // If we've found a non-local context, we don't have to keep walking up
+    // the hierarchy.
+    if (!dc->isLocalContext())
+      break;
+  } while ((dc = dc->getParent()));
+
+  return result;
+}
+
 DeclContext *DeclContext::getInnermostSkippedFunctionContext() {
   auto dc = this;
   do {
@@ -259,6 +276,25 @@ DeclContext *DeclContext::getInnermostSkippedFunctionContext() {
       if (afd->isBodySkipped())
         return afd;
   } while ((dc = dc->getParent()));
+
+  return nullptr;
+}
+
+ClosureExpr *DeclContext::getInnermostClosureForSelfCapture() {
+  auto dc = this;
+  if (auto closure = dyn_cast<ClosureExpr>(dc)) {
+    return closure;
+  }
+
+  // Stop searching if we find a type decl, since types always
+  // redefine what 'self' means, even when nested inside a closure.
+  if (dc->isTypeContext()) {
+    return nullptr;
+  }
+
+  if (auto parent = dc->getParent()) {
+    return parent->getInnermostClosureForSelfCapture();
+  }
 
   return nullptr;
 }
@@ -342,7 +378,8 @@ SourceFile *DeclContext::getParentSourceFile() const {
       case DeclContextKind::FileUnit:
       case DeclContextKind::Module:
       case DeclContextKind::Package:
-      case DeclContextKind::SerializedLocal:
+      case DeclContextKind::SerializedAbstractClosure:
+      case DeclContextKind::SerializedTopLevelCodeDecl:
         break;
       }
     }
@@ -613,7 +650,8 @@ bool DeclContext::walkContext(ASTWalker &Walker) {
     return cast<EnumElementDecl>(this)->walk(Walker);
   case DeclContextKind::MacroDecl:
     return cast<MacroDecl>(this)->walk(Walker);
-  case DeclContextKind::SerializedLocal:
+  case DeclContextKind::SerializedAbstractClosure:
+  case DeclContextKind::SerializedTopLevelCodeDecl:
     llvm_unreachable("walk is unimplemented for deserialized contexts");
   case DeclContextKind::Initializer:
     // Is there any point in trying to walk the expression?
@@ -689,9 +727,11 @@ unsigned DeclContext::printContext(raw_ostream &OS, const unsigned indent,
   case DeclContextKind::Package:          Kind = "Package"; break;
   case DeclContextKind::Module:           Kind = "Module"; break;
   case DeclContextKind::FileUnit:         Kind = "FileUnit"; break;
-  case DeclContextKind::SerializedLocal:  Kind = "Serialized Local"; break;
   case DeclContextKind::AbstractClosureExpr:
     Kind = "AbstractClosureExpr";
+    break;
+  case DeclContextKind::SerializedAbstractClosure:
+    Kind = "SerializedAbstractClosure";
     break;
   case DeclContextKind::GenericTypeDecl:
     switch (cast<GenericTypeDecl>(this)->getKind()) {
@@ -702,6 +742,9 @@ unsigned DeclContext::printContext(raw_ostream &OS, const unsigned indent,
     break;
   case DeclContextKind::ExtensionDecl:    Kind = "ExtensionDecl"; break;
   case DeclContextKind::TopLevelCodeDecl: Kind = "TopLevelCodeDecl"; break;
+  case DeclContextKind::SerializedTopLevelCodeDecl:
+    Kind = "SerializedTopLevelCodeDecl"; 
+    break;
   case DeclContextKind::Initializer:      Kind = "Initializer"; break;
   case DeclContextKind::AbstractFunctionDecl:
     Kind = "AbstractFunctionDecl";
@@ -741,16 +784,29 @@ unsigned DeclContext::printContext(raw_ostream &OS, const unsigned indent,
     OS << " line=" << getLineNumber(cast<AbstractClosureExpr>(this));
     OS << " : " << cast<AbstractClosureExpr>(this)->getType();
     break;
+
+  case DeclContextKind::SerializedAbstractClosure: {
+    OS << " : " << cast<SerializedAbstractClosureExpr>(this)->getType();
+    break;
+  }
+
   case DeclContextKind::GenericTypeDecl:
     OS << " name=" << cast<GenericTypeDecl>(this)->getName();
     break;
+
   case DeclContextKind::ExtensionDecl:
     OS << " line=" << getLineNumber(cast<ExtensionDecl>(this));
     OS << " base=" << cast<ExtensionDecl>(this)->getExtendedType();
     break;
+
   case DeclContextKind::TopLevelCodeDecl:
     OS << " line=" << getLineNumber(cast<TopLevelCodeDecl>(this));
     break;
+
+  case DeclContextKind::SerializedTopLevelCodeDecl:
+    // Already printed the kind, nothing else to do.
+    break;
+
   case DeclContextKind::AbstractFunctionDecl: {
     auto *AFD = cast<AbstractFunctionDecl>(this);
     OS << " name=" << AFD->getName();
@@ -815,31 +871,6 @@ unsigned DeclContext::printContext(raw_ostream &OS, const unsigned indent,
     }
     }
     break;
-
-  case DeclContextKind::SerializedLocal: {
-    auto local = cast<SerializedLocalDeclContext>(this);
-    switch (local->getLocalDeclContextKind()) {
-    case LocalDeclContextKind::AbstractClosure: {
-      auto serializedClosure = cast<SerializedAbstractClosureExpr>(local);
-      OS << " closure : " << serializedClosure->getType();
-      break;
-    }
-    case LocalDeclContextKind::DefaultArgumentInitializer: {
-      auto init = cast<SerializedDefaultArgumentInitializer>(local);
-      OS << "DefaultArgument index=" << init->getIndex();
-      break;
-    }
-    case LocalDeclContextKind::PatternBindingInitializer: {
-      auto init = cast<SerializedPatternBindingInitializer>(local);
-      OS << " PatternBinding 0x" << (void*) init->getBinding()
-         << " #" << init->getBindingIndex();
-      break;
-    }
-    case LocalDeclContextKind::TopLevelCodeDecl:
-      OS << " TopLevelCode";
-      break;
-    }
-  }
   }
 
   if (auto decl = getAsDecl())
@@ -939,13 +970,6 @@ void IterableDeclContext::addMemberPreservingSourceOrder(Decl *member) {
     if (isa<EnumCaseDecl>(existingMember))
       continue;
 
-    // The elements of the active clause of an IfConfigDecl
-    // are added to the parent type. We ignore the IfConfigDecl
-    // since its source range overlaps with the source ranges
-    // of the active elements.
-    if (isa<IfConfigDecl>(existingMember))
-      continue;
-
     if (!SM.isBeforeInBuffer(existingMember->getEndLoc(), start))
       break;
 
@@ -994,14 +1018,11 @@ void IterableDeclContext::addMemberSilently(Decl *member, Decl *hint,
       return;
 
     auto shouldSkip = [](Decl *d) {
-      // PatternBindingDecl source ranges overlap with VarDecls,
-      // EnumCaseDecl source ranges overlap with EnumElementDecls,
-      // and IfConfigDecl source ranges overlap with the elements
-      // of the active clause. Skip them all here to avoid
-      // spurious assertions.
+      // PatternBindingDecl source ranges overlap with VarDecls and
+      // EnumCaseDecl source ranges overlap with EnumElementDecls.
+      // Skip them all here to avoid spurious assertions.
       if (isa<PatternBindingDecl>(d) ||
-          isa<EnumCaseDecl>(d) ||
-          isa<IfConfigDecl>(d))
+          isa<EnumCaseDecl>(d))
         return true;
 
       // Ignore source location information of implicit declarations.
@@ -1180,10 +1201,10 @@ IterableDeclContext::castDeclToIterableDeclContext(const Decl *D) {
   }
 }
 
-llvm::Optional<Fingerprint> IterableDeclContext::getBodyFingerprint() const {
+std::optional<Fingerprint> IterableDeclContext::getBodyFingerprint() const {
   auto fileUnit = dyn_cast<FileUnit>(getAsGenericContext()->getModuleScopeContext());
   if (!fileUnit)
-    return llvm::None;
+    return std::nullopt;
 
   if (isa<SourceFile>(fileUnit)) {
     auto mutableThis = const_cast<IterableDeclContext *>(this);
@@ -1194,7 +1215,7 @@ llvm::Optional<Fingerprint> IterableDeclContext::getBodyFingerprint() const {
   }
 
   if (getDecl()->isImplicit())
-    return llvm::None;
+    return std::nullopt;
 
   return fileUnit->loadFingerprint(this);
 }
@@ -1319,8 +1340,10 @@ DeclContextKind DeclContext::getContextKind() const {
     return DeclContextKind::AbstractClosureExpr;
   case ASTHierarchy::Initializer:
     return DeclContextKind::Initializer;
-  case ASTHierarchy::SerializedLocal:
-    return DeclContextKind::SerializedLocal;
+  case ASTHierarchy::SerializedAbstractClosure:
+    return DeclContextKind::SerializedAbstractClosure;
+  case ASTHierarchy::SerializedTopLevelCodeDecl:
+    return DeclContextKind::SerializedTopLevelCodeDecl;
   case ASTHierarchy::FileUnit:
     return DeclContextKind::FileUnit;
   case ASTHierarchy::Package:
@@ -1373,7 +1396,8 @@ bool DeclContext::isAsyncContext() const {
   case DeclContextKind::Initializer:
   case DeclContextKind::EnumElementDecl:
   case DeclContextKind::ExtensionDecl:
-  case DeclContextKind::SerializedLocal:
+  case DeclContextKind::SerializedAbstractClosure:
+  case DeclContextKind::SerializedTopLevelCodeDecl:
   case DeclContextKind::Package:
   case DeclContextKind::Module:
   case DeclContextKind::GenericTypeDecl:
@@ -1401,6 +1425,8 @@ bool DeclContext::isAsyncContext() const {
 }
 
 SourceLoc swift::extractNearestSourceLoc(const DeclContext *dc) {
+  assert(dc && "Expected non-null DeclContext!");
+
   switch (dc->getContextKind()) {
   case DeclContextKind::Package:
   case DeclContextKind::Module:
@@ -1425,7 +1451,8 @@ SourceLoc swift::extractNearestSourceLoc(const DeclContext *dc) {
     return SourceLoc();
 
   case DeclContextKind::Initializer:
-  case DeclContextKind::SerializedLocal:
+  case DeclContextKind::SerializedAbstractClosure:
+  case DeclContextKind::SerializedTopLevelCodeDecl:
     return extractNearestSourceLoc(dc->getParent());
   }
   llvm_unreachable("Unhandled DeclContextKindIn switch");
@@ -1512,11 +1539,10 @@ bool DeclContext::isAlwaysAvailableConformanceContext() const {
 
   auto &ctx = getASTContext();
 
-  AvailabilityContext conformanceAvailability{
+  AvailabilityRange conformanceAvailability{
       AvailabilityInference::availableRange(ext, ctx)};
 
-  auto deploymentTarget =
-      AvailabilityContext::forDeploymentTarget(ctx);
+  auto deploymentTarget = AvailabilityRange::forDeploymentTarget(ctx);
 
   return deploymentTarget.isContainedIn(conformanceAvailability);
 }

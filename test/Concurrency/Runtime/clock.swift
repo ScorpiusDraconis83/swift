@@ -1,3 +1,4 @@
+// RUN: %target-typecheck-verify-swift -strict-concurrency=complete -disable-availability-checking -parse-as-library
 // RUN: %target-run-simple-swift( -Xfrontend -disable-availability-checking -parse-as-library)
 
 // REQUIRES: concurrency
@@ -8,12 +9,11 @@
 // in the back deployment runtime.
 // UNSUPPORTED: back_deployment_runtime
 // UNSUPPORTED: back_deploy_concurrency
-// UNSUPPORTED: freestanding
 
 import _Concurrency
 import StdlibUnittest
 
-var tests = TestSuite("Time")
+@MainActor var tests = TestSuite("Time")
 
 @main struct Main {
   static func main() async {

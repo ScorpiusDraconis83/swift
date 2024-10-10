@@ -12,6 +12,7 @@
 
 #include "swift/Frontend/CASOutputBackends.h"
 
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/FileTypes.h"
 #include "swift/Frontend/CachingUtils.h"
 #include "swift/Frontend/CompileJobCacheKey.h"
@@ -64,31 +65,31 @@ public:
 
   llvm::Expected<std::unique_ptr<llvm::vfs::OutputFileImpl>>
   createFileImpl(llvm::StringRef ResolvedPath,
-                 llvm::Optional<llvm::vfs::OutputConfig> Config) {
+                 std::optional<llvm::vfs::OutputConfig> Config) {
     auto ProducingInput = OutputToInputMap.find(ResolvedPath);
     assert(ProducingInput != OutputToInputMap.end() && "Unknown output file");
 
-    std::string InputFilename = ProducingInput->second.first.getFileName();
+    unsigned InputIndex = ProducingInput->second.first;
     auto OutputType = ProducingInput->second.second;
 
     // Uncached output kind.
-    if (file_types::isProducedFromDiagnostics(OutputType))
+    if (!isStoredDirectly(OutputType))
       return std::make_unique<llvm::vfs::NullOutputFileImpl>();
 
     return std::make_unique<SwiftCASOutputFile>(
         ResolvedPath,
-        [this, InputFilename, OutputType](StringRef Path,
-                                          StringRef Bytes) -> Error {
-          return storeImpl(Path, Bytes, InputFilename, OutputType);
+        [this, InputIndex, OutputType](StringRef Path,
+                                       StringRef Bytes) -> Error {
+          return storeImpl(Path, Bytes, InputIndex, OutputType);
         });
   }
 
   void initBackend(const FrontendInputsAndOutputs &InputsAndOutputs);
 
-  Error storeImpl(StringRef Path, StringRef Bytes, StringRef CorrespondingInput,
+  Error storeImpl(StringRef Path, StringRef Bytes, unsigned InputIndex,
                   file_types::ID OutputKind);
 
-  Error finalizeCacheKeysFor(StringRef Input);
+  Error finalizeCacheKeysFor(unsigned InputIndex);
 
 private:
   friend class SwiftCASOutputBackend;
@@ -98,8 +99,11 @@ private:
   const FrontendInputsAndOutputs &InputsAndOutputs;
   FrontendOptions::ActionType Action;
 
-  StringMap<std::pair<const InputFile &, file_types::ID>> OutputToInputMap;
-  StringMap<DenseMap<file_types::ID, ObjectRef>> OutputRefs;
+  // Map from output path to the input index and output kind.
+  StringMap<std::pair<unsigned, file_types::ID>> OutputToInputMap;
+
+  // A vector of output refs where the index is the input index.
+  SmallVector<DenseMap<file_types::ID, ObjectRef>> OutputRefs;
 };
 
 SwiftCASOutputBackend::SwiftCASOutputBackend(
@@ -111,6 +115,11 @@ SwiftCASOutputBackend::SwiftCASOutputBackend(
 
 SwiftCASOutputBackend::~SwiftCASOutputBackend() { delete &Impl; }
 
+bool SwiftCASOutputBackend::isStoredDirectly(file_types::ID Kind) {
+  return !file_types::isProducedFromDiagnostics(Kind) &&
+         Kind != file_types::TY_Dependencies;
+}
+
 IntrusiveRefCntPtr<OutputBackend> SwiftCASOutputBackend::cloneImpl() const {
   return makeIntrusiveRefCnt<SwiftCASOutputBackend>(
       Impl.CAS, Impl.Cache, Impl.BaseKey, Impl.InputsAndOutputs, Impl.Action);
@@ -118,7 +127,7 @@ IntrusiveRefCntPtr<OutputBackend> SwiftCASOutputBackend::cloneImpl() const {
 
 Expected<std::unique_ptr<OutputFileImpl>>
 SwiftCASOutputBackend::createFileImpl(StringRef ResolvedPath,
-                                      Optional<OutputConfig> Config) {
+                                      std::optional<OutputConfig> Config) {
   return Impl.createFileImpl(ResolvedPath, Config);
 }
 
@@ -127,15 +136,42 @@ file_types::ID SwiftCASOutputBackend::getOutputFileType(StringRef Path) const {
 }
 
 Error SwiftCASOutputBackend::storeImpl(StringRef Path, StringRef Bytes,
-                                       StringRef CorrespondingInput,
+                                       unsigned InputIndex,
                                        file_types::ID OutputKind) {
-  return Impl.storeImpl(Path, Bytes, CorrespondingInput, OutputKind);
+  return Impl.storeImpl(Path, Bytes, InputIndex, OutputKind);
 }
 
-Error SwiftCASOutputBackend::storeCachedDiagnostics(StringRef InputFile,
+Error SwiftCASOutputBackend::storeCachedDiagnostics(unsigned InputIndex,
                                                     StringRef Bytes) {
-  return storeImpl("<cached-diagnostics>", Bytes, InputFile,
+  return storeImpl("<cached-diagnostics>", Bytes, InputIndex,
                    file_types::ID::TY_CachedDiagnostics);
+}
+
+Error SwiftCASOutputBackend::storeMakeDependenciesFile(StringRef OutputFilename,
+                                                       llvm::StringRef Bytes) {
+  auto Input = Impl.OutputToInputMap.find(OutputFilename);
+  if (Input == Impl.OutputToInputMap.end())
+    return llvm::createStringError("InputIndex for output file not found!");
+  auto InputIndex = Input->second.first;
+  assert(Input->second.second == file_types::TY_Dependencies &&
+         "wrong output type");
+  return storeImpl(OutputFilename, Bytes, InputIndex,
+                   file_types::TY_Dependencies);
+}
+
+Error SwiftCASOutputBackend::storeMCCASObjectID(StringRef OutputFilename,
+                                                llvm::cas::CASID ID) {
+  auto Input = Impl.OutputToInputMap.find(OutputFilename);
+  if (Input == Impl.OutputToInputMap.end())
+    return llvm::createStringError("InputIndex for output file not found!");
+  auto InputIndex = Input->second.first;
+  auto MCRef = Impl.CAS.getReference(ID);
+  if (!MCRef)
+    return createStringError("Invalid CASID: " + ID.toString() +
+                             ". No associated ObjectRef found!");
+
+  Impl.OutputRefs[InputIndex].insert({file_types::TY_Object, *MCRef});
+  return Impl.finalizeCacheKeysFor(InputIndex);
 }
 
 void SwiftCASOutputBackend::Implementation::initBackend(
@@ -145,64 +181,73 @@ void SwiftCASOutputBackend::Implementation::initBackend(
   // input it actually comes from. Maybe the solution is just not to cache
   // any commands write output to `-`.
   file_types::ID mainOutputType = InputsAndOutputs.getPrincipalOutputType();
-  auto addInput = [&](const InputFile &Input) {
-    if (!Input.outputFilename().empty())
+  auto addInput = [&](const InputFile &Input, unsigned Index) {
+    // Ignore the outputFilename for typecheck action since it is not producing
+    // an output file for that.
+    if (!Input.outputFilename().empty() &&
+        Action != FrontendOptions::ActionType::Typecheck)
       OutputToInputMap.insert(
-          {Input.outputFilename(), {Input, mainOutputType}});
+          {Input.outputFilename(), {Index, mainOutputType}});
     Input.getPrimarySpecificPaths()
         .SupplementaryOutputs.forEachSetOutputAndType(
             [&](const std::string &Out, file_types::ID ID) {
               if (!file_types::isProducedFromDiagnostics(ID))
-                OutputToInputMap.insert({Out, {Input, ID}});
+                OutputToInputMap.insert({Out, {Index, ID}});
             });
   };
-  llvm::for_each(InputsAndOutputs.getAllInputs(), addInput);
+
+  for (unsigned idx = 0; idx < InputsAndOutputs.getAllInputs().size(); ++idx)
+    addInput(InputsAndOutputs.getAllInputs()[idx], idx);
 
   // FIXME: Cached diagnostics is associated with the first output producing
   // input file.
-  OutputToInputMap.insert({"<cached-diagnostics>",
-                           {InputsAndOutputs.getFirstOutputProducingInput(),
-                            file_types::TY_CachedDiagnostics}});
+  OutputToInputMap.insert(
+      {"<cached-diagnostics>",
+       {InputsAndOutputs.getIndexOfFirstOutputProducingInput(),
+        file_types::TY_CachedDiagnostics}});
+
+  // Resize the output refs to hold all inputs.
+  OutputRefs.resize(InputsAndOutputs.getAllInputs().size());
 }
 
 Error SwiftCASOutputBackend::Implementation::storeImpl(
-    StringRef Path, StringRef Bytes, StringRef CorrespondingInput,
+    StringRef Path, StringRef Bytes, unsigned InputIndex,
     file_types::ID OutputKind) {
-  Optional<ObjectRef> BytesRef;
-  if (Error E = CAS.storeFromString(None, Bytes).moveInto(BytesRef))
+  std::optional<ObjectRef> BytesRef;
+  if (Error E = CAS.storeFromString(std::nullopt, Bytes).moveInto(BytesRef))
     return E;
 
   LLVM_DEBUG(llvm::dbgs() << "DEBUG: producing CAS output of type \'"
                           << file_types::getTypeName(OutputKind)
-                          << "\' for input \'" << CorrespondingInput << "\': \'"
+                          << "\' for input \'" << InputIndex << "\': \'"
                           << CAS.getID(*BytesRef).toString() << "\'\n";);
 
-  OutputRefs[CorrespondingInput].insert({OutputKind, *BytesRef});
+  OutputRefs[InputIndex].insert({OutputKind, *BytesRef});
 
-  return finalizeCacheKeysFor(CorrespondingInput);
+  return finalizeCacheKeysFor(InputIndex);
 }
 
 Error SwiftCASOutputBackend::Implementation::finalizeCacheKeysFor(
-    StringRef Input) {
-  auto Entry = OutputRefs.find(Input);
-  assert(Entry != OutputRefs.end() && "Unexpected input");
+    unsigned InputIndex) {
+  auto ProducedOutputs = OutputRefs[InputIndex];
+  assert(!ProducedOutputs.empty() && "Expect outputs for this input");
 
   // If not all outputs for the input are emitted, return.
   if (!llvm::all_of(OutputToInputMap, [&](auto &E) {
-        return (E.second.first.getFileName() != Input ||
-                Entry->second.count(E.second.second));
+        return (E.second.first != InputIndex ||
+                ProducedOutputs.count(E.second.second));
       }))
     return Error::success();
 
   std::vector<std::pair<file_types::ID, ObjectRef>> OutputsForInput;
-  llvm::for_each(Entry->second, [&OutputsForInput](auto E) {
+  llvm::for_each(ProducedOutputs, [&OutputsForInput](auto E) {
     OutputsForInput.emplace_back(E.first, E.second);
   });
   // Sort to a stable ordering for deterministic output cache object.
   llvm::sort(OutputsForInput,
              [](auto &LHS, auto &RHS) { return LHS.first < RHS.first; });
 
-  Optional<ObjectRef> Result;
+  std::optional<ObjectRef> Result;
   // Use a clang compatible result CAS object schema when emiting PCM.
   if (Action == FrontendOptions::ActionType::EmitPCM) {
     clang::cas::CompileJobCacheResult::Builder Builder;
@@ -237,14 +282,14 @@ Error SwiftCASOutputBackend::Implementation::finalizeCacheKeysFor(
       return Err;
   }
 
-  auto CacheKey = createCompileJobCacheKeyForOutput(CAS, BaseKey, Input);
+  auto CacheKey = createCompileJobCacheKeyForOutput(CAS, BaseKey, InputIndex);
   if (!CacheKey)
     return CacheKey.takeError();
 
-  LLVM_DEBUG(llvm::dbgs() << "DEBUG: writing cache entry for input \'" << Input
-                          << "\': \'" << CAS.getID(*CacheKey).toString()
-                          << "\' => \'" << CAS.getID(*Result).toString()
-                          << "\'\n";);
+  LLVM_DEBUG(llvm::dbgs() << "DEBUG: writing cache entry for input \'"
+                          << InputIndex << "\': \'"
+                          << CAS.getID(*CacheKey).toString() << "\' => \'"
+                          << CAS.getID(*Result).toString() << "\'\n";);
 
   if (auto E = Cache.put(CAS.getID(*CacheKey), CAS.getID(*Result)))
     return E;

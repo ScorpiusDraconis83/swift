@@ -24,6 +24,8 @@
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/PropertyWrappers.h"
 #include "swift/AST/ProtocolConformance.h"
+#include "swift/Basic/Platform.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/ProfileCounter.h"
 #include "swift/SIL/FormalLinkage.h"
 #include "swift/SIL/PrettyStackTrace.h"
@@ -367,6 +369,43 @@ void TemporaryInitialization::finishInitialization(SILGenFunction &SGF) {
     SGF.Cleanups.setCleanupState(Cleanup, CleanupState::Active);
 }
 
+StoreBorrowInitialization::StoreBorrowInitialization(SILValue address)
+    : address(address) {
+  assert(isa<AllocStackInst>(address) ||
+         isa<MarkUnresolvedNonCopyableValueInst>(address) &&
+             "invalid destination for store_borrow initialization!?");
+}
+
+void StoreBorrowInitialization::copyOrInitValueInto(SILGenFunction &SGF,
+                                                    SILLocation loc,
+                                                    ManagedValue mv,
+                                                    bool isInit) {
+  auto value = mv.getValue();
+  auto &lowering = SGF.getTypeLowering(value->getType());
+  if (lowering.isAddressOnly() && SGF.silConv.useLoweredAddresses()) {
+    llvm::report_fatal_error(
+        "Attempting to store_borrow an address-only value!?");
+  }
+  if (value->getType().isAddress()) {
+    value = SGF.emitManagedLoadBorrow(loc, value).getValue();
+  }
+  if (!isInit) {
+    value = lowering.emitCopyValue(SGF.B, loc, value);
+  }
+  storeBorrow = SGF.emitManagedStoreBorrow(loc, value, address);
+}
+
+SILValue StoreBorrowInitialization::getAddress() const {
+  if (storeBorrow) {
+    return storeBorrow.getValue();
+  }
+  return address;
+}
+
+ManagedValue StoreBorrowInitialization::getManagedAddress() const {
+  return storeBorrow;
+}
+
 namespace {
 class ReleaseValueCleanup : public Cleanup {
   SILValue v;
@@ -502,7 +541,7 @@ public:
   /// CleanupUninitializedBox cleanup that will be replaced when
   /// initialization is completed.
   LocalVariableInitialization(VarDecl *decl,
-                              llvm::Optional<MarkUninitializedInst::Kind> kind,
+                              std::optional<MarkUninitializedInst::Kind> kind,
                               uint16_t ArgNo, bool generateDebugInfo,
                               SILGenFunction &SGF)
       : decl(decl) {
@@ -515,11 +554,14 @@ public:
     auto instanceType = SGF.SGM.Types.getLoweredRValueType(
         TypeExpansionContext::minimal(), decl->getTypeInContext());
 
-    // If we have a no implicit copy param decl, make our instance type
-    // @moveOnly.
-    if (!instanceType->isNoncopyable()) {
+
+    bool isNoImplicitCopy = instanceType->is<SILMoveOnlyWrappedType>();
+
+    // If our instance type is not already @moveOnly wrapped, and it's a
+    // no-implicit-copy parameter, wrap it.
+    if (!isNoImplicitCopy && !instanceType->isNoncopyable()) {
       if (auto *pd = dyn_cast<ParamDecl>(decl)) {
-        bool isNoImplicitCopy = pd->isNoImplicitCopy();
+        isNoImplicitCopy = pd->isNoImplicitCopy();
         isNoImplicitCopy |= pd->getSpecifier() == ParamSpecifier::Consuming;
         if (pd->isSelfParameter()) {
           auto *dc = pd->getDeclContext();
@@ -533,19 +575,21 @@ public:
       }
     }
 
+    const bool isCopyable = isNoImplicitCopy || !instanceType->isNoncopyable();
+
     auto boxType = SGF.SGM.Types.getContextBoxTypeForCapture(
         decl, instanceType, SGF.F.getGenericEnvironment(),
-        /*mutable*/ !instanceType->isNoncopyable() || !decl->isLet());
+        /*mutable=*/ isCopyable || !decl->isLet());
 
     // The variable may have its lifetime extended by a closure, heap-allocate
     // it using a box.
 
-    llvm::Optional<SILDebugVariable> DbgVar;
+    std::optional<SILDebugVariable> DbgVar;
     if (generateDebugInfo)
       DbgVar = SILDebugVariable(decl->isLet(), ArgNo);
     Box = SGF.B.createAllocBox(
-        decl, boxType, DbgVar, /*hasDynamicLifetime*/ false,
-        /*reflection*/ false, /*usesMoveableValueDebugInfo*/ false,
+        decl, boxType, DbgVar, DoesNotHaveDynamicLifetime,
+        /*reflection*/ false, DoesNotUseMoveableValueDebugInfo,
         !generateDebugInfo);
 
     // Mark the memory as uninitialized, so DI will track it for us.
@@ -564,11 +608,11 @@ public:
       // pointer to a box can be formed; and the box doesn't synchronize on
       // deinit.
       //
-      // Only add a lexical lifetime to the box if the the variable it stores
+      // Only add a lexical lifetime to the box if the variable it stores
       // requires one.
-      Box = SGF.B.createBeginBorrow(
-          decl, Box, /*isLexical=*/lifetime.isLexical(),
-          /*hasPointerEscape=*/false, /*fromVarDecl=*/true);
+      Box =
+          SGF.B.createBeginBorrow(decl, Box, IsLexical_t(lifetime.isLexical()),
+                                  DoesNotHavePointerEscape, IsFromVarDecl);
     }
 
     Addr = SGF.B.createProjectBox(decl, Box, 0);
@@ -689,7 +733,7 @@ public:
       // For noncopyable types, we always need to box them.
       needsTemporaryBuffer =
           (lowering->isAddressOnly() && SGF.silConv.useLoweredAddresses()) ||
-              lowering->getLoweredType().getASTType()->isNoncopyable();
+              lowering->getLoweredType().isMoveOnly(/*orWrapped=*/false);
     }
 
     // Make sure that we have a non-address only type when binding a
@@ -703,24 +747,25 @@ public:
       bool lexicalLifetimesEnabled =
           SGF.getASTContext().SILOpts.supportsLexicalLifetimes(SGF.getModule());
       auto lifetime = SGF.F.getLifetime(vd, lowering->getLoweredType());
-      auto isLexical = lexicalLifetimesEnabled && lifetime.isLexical();
-      address =
-          SGF.emitTemporaryAllocation(vd, lowering->getLoweredType(),
-                                      /*hasDynamicLifetime=*/false, isLexical);
+      auto isLexical =
+          IsLexical_t(lexicalLifetimesEnabled && lifetime.isLexical());
+      address = SGF.emitTemporaryAllocation(vd, lowering->getLoweredType(),
+                                            DoesNotHaveDynamicLifetime,
+                                            isLexical, IsFromVarDecl);
       if (isUninitialized)
         address = SGF.B.createMarkUninitializedVar(vd, address);
       DestroyCleanup = SGF.enterDormantTemporaryCleanup(address, *lowering);
       SGF.VarLocs[vd] = SILGenFunction::VarLoc::get(address);
-    } else if (!lowering->isTrivial()) {
-      // Push a cleanup to destroy the let declaration.  This has to be
-      // inactive until the variable is initialized: if control flow exits the
-      // before the value is bound, we don't want to destroy the value.
-      SGF.Cleanups.pushCleanupInState<DestroyLocalVariable>(
-                                                    CleanupState::Dormant, vd);
-      DestroyCleanup = SGF.Cleanups.getTopCleanup();
-    } else {
-      DestroyCleanup = CleanupHandle::invalid();
     }
+    // Push a cleanup to destroy the let declaration.  This has to be
+    // inactive until the variable is initialized: if control flow exits the
+    // before the value is bound, we don't want to destroy the value.
+    //
+    // Cleanups are required for all lexically scoped variables to delimite
+    // the variable scope, even if the cleanup does nothing.
+    SGF.Cleanups.pushCleanupInState<DestroyLocalVariable>(
+      CleanupState::Dormant, vd);
+    DestroyCleanup = SGF.Cleanups.getTopCleanup();
   }
 
   ~LetValueInitialization() override {
@@ -765,44 +810,26 @@ public:
                                             SplitCleanups);
   }
 
-  /// This is a helper method for bindValue that handles any changes to the
-  /// value needed for lexical lifetime or no implicit copy purposes.
+  /// This is a helper method for bindValue that creates a scopes operation for
+  /// the lexical variable lifetime and handles any changes to the value needed
+  /// for move-only values.
   SILValue getValueForLexicalLifetimeBinding(SILGenFunction &SGF,
                                              SILLocation PrologueLoc,
                                              SILValue value, bool wasPlusOne) {
-    // If we have none...
-    if (value->getOwnershipKind() == OwnershipKind::None) {
-      // Then check if we have a pure move only type. In that case, we need to
-      // insert a no implicit copy
-      if (value->getType().getASTType()->isNoncopyable()) {
-        value = SGF.B.createMoveValue(PrologueLoc, value, /*isLexical*/ true);
-        return SGF.B.createMarkUnresolvedNonCopyableValueInst(
-            PrologueLoc, value,
-            MarkUnresolvedNonCopyableValueInst::CheckKind::
-                ConsumableAndAssignable);
-      }
-
-      // Otherwise, if we don't have a no implicit copy trivial type, just
-      // return value.
-      if (!vd->isNoImplicitCopy() || !value->getType().isTrivial(SGF.F))
-        return value;
-
-      // Otherwise, we have a no implicit copy trivial type, so wrap it in the
-      // move only wrapper and mark it as needing checking by the move cherk.
-      value =
-          SGF.B.createOwnedCopyableToMoveOnlyWrapperValue(PrologueLoc, value);
-      value = SGF.B.createMoveValue(PrologueLoc, value, /*isLexical*/ true);
-      return SGF.B.createMarkUnresolvedNonCopyableValueInst(
-          PrologueLoc, value,
-          MarkUnresolvedNonCopyableValueInst::CheckKind::
-              ConsumableAndAssignable);
+    // TODO: emitPatternBindingInitialization creates fake local variables for
+    // metatypes within function_conversion expressions that operate on static
+    // functions. Creating SIL local variables for all these is impractical and
+    // undesirable. We need a better way of representing these "capture_list"
+    // locals in a way that doesn't produce SIL locals. For now, bypassing
+    // metatypes mostly avoids the issue, but it's not robust and doesn't allow
+    // SIL-level analysis of real metatype variables.
+    if (isa<MetatypeType>(value->getType().getASTType())) {
+      return value;
     }
 
-    // Otherwise, we need to perform some additional processing. First, if we
-    // have an owned moveonly value that had a cleanup, then create a move_value
-    // that acts as a consuming use of the value. The reason why we want this is
-    // even if we are only performing a borrow for our lexical lifetime, we want
-    // to ensure that our defs see this initialization as consuming this value.
+    // Preprocess an owned moveonly value that had a cleanup. Even if we are
+    // only performing a borrow for our lexical lifetime, this ensures that
+    // defs see this initialization as consuming this value.
     if (value->getOwnershipKind() == OwnershipKind::Owned &&
         value->getType().isMoveOnlyWrapped()) {
       assert(wasPlusOne);
@@ -813,52 +840,35 @@ public:
       value =
           SGF.B.createOwnedMoveOnlyWrapperToCopyableValue(PrologueLoc, value);
     }
-
-    // If we still have a trivial thing, just return that.
-    if (value->getType().isTrivial(SGF.F))
-      return value;
-
-    // Check if we have a move only type. In that case, we perform a lexical
-    // move and insert a mark_unresolved_non_copyable_value.
-    //
-    // We do this before the begin_borrow "normal" path below since move only
-    // types do not have no implicit copy attr on them.
-    if (value->getOwnershipKind() == OwnershipKind::Owned &&
-        value->getType().getASTType()->isNoncopyable()) {
-      value = SGF.B.createMoveValue(PrologueLoc, value, true /*isLexical*/);
-      return SGF.B.createMarkUnresolvedNonCopyableValueInst(
-          PrologueLoc, value,
-          MarkUnresolvedNonCopyableValueInst::CheckKind::
-              ConsumableAndAssignable);
+    auto isLexical =
+        IsLexical_t(SGF.F.getLifetime(vd, value->getType()).isLexical());
+    switch (value->getOwnershipKind()) {
+    case OwnershipKind::None:
+    case OwnershipKind::Owned:
+      value = SGF.B.createMoveValue(PrologueLoc, value, isLexical,
+                                    DoesNotHavePointerEscape, IsFromVarDecl);
+      break;
+    case OwnershipKind::Guaranteed:
+      value = SGF.B.createBeginBorrow(PrologueLoc, value, isLexical,
+                                      DoesNotHavePointerEscape, IsFromVarDecl);
+      break;
+    case OwnershipKind::Unowned:
+    case OwnershipKind::Any:
+      llvm_unreachable("unexpected ownership");
     }
-
-    // If we have a no implicit copy lexical, emit the instruction stream so
-    // that the move checker knows to check this variable.
     if (vd->isNoImplicitCopy()) {
-      value = SGF.B.createMoveValue(PrologueLoc, value, /*isLexical*/ true,
-                                    /*hasPointerEscape=*/false,
-                                    /*fromVarDecl=*/true);
       value =
           SGF.B.createOwnedCopyableToMoveOnlyWrapperValue(PrologueLoc, value);
-      return SGF.B.createMarkUnresolvedNonCopyableValueInst(
-          PrologueLoc, value,
-          MarkUnresolvedNonCopyableValueInst::CheckKind::
-              ConsumableAndAssignable);
+      // fall-through to the owned move-only case...
     }
-
-    // Otherwise, if we do not have a no implicit copy variable, just follow
-    // the "normal path".
-
-    auto isLexical = SGF.F.getLifetime(vd, value->getType()).isLexical();
-
-    if (value->getOwnershipKind() == OwnershipKind::Owned)
-      return SGF.B.createMoveValue(PrologueLoc, value, /*isLexical*/ isLexical,
-                                   /*hasPointerEscape=*/false,
-                                   /*fromVarDecl=*/true);
-
-    return SGF.B.createBeginBorrow(PrologueLoc, value, /*isLexical*/ isLexical,
-                                   /*hasPointerEscape=*/false,
-                                   /*fromVarDecl=*/true);
+    if (value->getType().isMoveOnly(/*orWrapped=*/true)
+        && value->getOwnershipKind() == OwnershipKind::Owned) {
+      value = SGF.B.createMarkUnresolvedNonCopyableValueInst(
+        PrologueLoc, value,
+        MarkUnresolvedNonCopyableValueInst::CheckKind::
+        ConsumableAndAssignable);
+    }
+    return value;
   }
 
   void bindValue(SILValue value, SILGenFunction &SGF, bool wasPlusOne,
@@ -1228,8 +1238,8 @@ void EnumElementPatternInitialization::emitEnumMatch(
         CanType substEltTy =
             value.getType()
                 .getASTType()
-                ->getTypeOfMember(SGF.SGM.M.getSwiftModule(), eltDecl,
-                                  eltDecl->getArgumentInterfaceType())
+                ->getTypeOfMember(eltDecl,
+                                  eltDecl->getPayloadInterfaceType())
                 ->getCanonicalType();
 
         AbstractionPattern origEltTy =
@@ -1480,14 +1490,14 @@ SILGenFunction::emitInitializationForVarDecl(VarDecl *vd, bool forceImmutable,
     RegularLocation loc(vd);
     loc.markAutoGenerated();
     B.createAllocGlobal(loc, silG);
-    SILValue addr = B.createGlobalAddr(loc, silG);
+    SILValue addr = B.createGlobalAddr(loc, silG, /*dependencyToken=*/ SILValue());
     if (isUninitialized)
       addr = B.createMarkUninitializedVar(loc, addr);
 
     VarLocs[vd] = SILGenFunction::VarLoc::get(addr);
     Result = InitializationPtr(new KnownAddressInitialization(addr));
   } else {
-    llvm::Optional<MarkUninitializedInst::Kind> uninitKind;
+    std::optional<MarkUninitializedInst::Kind> uninitKind;
     if (isUninitialized) {
       uninitKind = MarkUninitializedInst::Kind::Var;
     }
@@ -1677,17 +1687,26 @@ emitVersionLiterals(SILLocation loc, SILGenBuilder &B, ASTContext &ctx,
 /// the specified version range and 0 otherwise. The returned SILValue
 /// (which has type Builtin.Int1) represents the result of this check.
 SILValue SILGenFunction::emitOSVersionRangeCheck(SILLocation loc,
-                                                 const VersionRange &range) {
+                                                 const VersionRange &range,
+                                                 bool forTargetVariant) {
   // Emit constants for the checked version range.
   SILValue majorValue;
   SILValue minorValue;
   SILValue subminorValue;
+
   std::tie(majorValue, minorValue, subminorValue) =
       emitVersionLiterals(loc, B, getASTContext(), range.getLowerEndpoint());
 
   // Emit call to _stdlib_isOSVersionAtLeast(major, minor, patch)
   FuncDecl *versionQueryDecl =
       getASTContext().getIsOSVersionAtLeastDecl();
+
+  // When targeting macCatalyst, the version number will be an iOS version number
+  // and so we call a variant of the query function that understands iOS
+  // versions.
+  if (forTargetVariant)
+    versionQueryDecl = getASTContext().getIsVariantOSVersionAtLeastDecl();
+
   assert(versionQueryDecl);
 
   auto silDeclRef = SILDeclRef(versionQueryDecl);
@@ -1698,6 +1717,129 @@ SILValue SILGenFunction::emitOSVersionRangeCheck(SILLocation loc,
   return B.createApply(loc, availabilityGTEFn, SubstitutionMap(), args);
 }
 
+SILValue SILGenFunction::emitOSVersionOrVariantVersionRangeCheck(
+    SILLocation loc, const VersionRange &targetRange,
+    const VersionRange &variantRange) {
+  SILValue targetMajorValue;
+  SILValue targetMinorValue;
+  SILValue targetSubminorValue;
+
+  const llvm::VersionTuple &targetVersion = targetRange.getLowerEndpoint();
+  std::tie(targetMajorValue, targetMinorValue, targetSubminorValue) =
+      emitVersionLiterals(loc, B, getASTContext(), targetVersion);
+
+  SILValue variantMajorValue;
+  SILValue variantMinorValue;
+  SILValue variantSubminorValue;
+
+  const llvm::VersionTuple &variantVersion = variantRange.getLowerEndpoint();
+  std::tie(variantMajorValue, variantMinorValue, variantSubminorValue) =
+      emitVersionLiterals(loc, B, getASTContext(), variantVersion);
+
+  FuncDecl *versionQueryDecl =
+    getASTContext().getIsOSVersionAtLeastOrVariantVersionAtLeast();
+
+  assert(versionQueryDecl);
+
+  auto silDeclRef = SILDeclRef(versionQueryDecl);
+  SILValue availabilityGTEFn = emitGlobalFunctionRef(
+      loc, silDeclRef, getConstantInfo(getTypeExpansionContext(), silDeclRef));
+
+  SILValue args[] = {
+      targetMajorValue,
+      targetMinorValue,
+      targetSubminorValue,
+      variantMajorValue,
+      variantMinorValue,
+      variantSubminorValue
+  };
+  return B.createApply(loc, availabilityGTEFn, SubstitutionMap(), args);
+}
+
+SILValue SILGenFunction::emitZipperedOSVersionRangeCheck(
+    SILLocation loc, const VersionRange &targetRange,
+    const VersionRange &variantRange) {
+  assert(getASTContext().LangOpts.TargetVariant);
+
+  VersionRange OSVersion = targetRange;
+  VersionRange VariantOSVersion = variantRange;
+
+  // We're building zippered, so we need to pass both macOS and iOS
+  // versions to the the runtime version range check. At run time
+  // that check will determine what kind of process this code is loaded
+  // into. In a macOS process it will use the macOS version; in an
+  // macCatalyst process it will use the iOS version.
+  llvm::Triple VariantTriple = *getASTContext().LangOpts.TargetVariant;
+  llvm::Triple TargetTriple = getASTContext().LangOpts.Target;
+
+  // From perspective of the driver and most of the frontend,
+  // -target and -target-variant are symmetric. That is, the user
+  // can pass either:
+  //    -target x86_64-apple-macosx10.15 \
+  //    -target-variant x86_64-apple-ios13.1-macabi
+  // or:
+  //    -target x86_64-apple-ios13.1-macabi \
+  //    -target-variant x86_64-apple-macosx10.15
+  //
+  // However, the runtime availability-checking entry points need
+  // to compare against an actual running OS version and so can't be
+  // symmetric. Here we standardize on "target" means macOS version
+  // and "targetVariant" means iOS version.
+  if (tripleIsMacCatalystEnvironment(TargetTriple)) {
+    assert(VariantTriple.isMacOSX());
+    // Normalize so that "variant" always means iOS version.
+    std::swap(OSVersion, VariantOSVersion);
+    std::swap(TargetTriple, VariantTriple);
+  }
+
+  // If there is no check for either the target platform
+  // or the target-variant platform then the condition is
+  // trivially true.
+  if (OSVersion.isAll() && VariantOSVersion.isAll()) {
+    SILType i1 = SILType::getBuiltinIntegerType(1, getASTContext());
+    return B.createIntegerLiteral(loc, i1, true);
+  }
+
+  // The variant-only availability-checking entrypoint is not part
+  // of the Swift 5.0 ABI. It is only available in macOS 10.15 and above.
+  bool isVariantEntrypointAvailable = !TargetTriple.isMacOSXVersionLT(10, 15);
+
+  // If there is no check for the target but there is for the
+  // variant, then we only need to emit code for the variant check.
+  if (isVariantEntrypointAvailable && OSVersion.isAll() &&
+      !VariantOSVersion.isAll())
+    return emitOSVersionRangeCheck(loc, VariantOSVersion,
+                                   /*forVariant*/ true);
+
+  // Similarly, if there is a check for the target but not for the
+  // target variant then we only to emit code for the target check.
+  if (!OSVersion.isAll() && VariantOSVersion.isAll())
+    return emitOSVersionRangeCheck(loc, OSVersion,
+                                   /*forVariant*/ false);
+
+  if (!isVariantEntrypointAvailable ||
+      (!OSVersion.isAll() && !VariantOSVersion.isAll())) {
+
+    // If the variant-only entrypoint isn't available (as is the
+    // case pre-macOS 10.15) we need to use the zippered entrypoint
+    // (which is part of the Swift 5.0 ABI) even when the macOS version
+    // is '*' (all).
+    // In this case, use the minimum macOS deployment version from
+    // the target triple. This ensures the check always passes on macOS.
+    if (!isVariantEntrypointAvailable && OSVersion.isAll()) {
+      assert(TargetTriple.isMacOSX());
+
+      llvm::VersionTuple macosVersion;
+      TargetTriple.getMacOSXVersion(macosVersion);
+      OSVersion = VersionRange::allGTE(macosVersion);
+    }
+
+    return emitOSVersionOrVariantVersionRangeCheck(loc, OSVersion,
+                                                   VariantOSVersion);
+  }
+
+  llvm_unreachable("Unhandled zippered configuration");
+}
 
 /// Emit the boolean test and/or pattern bindings indicated by the specified
 /// stmt condition.  If the condition fails, control flow is transferred to the
@@ -1721,8 +1863,7 @@ void SILGenFunction::emitStmtCondition(StmtCondition Cond, JumpDest FalseDest,
           // Begin a new binding scope, which is popped when the next innermost debug
           // scope ends. The cleanup location loc isn't the perfect source location
           // but it's close enough.
-          B.getSILGenFunction().enterDebugScope(loc,
-                                                      /*isBindingScope=*/true);
+          B.getSILGenFunction().enterDebugScope(loc, /*isBindingScope=*/true);
         InitializationPtr initialization =
           emitPatternBindingInitialization(elt.getPattern(), FalseDest);
 
@@ -1748,12 +1889,28 @@ void SILGenFunction::emitStmtCondition(StmtCondition Cond, JumpDest FalseDest,
       // specified by elt.
       PoundAvailableInfo *availability = elt.getAvailability();
       VersionRange OSVersion = availability->getAvailableRange();
-      
+
       // The OS version might be left empty if availability checking was
       // disabled. Treat it as always-true in that case.
       assert(!OSVersion.isEmpty()
              || getASTContext().LangOpts.DisableAvailabilityChecking);
-        
+
+      if (getASTContext().LangOpts.TargetVariant &&
+          !getASTContext().LangOpts.DisableAvailabilityChecking) {
+        // We're building zippered, so we need to pass both macOS and iOS
+        // versions to the the runtime version range check. At run time
+        // that check will determine what kind of process this code is loaded
+        // into. In a macOS process it will use the macOS version; in an
+        // macCatalyst process it will use the iOS version.
+
+        VersionRange VariantOSVersion =
+            elt.getAvailability()->getVariantAvailableRange();
+        assert(!VariantOSVersion.isEmpty());
+        booleanTestValue =
+            emitZipperedOSVersionRangeCheck(loc, OSVersion, VariantOSVersion);
+        break;
+      }
+
       if (OSVersion.isEmpty() || OSVersion.isAll()) {
         // If there's no check for the current platform, this condition is
         // trivially true  (or false, for unavailability).
@@ -1761,7 +1918,10 @@ void SILGenFunction::emitStmtCondition(StmtCondition Cond, JumpDest FalseDest,
         bool value = !availability->isUnavailability();
         booleanTestValue = B.createIntegerLiteral(loc, i1, value);
       } else {
-        booleanTestValue = emitOSVersionRangeCheck(loc, OSVersion);
+        bool isMacCatalyst =
+            tripleIsMacCatalystEnvironment(getASTContext().LangOpts.Target);
+        booleanTestValue = emitOSVersionRangeCheck(loc, OSVersion,
+                                                   isMacCatalyst);
         if (availability->isUnavailability()) {
           // If this is an unavailability check, invert the result
           // by emitting a call to Builtin.xor_Int1(lhs, -1).
@@ -1993,7 +2153,7 @@ CleanupHandle SILGenFunction::enterAsyncLetCleanup(SILValue alet,
 
 /// Create a LocalVariableInitialization for the uninitialized var.
 InitializationPtr SILGenFunction::emitLocalVariableWithCleanup(
-    VarDecl *vd, llvm::Optional<MarkUninitializedInst::Kind> kind,
+    VarDecl *vd, std::optional<MarkUninitializedInst::Kind> kind,
     unsigned ArgNo, bool generateDebugInfo) {
   return InitializationPtr(new LocalVariableInitialization(
       vd, kind, ArgNo, generateDebugInfo, *this));
@@ -2137,23 +2297,37 @@ void SILGenFunction::destroyLocalVariable(SILLocation silLoc, VarDecl *vd) {
 
   assert(VarLocs.count(vd) && "var decl wasn't emitted?!");
 
+  auto emitEndBorrow = [this, silLoc](SILValue value){
+    if (value->getOwnershipKind() == OwnershipKind::None) {
+      B.createExtendLifetime(silLoc, value);
+    } else {
+      B.createEndBorrow(silLoc, value);
+    }
+  };
+
+  auto emitDestroy = [this, silLoc](SILValue value){
+    if (value->getOwnershipKind() == OwnershipKind::None) {
+      B.createExtendLifetime(silLoc, value);
+    } else {
+      B.emitDestroyValueOperation(silLoc, value);
+    }
+  };
+
   auto loc = VarLocs[vd];
 
   // For a heap variable, the box is responsible for the value. We just need
   // to give up our retain count on it.
-  if (loc.box) {
+  if (auto boxValue = loc.box) {
     if (!getASTContext().SILOpts.supportsLexicalLifetimes(getModule())) {
-      B.emitDestroyValueOperation(silLoc, loc.box);
+      emitDestroy(boxValue);
       return;
     }
 
-    if (auto *bbi = dyn_cast<BeginBorrowInst>(loc.box)) {
-      B.createEndBorrow(silLoc, bbi);
-      B.emitDestroyValueOperation(silLoc, bbi->getOperand());
-      return;
+    if (auto *bbi = dyn_cast<BeginBorrowInst>(boxValue)) {
+      emitEndBorrow(bbi);
+      boxValue = bbi->getOperand();
     }
-
-    B.emitDestroyValueOperation(silLoc, loc.box);
+    emitDestroy(boxValue);
     return;
   }
 
@@ -2167,11 +2341,14 @@ void SILGenFunction::destroyLocalVariable(SILLocation silLoc, VarDecl *vd) {
   }
 
   if (!getASTContext().SILOpts.supportsLexicalLifetimes(getModule())) {
-    B.emitDestroyValueOperation(silLoc, Val);
+    emitDestroy(Val);
     return;
   }
 
-  if (Val->getOwnershipKind() == OwnershipKind::None) {
+  // If no variable scope was emitted, then we might not have a defining
+  // instruction.
+  if (!Val.getDefiningInstruction()) {
+    emitDestroy(Val);
     return;
   }
 
@@ -2179,61 +2356,57 @@ void SILGenFunction::destroyLocalVariable(SILLocation silLoc, VarDecl *vd) {
   // + begin_borrow. In either case we just need to end the lifetime of the
   // begin_borrow's operand.
   if (auto *bbi = dyn_cast<BeginBorrowInst>(Val.getDefiningInstruction())) {
-    B.createEndBorrow(silLoc, bbi);
-    B.emitDestroyValueOperation(silLoc, bbi->getOperand());
+    emitEndBorrow(bbi);
+    emitDestroy(bbi->getOperand());
     return;
   }
 
   if (auto *mvi = dyn_cast<MoveValueInst>(Val.getDefiningInstruction())) {
-    B.emitDestroyValueOperation(silLoc, mvi);
+    emitDestroy(mvi);
     return;
   }
 
-  if (auto *mvi = dyn_cast<MarkUnresolvedNonCopyableValueInst>(
+  // Handle BeginBorrow and MoveValue before bailing-out on trivial values.
+  if (Val->getOwnershipKind() == OwnershipKind::None) {
+    return;
+  }
+
+  if (auto *mark = dyn_cast<MarkUnresolvedNonCopyableValueInst>(
           Val.getDefiningInstruction())) {
-    if (mvi->hasMoveCheckerKind()) {
-      if (auto *cvi = dyn_cast<CopyValueInst>(mvi->getOperand())) {
+    if (mark->hasMoveCheckerKind()) {
+      if (auto *cvi = dyn_cast<CopyValueInst>(mark->getOperand())) {
         if (auto *bbi = dyn_cast<BeginBorrowInst>(cvi->getOperand())) {
-          if (bbi->isLexical()) {
-            B.emitDestroyValueOperation(silLoc, mvi);
-            B.createEndBorrow(silLoc, bbi);
-            B.emitDestroyValueOperation(silLoc, bbi->getOperand());
-            return;
-          }
+          emitDestroy(mark);
+          emitEndBorrow(bbi);
+          emitDestroy(bbi->getOperand());
+          return;
         }
       }
 
       if (auto *copyToMove = dyn_cast<CopyableToMoveOnlyWrapperValueInst>(
-              mvi->getOperand())) {
-        if (auto *move = dyn_cast<MoveValueInst>(copyToMove->getOperand())) {
-          if (move->isLexical()) {
-            B.emitDestroyValueOperation(silLoc, mvi);
-            return;
-          }
+              mark->getOperand())) {
+        if (copyToMove->getOperand()->isFromVarDecl()) {
+          emitDestroy(mark);
+          return;
         }
       }
 
-      if (auto *cvi = dyn_cast<ExplicitCopyValueInst>(mvi->getOperand())) {
+      if (auto *cvi = dyn_cast<ExplicitCopyValueInst>(mark->getOperand())) {
         if (auto *bbi = dyn_cast<BeginBorrowInst>(cvi->getOperand())) {
-          if (bbi->isLexical()) {
-            B.emitDestroyValueOperation(silLoc, mvi);
-            B.createEndBorrow(silLoc, bbi);
-            B.emitDestroyValueOperation(silLoc, bbi->getOperand());
-            return;
-          }
+          emitDestroy(mark);
+          emitEndBorrow(bbi);
+          emitDestroy(bbi->getOperand());
+          return;
         }
       }
 
       // Handle trivial arguments.
-      if (auto *move = dyn_cast<MoveValueInst>(mvi->getOperand())) {
-        if (move->isLexical()) {
-          B.emitDestroyValueOperation(silLoc, mvi);
-          return;
-        }
+      if (auto *move = dyn_cast<MoveValueInst>(mark->getOperand())) {
+        emitDestroy(mark);
+        return;
       }
     }
-  }
-
+  }  
   llvm_unreachable("unhandled case");
 }
 

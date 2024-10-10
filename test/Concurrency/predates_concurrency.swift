@@ -1,7 +1,7 @@
 // RUN: %target-swift-frontend -disable-availability-checking %s -emit-sil -o /dev/null -verify -verify-additional-prefix minimal-targeted-
 // RUN: %target-swift-frontend -disable-availability-checking %s -emit-sil -o /dev/null -verify -strict-concurrency=targeted -verify-additional-prefix minimal-targeted-
 // RUN: %target-swift-frontend -disable-availability-checking %s -emit-sil -o /dev/null -verify -strict-concurrency=complete -verify-additional-prefix complete-tns-
-// RUN: %target-swift-frontend -disable-availability-checking %s -emit-sil -o /dev/null -verify -strict-concurrency=complete -enable-experimental-feature RegionBasedIsolation -verify-additional-prefix complete-tns-
+// RUN: %target-swift-frontend -disable-availability-checking %s -emit-sil -o /dev/null -verify -strict-concurrency=complete -enable-upcoming-feature RegionBasedIsolation -verify-additional-prefix complete-tns-
 
 // REQUIRES: concurrency
 // REQUIRES: asserts
@@ -73,13 +73,15 @@ func testElsewhere(x: X) {
 // expected-complete-tns-note @-1 {{calls to global function 'onMainActorAlways()' from outside of its actor context are implicitly asynchronous}}
 
 @preconcurrency @MainActor class MyModelClass {
-  // expected-complete-tns-note @-1 {{calls to initializer 'init()' from outside of its actor context are implicitly asynchronous}}
+
+  // default init() is 'nonisolated' in '-strict-concurrency=complete'
+
   func f() { }
   // expected-complete-tns-note @-1 {{calls to instance method 'f()' from outside of its actor context are implicitly asynchronous}}
 }
 
 func testCalls(x: X) {
-  // expected-complete-tns-note @-1 3{{add '@MainActor' to make global function 'testCalls(x:)' part of global actor 'MainActor'}}
+  // expected-complete-tns-note @-1 2{{add '@MainActor' to make global function 'testCalls(x:)' part of global actor 'MainActor'}}
   unsafelyMainActorClosure {
     onMainActor()
   }
@@ -102,9 +104,10 @@ func testCalls(x: X) {
   // Ok with minimal/targeted concurrency, Not ok with complete.
   let _: () -> Void = onMainActorAlways // expected-complete-tns-warning {{converting function value of type '@MainActor () -> ()' to '() -> Void' loses global actor 'MainActor'}}
 
-  // both okay with minimal/targeted... an error with complete.
-  let c = MyModelClass() // expected-complete-tns-error {{call to main actor-isolated initializer 'init()' in a synchronous nonisolated context}}
-  c.f() // expected-complete-tns-error {{call to main actor-isolated instance method 'f()' in a synchronous nonisolated context}}
+  let c = MyModelClass()
+
+  // okay with minimal/targeted... an error with complete.
+  c.f() // expected-complete-tns-warning {{call to main actor-isolated instance method 'f()' in a synchronous nonisolated context}}
 }
 
 func testCallsWithAsync() async {
@@ -113,8 +116,9 @@ func testCallsWithAsync() async {
 
   let _: () -> Void = onMainActorAlways // expected-warning {{converting function value of type '@MainActor () -> ()' to '() -> Void' loses global actor 'MainActor'}}
 
-  let c = MyModelClass() // expected-warning{{expression is 'async' but is not marked with 'await'}}
-  // expected-note@-1{{calls to initializer 'init()' from outside of its actor context are implicitly asynchronous}}
+  let c = MyModelClass() // expected-minimal-targeted-warning{{expression is 'async' but is not marked with 'await'}}
+  // expected-minimal-targeted-note@-1{{calls to initializer 'init()' from outside of its actor context are implicitly asynchronous}}
+
   c.f() // expected-warning{{expression is 'async' but is not marked with 'await'}}
   // expected-note@-1{{calls to instance method 'f()' from outside of its actor context are implicitly asynchronous}}
 }
@@ -207,3 +211,152 @@ class C { // expected-complete-tns-note {{'C' does not conform to the 'Sendable'
   }
 }
 
+@preconcurrency @MainActor
+class MainActorPreconcurrency {}
+
+class InferMainActorPreconcurrency: MainActorPreconcurrency {
+  static func predatesConcurrency() {}
+  // expected-note@-1 {{calls to static method 'predatesConcurrency()' from outside of its actor context are implicitly asynchronous}}
+  // expected-note@-2 {{main actor isolation inferred from inheritance from class 'MainActorPreconcurrency'}}
+}
+
+nonisolated func blah() {
+  InferMainActorPreconcurrency.predatesConcurrency()
+  // expected-warning@-1 {{call to main actor-isolated static method 'predatesConcurrency()' in a synchronous nonisolated context}}
+}
+
+protocol NotIsolated {
+  func requirement()
+  // expected-complete-tns-note@-1 {{mark the protocol requirement 'requirement()' 'async' to allow actor-isolated conformances}}
+}
+
+extension MainActorPreconcurrency: NotIsolated {
+  // expected-complete-note@-1{{add '@preconcurrency' to the 'NotIsolated' conformance to suppress isolation-related diagnostics}}{{36-36=@preconcurrency }}
+  // expected-complete-tns-note@-2{{add '@preconcurrency' to the 'NotIsolated' conformance to defer isolation checking to run time}}{{36-36=@preconcurrency }}
+
+  func requirement() {}
+  // expected-complete-tns-warning@-1 {{main actor-isolated instance method 'requirement()' cannot be used to satisfy nonisolated protocol requirement}}
+  // expected-complete-tns-note@-2 {{add 'nonisolated' to 'requirement()' to make this instance method not isolated to the actor}}
+  // expected-complete-tns-note@-3 {{calls to instance method 'requirement()' from outside of its actor context are implicitly asynchronous}}
+
+
+  class Nested {
+    weak var c: MainActorPreconcurrency?
+
+    func test() {
+    // expected-complete-tns-note@-1 {{add '@MainActor' to make instance method 'test()' part of global actor 'MainActor'}}
+
+      if let c {
+        c.requirement()
+        // expected-complete-tns-warning@-1 {{call to main actor-isolated instance method 'requirement()' in a synchronous nonisolated context}}
+      }
+    }
+  }
+}
+
+// Override matching with @preconcurrency properties.
+do {
+  class Base {
+    @preconcurrency
+    open var test1 : ([any Sendable])? // expected-note {{overridden declaration is here}}
+
+    @preconcurrency
+    open var test2: [String: [Int: any Sendable]] // expected-note {{overridden declaration is here}}
+
+    @preconcurrency
+    open var test3: any Sendable // expected-note {{overridden declaration is here}}
+
+    @preconcurrency
+    open var test4: (((Any)?) -> Void)? { // expected-note {{overridden declaration is here}}
+      nil
+    }
+
+    @preconcurrency
+    open var test5: (@MainActor () -> Void)? { // expected-note {{overridden declaration is here}}
+      nil
+    }
+
+    open var test6: (@MainActor () -> Void)? { // expected-note {{attempt to override property here}}
+      nil
+    }
+
+    @preconcurrency
+    func test7(_: (@MainActor () -> Void)? = nil) { // expected-note {{overridden declaration is here}}
+    }
+
+    init() {
+      self.test1 = nil
+      self.test2 = [:]
+      self.test3 = 42
+    }
+  }
+
+  class Test : Base {
+    override var test1: [Any]? {
+      // expected-warning@-1 {{declaration 'test1' has a type with different sendability from any potential overrides; this is an error in the Swift 6 language mode}}
+      get { nil }
+      set { }
+    }
+
+    override var test2: [String: [Int: Any]] {
+      // expected-warning@-1 {{declaration 'test2' has a type with different sendability from any potential overrides; this is an error in the Swift 6 language mode}}
+      get { [:] }
+      set {}
+    }
+
+    override var test3: Any {
+      // expected-warning@-1 {{declaration 'test3' has a type with different sendability from any potential overrides; this is an error in the Swift 6 language mode}}
+      get { 42 }
+      set { }
+    }
+
+    override var test4: (((any Sendable)?) -> Void)? {
+      // expected-warning@-1 {{declaration 'test4' has a type with different sendability from any potential overrides; this is an error in the Swift 6 language mode}}
+      nil
+    }
+
+    override var test5: (() -> Void)? {
+      // expected-warning@-1 {{declaration 'test5' has a type with different global actor isolation from any potential overrides; this is an error in the Swift 6 language mode}}
+      nil
+    }
+
+    override var test6: (() -> Void)? {
+      // expected-error@-1 {{property 'test6' with type '(() -> Void)?' cannot override a property with type '(@MainActor () -> Void)?'}}
+      nil
+    }
+
+    override func test7(_: (() -> Void)?) {
+      // expected-warning@-1 {{declaration 'test7' has a type with different global actor isolation from any potential overrides; this is an error in the Swift 6 language mode}}
+    }
+  }
+}
+
+// rdar://132700409 - coercion PartialKeyPath & Sendable -> PartialKeyPath crashes in CSApply
+do {
+  struct Test {
+    enum KeyPath {
+      static var member: PartialKeyPath<Test> {
+        fatalError()
+      }
+    }
+  }
+
+  struct KeyPathComparator<Compared> {
+    @preconcurrency public let keyPath: any PartialKeyPath<Compared> & Sendable
+
+    func testDirect() {
+      switch keyPath { // Ok
+      case Test.KeyPath.member: break // Ok
+      default: break
+      }
+    }
+
+    func testErasure() {
+      let kp: PartialKeyPath<Compared> = keyPath
+      switch kp { // Ok
+      case Test.KeyPath.member: break // Ok
+      default: break
+      }
+    }
+  }
+}

@@ -43,8 +43,14 @@ public struct AddExtensionMacro: ExtensionMacro {
   ) throws -> [ExtensionDeclSyntax] {
     let typeName = declaration.declGroupName
     return protocols.map {
-      ("extension \(typeName): \($0) { }" as DeclSyntax)
-        .cast(ExtensionDeclSyntax.self)
+      ("""
+      extension \(typeName): \($0) {
+        struct _Extension_\($0): \($0) {
+          var nested = 8
+        }
+      }
+      """ as DeclSyntax)
+      .cast(ExtensionDeclSyntax.self)
     } + [
     ("""
     extension \(typeName) {
@@ -52,6 +58,23 @@ public struct AddExtensionMacro: ExtensionMacro {
     }
     """ as DeclSyntax).cast(ExtensionDeclSyntax.self)
     ]
+  }
+}
+
+public struct AddSpecificExtensionMacro: ExtensionMacro {
+  public static func expansion(
+    of node: AttributeSyntax,
+    attachedTo declaration: some DeclGroupSyntax,
+    providingExtensionsOf type: some TypeSyntaxProtocol,
+    conformingTo protocols: [TypeSyntax],
+    in context: some MacroExpansionContext
+  ) throws -> [ExtensionDeclSyntax] {
+    var extensions = [ExtensionDeclSyntax]()
+    let protocolNames = Set(protocols.compactMap { $0.as(IdentifierTypeSyntax.self)?.name.text })
+    if protocolNames.contains("MyProto") {
+        extensions.append(try ExtensionDeclSyntax("extension \(type.trimmed): MyProto") { })
+    }
+    return extensions
   }
 }
 

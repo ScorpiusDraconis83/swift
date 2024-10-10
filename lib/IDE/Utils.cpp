@@ -12,6 +12,7 @@
 
 #include "swift/IDE/Utils.h"
 #include "swift/AST/SourceFile.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Edit.h"
 #include "swift/Basic/Platform.h"
 #include "swift/Basic/SourceManager.h"
@@ -658,6 +659,7 @@ adjustMacroExpansionWhitespace(GeneratedSourceInfo::Kind kind,
   case GeneratedSourceInfo::BodyMacroExpansion:
   case GeneratedSourceInfo::ReplacedFunctionBody:
   case GeneratedSourceInfo::PrettyPrinted:
+  case GeneratedSourceInfo::DefaultArgument:
     return expandedCode;
   }
 }
@@ -706,9 +708,8 @@ void swift::ide::SourceEditConsumer::acceptMacroExpansionBuffer(
       containingSF->getParentModule()->getSourceFileContainingLocation(
           originalSourceRange.getStart());
   StringRef originalPath;
-  if (originalFile->getBufferID().has_value() &&
-      containingSF->getBufferID() != originalFile->getBufferID()) {
-    originalPath = SM.getIdentifierForBuffer(*originalFile->getBufferID());
+  if (containingSF->getBufferID() != originalFile->getBufferID()) {
+    originalPath = SM.getIdentifierForBuffer(originalFile->getBufferID());
   }
 
   StringRef bufferName;

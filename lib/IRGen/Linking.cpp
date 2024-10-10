@@ -19,6 +19,7 @@
 #include "IRGenModule.h"
 #include "swift/AST/ASTMangler.h"
 #include "swift/AST/IRGenOptions.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "swift/SIL/SILGlobalVariable.h"
 #include "swift/SIL/FormalLinkage.h"
@@ -97,7 +98,7 @@ LinkEntity LinkEntity::forSILGlobalVariable(SILGlobalVariable *G,
   LinkEntity entity;
   entity.Pointer = G;
   entity.SecondaryPointer = nullptr;
-  auto kind = (G->isInitializedObject() && IGM.canMakeStaticObjectsReadOnly() ?
+  auto kind = (G->isInitializedObject() && IGM.canMakeStaticObjectReadOnly(G->getLoweredType()) ?
                 Kind::ReadOnlyGlobalObject : Kind::SILGlobalVariable);
   entity.Data = unsigned(kind) << KindShift;
   return entity;
@@ -346,7 +347,7 @@ std::string LinkEntity::mangleAsString() const {
     return mangler.mangleFieldOffset(getDecl());
 
   case Kind::ProtocolWitnessTable:
-    return mangler.mangleWitnessTable(getRootProtocolConformance());
+    return mangler.mangleWitnessTable(getProtocolConformance());
 
   case Kind::GenericProtocolWitnessTableInstantiationFunction:
     return mangler.mangleGenericProtocolWitnessTableInstantiationFunction(
@@ -518,12 +519,21 @@ std::string LinkEntity::mangleAsString() const {
   }
 
   case Kind::DistributedAccessor: {
-    std::string Result(getSILFunction()->getName());
+    std::string Result = getSILDeclRef().mangle();
     Result.append("TF");
     return Result;
   }
 
   case Kind::AccessibleFunctionRecord: {
+    auto DC = getSILFunction()->getDeclContext();
+
+    auto thunk = dyn_cast<AbstractFunctionDecl>(DC);
+    if (thunk && thunk->isDistributedThunk()) {
+      IRGenMangler mangler;
+      return mangler.mangleDistributedThunkRecord(thunk);
+    }
+
+    // Otherwise use the default mangling: just the function name
     std::string Result(getSILFunction()->getName());
     Result.append("HF");
     return Result;
@@ -545,6 +555,7 @@ SILDeclRef::Kind LinkEntity::getSILDeclRefKind() const {
   switch (getKind()) {
   case Kind::DispatchThunk:
   case Kind::MethodDescriptor:
+  case Kind::DistributedAccessor:
     return SILDeclRef::Kind::Func;
   case Kind::DispatchThunkInitializer:
   case Kind::MethodDescriptorInitializer:
@@ -562,7 +573,10 @@ SILDeclRef::Kind LinkEntity::getSILDeclRefKind() const {
 }
 
 SILDeclRef LinkEntity::getSILDeclRef() const {
-  return SILDeclRef(const_cast<ValueDecl *>(getDecl()), getSILDeclRefKind());
+  auto ref = SILDeclRef(const_cast<ValueDecl *>(getDecl()), getSILDeclRefKind());
+  if (getKind() == Kind::DistributedAccessor)
+    return ref.asDistributed();
+  return ref;
 }
 
 SILLinkage LinkEntity::getLinkage(ForDefinition_t forDefinition) const {
@@ -629,6 +643,9 @@ SILLinkage LinkEntity::getLinkage(ForDefinition_t forDefinition) const {
     return SILLinkage::Shared;
 
   case Kind::TypeMetadata: {
+    if (isForcedShared())
+      return SILLinkage::Shared;
+
     auto *nominal = getType().getAnyNominal();
     switch (getMetadataAddress()) {
     case TypeMetadataAddress::FullMetadata:
@@ -673,6 +690,8 @@ SILLinkage LinkEntity::getLinkage(ForDefinition_t forDefinition) const {
     switch (getTypeMetadataAccessStrategy(getType())) {
     case MetadataAccessStrategy::PublicUniqueAccessor:
       return getSILLinkage(FormalLinkage::PublicUnique, forDefinition);
+    case MetadataAccessStrategy::PackageUniqueAccessor:
+      return getSILLinkage(FormalLinkage::PackageUnique, forDefinition);
     case MetadataAccessStrategy::HiddenUniqueAccessor:
       return getSILLinkage(FormalLinkage::HiddenUnique, forDefinition);
     case MetadataAccessStrategy::PrivateAccessor:
@@ -724,7 +743,8 @@ SILLinkage LinkEntity::getLinkage(ForDefinition_t forDefinition) const {
       assert(linkage != FormalLinkage::PublicNonUnique &&
             "Cannot have a resilient class with non-unique linkage");
 
-      if (linkage == FormalLinkage::PublicUnique)
+      if (linkage == FormalLinkage::PublicUnique ||
+          linkage == FormalLinkage::PackageUnique)
         linkage = FormalLinkage::HiddenUnique;
     }
 
@@ -1284,6 +1304,18 @@ bool LinkEntity::isText() const {
   }
 }
 
+bool LinkEntity::isDistributedThunk() const {
+  if (!hasDecl())
+    return false;
+
+  auto value = getDecl();
+  if (auto afd = dyn_cast<AbstractFunctionDecl>(value)) {
+    return afd->isDistributedThunk();
+  }
+
+  return false;
+}
+
 bool LinkEntity::isWeakImported(ModuleDecl *module) const {
   switch (getKind()) {
   case Kind::SILGlobalVariable:
@@ -1294,8 +1326,7 @@ bool LinkEntity::isWeakImported(ModuleDecl *module) const {
     return false;
   case Kind::DynamicallyReplaceableFunctionKey:
   case Kind::DynamicallyReplaceableFunctionVariable:
-  case Kind::SILFunction:
-  case Kind::DistributedAccessor: {
+  case Kind::SILFunction: {
     return getSILFunction()->isWeakImported(module);
   }
 
@@ -1340,7 +1371,6 @@ bool LinkEntity::isWeakImported(ModuleDecl *module) const {
   case Kind::ObjCMetaclass:
   case Kind::SwiftMetaclassStub:
   case Kind::ClassMetadataBaseOffset:
-  case Kind::PropertyDescriptor:
   case Kind::NominalTypeDescriptor:
   case Kind::NominalTypeDescriptorRecord:
   case Kind::ModuleDescriptor:
@@ -1357,7 +1387,13 @@ bool LinkEntity::isWeakImported(ModuleDecl *module) const {
   case Kind::OpaqueTypeDescriptorAccessorImpl:
   case Kind::OpaqueTypeDescriptorAccessorKey:
   case Kind::OpaqueTypeDescriptorAccessorVar:
+  case Kind::DistributedAccessor:
     return getDecl()->isWeakImported(module);
+      
+  case Kind::PropertyDescriptor:
+    // Static properties may have nil property descriptors if declared in
+    // modules compiled with older compilers and should be weak linked.
+    return (getDecl()->isWeakImported(module) || getDecl()->isStatic());
 
   case Kind::CanonicalSpecializedGenericSwiftMetaclassStub:
     return getType()->getClassOrBoundGenericClass()->isWeakImported(module);
@@ -1414,7 +1450,7 @@ bool LinkEntity::isWeakImported(ModuleDecl *module) const {
   case Kind::KnownAsyncFunctionPointer:
     auto &context = module->getASTContext();
     auto deploymentAvailability =
-        AvailabilityContext::forDeploymentTarget(context);
+        AvailabilityRange::forDeploymentTarget(context);
     return !deploymentAvailability.isContainedIn(
         context.getConcurrencyAvailability());
   }
@@ -1468,6 +1504,7 @@ DeclContext *LinkEntity::getDeclContextForEmission() const {
   case Kind::OpaqueTypeDescriptorAccessorKey:
   case Kind::OpaqueTypeDescriptorAccessorVar:
   case Kind::CanonicalPrespecializedGenericTypeCachingOnceToken:
+  case Kind::DistributedAccessor:
     return getDecl()->getDeclContext();
 
   case Kind::CanonicalSpecializedGenericSwiftMetaclassStub:
@@ -1543,7 +1580,6 @@ DeclContext *LinkEntity::getDeclContextForEmission() const {
     return getUnderlyingEntityForAsyncFunctionPointer()
         .getDeclContextForEmission();
 
-  case Kind::DistributedAccessor:
   case Kind::AccessibleFunctionRecord: {
     return getSILFunction()->getParentModule();
   }

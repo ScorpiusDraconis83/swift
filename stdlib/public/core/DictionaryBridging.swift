@@ -437,6 +437,9 @@ internal struct __CocoaDictionary {
   }
 }
 
+@available(*, unavailable)
+extension __CocoaDictionary: Sendable {}
+
 extension __CocoaDictionary {
   @usableFromInline
   internal func isEqual(to other: __CocoaDictionary) -> Bool {
@@ -732,6 +735,9 @@ extension __CocoaDictionary: Sequence {
     return Iterator(self)
   }
 }
+
+@available(*, unavailable)
+extension __CocoaDictionary.Iterator: Sendable {}
 
 extension __CocoaDictionary.Iterator: IteratorProtocol {
   @usableFromInline

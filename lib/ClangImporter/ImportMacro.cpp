@@ -22,6 +22,7 @@
 #include "swift/AST/Expr.h"
 #include "swift/AST/Stmt.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/PrettyStackTrace.h"
 #include "swift/Basic/Unicode.h"
 #include "swift/ClangImporter/ClangModule.h"
@@ -52,14 +53,14 @@ static bool isInSystemModule(DeclContext *D) {
   return cast<ClangModuleUnit>(D->getModuleScopeContext())->isSystemModule();
 }
 
-static llvm::Optional<StringRef>
+static std::optional<StringRef>
 getTokenSpelling(ClangImporter::Implementation &impl, const clang::Token &tok) {
   bool tokenInvalid = false;
   llvm::SmallString<32> spellingBuffer;
   StringRef tokenSpelling = impl.getClangPreprocessor().getSpelling(
       tok, spellingBuffer, &tokenInvalid);
   if (tokenInvalid)
-    return llvm::None;
+    return std::nullopt;
   return tokenSpelling;
 }
 
@@ -93,7 +94,7 @@ static ValueDecl *importNumericLiteral(ClangImporter::Implementation &Impl,
     // FIXME: remove this when the following radar is implemented:
     // <rdar://problem/16445608> Swift should set up a DiagnosticConsumer for
     // Clang
-    llvm::Optional<StringRef> TokSpelling = getTokenSpelling(Impl, tok);
+    std::optional<StringRef> TokSpelling = getTokenSpelling(Impl, tok);
     if (!TokSpelling)
       return nullptr;
     if (TokSpelling->contains('_'))
@@ -271,7 +272,7 @@ static bool isSignToken(const clang::Token &tok) {
          tok.is(clang::tok::tilde);
 }
 
-static llvm::Optional<clang::QualType>
+static std::optional<clang::QualType>
 builtinTypeForToken(const clang::Token &tok, const clang::ASTContext &context) {
   switch (tok.getKind()) {
   case clang::tok::kw_short:
@@ -300,16 +301,18 @@ builtinTypeForToken(const clang::Token &tok, const clang::ASTContext &context) {
     return clang::QualType(context.WCharTy);
   case clang::tok::kw_bool:
     return clang::QualType(context.BoolTy);
+  case clang::tok::kw_char8_t:
+    return clang::QualType(context.Char8Ty);
   case clang::tok::kw_char16_t:
     return clang::QualType(context.Char16Ty);
   case clang::tok::kw_char32_t:
     return clang::QualType(context.Char32Ty);
   default:
-    return llvm::None;
+    return std::nullopt;
   }
 }
 
-static llvm::Optional<std::pair<llvm::APSInt, Type>>
+static std::optional<std::pair<llvm::APSInt, Type>>
 getIntegerConstantForMacroToken(ClangImporter::Implementation &impl,
                                 const clang::MacroInfo *macro, DeclContext *DC,
                                 const clang::Token &token) {
@@ -335,7 +338,7 @@ getIntegerConstantForMacroToken(ClangImporter::Implementation &impl,
     auto rawID = token.getIdentifierInfo();
     auto definition = impl.getClangPreprocessor().getMacroDefinition(rawID);
     if (!definition)
-      return llvm::None;
+      return std::nullopt;
 
     ClangNode macroNode;
     const clang::MacroInfo *macroInfo;
@@ -355,16 +358,16 @@ getIntegerConstantForMacroToken(ClangImporter::Implementation &impl,
 
     auto searcher = impl.ImportedMacroConstants.find(macroInfo);
     if (searcher == impl.ImportedMacroConstants.end()) {
-      return llvm::None;
+      return std::nullopt;
     }
     auto importedConstant = searcher->second;
     if (!importedConstant.first.isInt()) {
-      return llvm::None;
+      return std::nullopt;
     }
     return {{ importedConstant.first.getInt(), importedConstant.second }};
   }
 
-  return llvm::None;
+  return std::nullopt;
 }
 
 static ValueDecl *importMacro(ClangImporter::Implementation &impl,
@@ -704,7 +707,7 @@ static ValueDecl *importMacro(ClangImporter::Implementation &impl,
 
     // Unhandled operators.
     } else {
-      if (llvm::Optional<StringRef> operatorSpelling =
+      if (std::optional<StringRef> operatorSpelling =
               getTokenSpelling(impl, tokenI[1])) {
         impl.addImportDiagnostic(
             &tokenI[1],

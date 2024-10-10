@@ -61,20 +61,6 @@ extension FormattedLikeArray {
   }
 }
 
-/// RandomAccessCollection which bridges to some C++ array.
-///
-/// It fixes the default reflection for bridged random access collections, which usually have a
-/// `bridged` stored property.
-/// Conforming to this protocol displays the "real" children  not just `bridged`.
-public protocol BridgedRandomAccessCollection : RandomAccessCollection, CustomReflectable {
-}
-
-extension BridgedRandomAccessCollection {
-  public var customMirror: Mirror {
-    Mirror(self, children: self.map { (label: nil, value: $0 as Any) })
-  }
-}
-
 /// A Sequence which is not consuming and therefore behaves like a Collection.
 ///
 /// Many sequences in SIL and the optimizer should be collections but cannot
@@ -87,22 +73,98 @@ public protocol CollectionLikeSequence : FormattedLikeArray {
 
 public extension CollectionLikeSequence {
   var isEmpty: Bool { !contains(where: { _ in true }) }
+
+  var singleElement: Element? {
+    var singleElement: Element? = nil
+    for e in self {
+      if singleElement != nil {
+        return nil
+      }
+      singleElement = e
+    }
+    return singleElement
+  }
+
+  var first: Element? { first(where: { _ in true }) }
 }
 
 // Also make the lazy sequences a CollectionLikeSequence if the underlying sequence is one.
 
-extension LazySequence : CollectionLikeSequence,
-                         FormattedLikeArray, CustomStringConvertible, CustomReflectable
+extension LazySequence : /*@retroactive*/ SIL.CollectionLikeSequence,
+                         /*@retroactive*/ SIL.FormattedLikeArray,
+                         /*@retroactive*/ Swift.CustomStringConvertible,
+                         /*@retroactive*/ Swift.CustomReflectable
                          where Base: CollectionLikeSequence {}
 
-extension FlattenSequence : CollectionLikeSequence,
-                            FormattedLikeArray, CustomStringConvertible, CustomReflectable
+extension FlattenSequence : /*@retroactive*/ SIL.CollectionLikeSequence,
+                            /*@retroactive*/ SIL.FormattedLikeArray,
+                            /*@retroactive*/ Swift.CustomStringConvertible,
+                            /*@retroactive*/ Swift.CustomReflectable
                             where Base: CollectionLikeSequence {}
 
-extension LazyMapSequence : CollectionLikeSequence,
-                            FormattedLikeArray, CustomStringConvertible, CustomReflectable
+extension LazyMapSequence : /*@retroactive*/ SIL.CollectionLikeSequence,
+                            /*@retroactive*/ SIL.FormattedLikeArray,
+                            /*@retroactive*/ Swift.CustomStringConvertible,
+                            /*@retroactive*/ Swift.CustomReflectable
                             where Base: CollectionLikeSequence {}
 
-extension LazyFilterSequence : CollectionLikeSequence,
-                               FormattedLikeArray, CustomStringConvertible, CustomReflectable
+extension LazyFilterSequence : /*@retroactive*/ SIL.CollectionLikeSequence,
+                               /*@retroactive*/ SIL.FormattedLikeArray,
+                               /*@retroactive*/ Swift.CustomStringConvertible,
+                               /*@retroactive*/ Swift.CustomReflectable
                                where Base: CollectionLikeSequence {}
+
+//===----------------------------------------------------------------------===//
+//                      Single-Element Inline Array
+//===----------------------------------------------------------------------===//
+
+public struct SingleInlineArray<Element>: RandomAccessCollection, FormattedLikeArray {
+  private var singleElement: Element?
+  private var multipleElements: [Element] = []
+
+  public init() {}
+
+  public init(element: Element) {
+    singleElement = element
+  }
+
+  public var startIndex: Int { 0 }
+  public var endIndex: Int {
+    singleElement == nil ? 0 : multipleElements.count + 1
+  }
+
+  public subscript(_ index: Int) -> Element {
+    _read {
+      if index == 0 {
+        yield singleElement!
+      } else {
+        yield multipleElements[index - 1]
+      }
+    }
+    _modify {
+      if index == 0 {
+        yield &singleElement!
+      } else {
+        yield &multipleElements[index - 1]
+      }
+    }
+  }
+
+  public mutating func append(_ element: __owned Element) {
+    push(element)
+  }
+
+  public mutating func append<S: Sequence>(contentsOf newElements: __owned S) where S.Element == Element {
+    for element in newElements {
+      push(element)
+    }
+  }
+
+  public mutating func push(_ element: __owned Element) {
+    guard singleElement != nil else {
+      singleElement = element
+      return
+    }
+    multipleElements.append(element)
+  }
+}

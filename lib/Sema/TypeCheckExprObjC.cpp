@@ -16,19 +16,20 @@
 //===----------------------------------------------------------------------===//
 #include "TypeChecker.h"
 #include "TypoCorrection.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Range.h"
 
 using namespace swift;
 
-llvm::Optional<Type> TypeChecker::checkObjCKeyPathExpr(DeclContext *dc,
-                                                       KeyPathExpr *expr,
-                                                       bool requireResultType) {
+std::optional<Type> TypeChecker::checkObjCKeyPathExpr(DeclContext *dc,
+                                                      KeyPathExpr *expr,
+                                                      bool requireResultType) {
   // TODO: Native keypaths
   assert(expr->isObjC() && "native keypaths not type-checked this way");
   
   // If there is already a semantic expression, do nothing.
   if (expr->getObjCStringLiteralExpr() && !requireResultType)
-    return llvm::None;
+    return std::nullopt;
 
   // ObjC #keyPath only makes sense when we have the Objective-C runtime.
   auto &Context = dc->getASTContext();
@@ -39,7 +40,7 @@ llvm::Optional<Type> TypeChecker::checkObjCKeyPathExpr(DeclContext *dc,
     expr->setObjCStringLiteralExpr(
       new (Context) StringLiteralExpr("", expr->getSourceRange(),
                                       /*Implicit=*/true));
-    return llvm::None;
+    return std::nullopt;
   }
 
   // The key path string we're forming.
@@ -344,21 +345,6 @@ llvm::Optional<Type> TypeChecker::checkObjCKeyPathExpr(DeclContext *dc,
             .fixItInsert(var->getAttributeInsertionLoc(false),
                          "@objc ");
         }
-      } else if (auto attr = var->getAttrs().getAttribute<ObjCAttr>()) {
-        // If this attribute was inferred based on deprecated Swift 3 rules,
-        // complain.
-        if (attr->isSwift3Inferred() &&
-            Context.LangOpts.WarnSwift3ObjCInference ==
-              Swift3ObjCInferenceWarnings::Minimal) {
-          auto *parent = var->getDeclContext()->getSelfNominalTypeDecl();
-          diags.diagnose(componentNameLoc,
-                         diag::expr_keypath_swift3_objc_inference,
-                         var->getName(),
-                         parent->getName());
-          diags.diagnose(var, diag::make_decl_objc, var->getDescriptiveKind())
-            .fixItInsert(var->getAttributeInsertionLoc(false),
-                         "@objc ");
-        }
       } else {
         // FIXME: Warn about non-KVC-compliant getter/setter names?
       }
@@ -388,8 +374,9 @@ llvm::Optional<Type> TypeChecker::checkObjCKeyPathExpr(DeclContext *dc,
 
       Type newType;
       if (lookupType && !lookupType->isAnyObject()) {
-        newType = lookupType->getTypeOfMember(dc->getParentModule(), type,
-                                              type->getDeclaredInterfaceType());
+        newType = type->getDeclaredInterfaceType().subst(
+            lookupType->getContextSubstitutionMap(
+                type->getDeclContext()));
       } else {
         newType = type->getDeclaredInterfaceType();
       }
@@ -435,6 +422,6 @@ llvm::Optional<Type> TypeChecker::checkObjCKeyPathExpr(DeclContext *dc,
   }
 
   if (!currentType)
-    return llvm::None;
+    return std::nullopt;
   return currentType;
 }

@@ -79,7 +79,7 @@ struct TupleBuilderWithoutIf { // expected-note 3{{struct 'TupleBuilderWithoutIf
   static func buildDo<T>(_ value: T) -> T { return value }
 }
 
-func tuplify<T>(_ cond: Bool, @TupleBuilder body: (Bool) -> T) { // expected-note {{'tuplify(_:body:)' declared here}}
+func tuplify<T>(_ cond: Bool, @TupleBuilder body: (Bool) -> T) { // expected-note 2{{'tuplify(_:body:)' declared here}}
   print(body(cond))
 }
 
@@ -313,9 +313,9 @@ func acceptMetatype<T>(_: T.Type) -> Bool { true }
 
 func syntacticUses<T>(_: T) {
   tuplify(true) { x in
-    if x && acceptMetatype(T) { // expected-error{{expected member name or constructor call after type name}}
+    if x && acceptMetatype(T) { // expected-error{{expected member name or initializer call after type name}}
       // expected-note@-1{{use '.self' to reference the type object}}
-      acceptMetatype(T) // expected-error{{expected member name or constructor call after type name}}
+      acceptMetatype(T) // expected-error{{expected member name or initializer call after type name}}
       // expected-note@-1{{use '.self' to reference the type object}}
     }
   }
@@ -455,7 +455,7 @@ func testNonExhaustiveSwitch(e: E) {
 // rdar://problem/59856491
 struct TestConstraintGenerationErrors {
   @TupleBuilder var buildTupleFnBody: String {
-    let a = nil // There is no diagnostic here because next line fails to pre-check, so body is invalid
+    let a = nil // expected-error {{'nil' requires a contextual type}}
     String(nothing) // expected-error {{cannot find 'nothing' in scope}}
   }
 
@@ -722,7 +722,7 @@ struct TuplifiedStructWithInvalidClosure {
 
   @TupleBuilder var errorsDiagnosedByParser: some Any {
     if let _ = condition {
-      tuplify { _ in
+      tuplify { _ in // expected-error {{missing argument for parameter #1 in call}}
         self. // expected-error {{expected member name following '.'}}
       }
       42
@@ -837,7 +837,7 @@ func test_rdar89742267() {
     @Builder var body: S {
       switch entry {
       case .listen: S()
-      case nil: S() // expected-warning {{type 'Hey' is not optional, value can never be nil; this is an error in Swift 6}}
+      case nil: S() // expected-warning {{type 'Hey' is not optional, value can never be nil; this is an error in the Swift 6 language mode}}
       default: S()
       }
     }
@@ -1012,4 +1012,20 @@ func test_partially_resolved_closure_params() {
     $0.a
     42
   }
+}
+
+func testMissingElementInEmptyBuilder() {
+  @resultBuilder
+  struct SingleElementBuilder {
+    static func buildBlock<T>(_ x: T) -> T { x }
+    // expected-note@-1 2{{'buildBlock' declared here}}
+  }
+
+  func test1(@SingleElementBuilder fn: () -> Int) {}
+  test1 {}
+  // expected-error@-1 {{expected expression of type 'Int' in result builder 'SingleElementBuilder'}} {{10-10=<#T##Int#>}}
+
+  @SingleElementBuilder
+  func test2() -> Int {}
+  // expected-error@-1 {{expected expression of type 'Int' in result builder 'SingleElementBuilder'}} {{24-24=<#T##Int#>}}
 }

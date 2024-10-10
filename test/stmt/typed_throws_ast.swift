@@ -1,4 +1,4 @@
-// RUN: %target-swift-frontend -enable-experimental-feature TypedThrows %s -dump-ast | %FileCheck %s
+// RUN: %target-swift-frontend %s -dump-ast | %FileCheck %s
 
 enum MyError: Error {
 case failed
@@ -41,7 +41,7 @@ func throwsAnything() throws {
 func doesNotThrow() { }
 
 func throwsNothing() {
-  // CHECK-LABE: func_decl{{.*}}"throwsNothing()"
+  // CHECK-LABEL: func_decl{{.*}}"throwsNothing()"
 
   // CHECK: force_try_expr{{.*}}thrown_error="Never"
   try! doesNotThrow()

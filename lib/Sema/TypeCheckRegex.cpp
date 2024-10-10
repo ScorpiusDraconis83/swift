@@ -17,6 +17,7 @@
 #include "swift/AST/Expr.h"
 #include "swift/AST/Type.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 
 using namespace swift;
 
@@ -48,10 +49,10 @@ bool swift::decodeRegexCaptureTypes(ASTContext &ctx,
   // Read contents.
   SmallVector<SmallVector<TupleTypeElt, 4>, 4> scopes(1);
   unsigned offset = sizeof(Version);
-  auto consumeCode = [&]() -> llvm::Optional<RegexCaptureStructureCode> {
+  auto consumeCode = [&]() -> std::optional<RegexCaptureStructureCode> {
     auto rawValue = serialization[offset];
     if (rawValue >= (uint8_t)RegexCaptureStructureCode::CaseCount)
-      return llvm::None;
+      return std::nullopt;
     offset += sizeof(RegexCaptureStructureCode);
     return (RegexCaptureStructureCode)rawValue;
   };

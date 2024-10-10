@@ -1,6 +1,8 @@
 
 add_swift_host_library(swiftSema STATIC
+  AssociatedTypeInference.cpp
   BuilderTransform.cpp
+  Comment.cpp
   CSApply.cpp
   CSBindings.cpp
   CSSyntacticElement.cpp
@@ -9,6 +11,7 @@ add_swift_host_library(swiftSema STATIC
   CSSimplify.cpp
   CSSolver.cpp
   CSStep.cpp
+  CSTrail.cpp
   CSFix.cpp
   CSDiagnostics.cpp
   CodeSynthesis.cpp
@@ -36,15 +39,17 @@ add_swift_host_library(swiftSema STATIC
   InstrumenterSupport.cpp
   LookupVisibleDecls.cpp
   MiscDiagnostics.cpp
+  OpenedExistentials.cpp
   PCMacro.cpp
   PlaygroundTransform.cpp
-  PreCheckExpr.cpp
+  PreCheckTarget.cpp
   ResilienceDiagnostics.cpp
   SourceLoader.cpp
   SyntacticElementTarget.cpp
   TypeCheckAccess.cpp
   TypeCheckAttr.cpp
   TypeCheckAvailability.cpp
+  TypeCheckBitwise.cpp
   TypeCheckCaptures.cpp
   TypeCheckCircularity.cpp
   TypeCheckCodeCompletion.cpp
@@ -65,7 +70,6 @@ add_swift_host_library(swiftSema STATIC
   TypeCheckPattern.cpp
   TypeCheckPropertyWrapper.cpp
   TypeCheckProtocol.cpp
-  TypeCheckProtocolInference.cpp
   TypeCheckRegex.cpp
   TypeCheckRequestFunctions.cpp
   TypeCheckStmt.cpp
@@ -89,7 +93,8 @@ target_link_libraries(swiftSema PRIVATE
 
 if (SWIFT_BUILD_SWIFT_SYNTAX)
   target_link_libraries(swiftSema PRIVATE
-    swiftASTGen)
+    swiftASTGen
+    swiftMacroEvaluation)
 endif()
 
 set_swift_llvm_is_available(swiftSema)

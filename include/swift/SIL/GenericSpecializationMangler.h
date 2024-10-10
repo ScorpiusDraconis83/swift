@@ -37,7 +37,7 @@ protected:
   /// The specialization pass.
   SpecializationPass Pass;
 
-  IsSerialized_t Serialized;
+  swift::SerializedKind_t Serialized;
 
   /// The original function which is specialized.
   SILFunction *Function;
@@ -50,12 +50,12 @@ protected:
   PossibleEffects RemovedEffects;
 
 protected:
-  SpecializationMangler(SpecializationPass P, IsSerialized_t Serialized,
+  SpecializationMangler(SpecializationPass P, swift::SerializedKind_t Serialized,
                         SILFunction *F)
       : Pass(P), Serialized(Serialized), Function(F),
         ArgOpBuffer(ArgOpStorage) {}
 
-  SpecializationMangler(SpecializationPass P, IsSerialized_t Serialized,
+  SpecializationMangler(SpecializationPass P, swift::SerializedKind_t Serialized,
                         std::string functionName)
       : Pass(P), Serialized(Serialized), Function(nullptr),
         FunctionName(functionName), ArgOpBuffer(ArgOpStorage) {}
@@ -87,13 +87,15 @@ class GenericSpecializationMangler : public SpecializationMangler {
   std::string manglePrespecialized(GenericSignature sig,
                                       SubstitutionMap subs);
 
+  void appendRemovedParams(const SmallBitVector &paramsRemoved);
+
 public:
-  GenericSpecializationMangler(SILFunction *F, IsSerialized_t Serialized)
+  GenericSpecializationMangler(SILFunction *F, swift::SerializedKind_t Serialized)
       : SpecializationMangler(SpecializationPass::GenericSpecializer,
                               Serialized, F) {}
 
   std::string mangleNotReabstracted(SubstitutionMap subs,
-                                    bool metatyeParamsRemoved);
+                                    const SmallBitVector &paramsRemoved = SmallBitVector());
 
   /// Mangle a generic specialization with re-abstracted parameters.
   ///
@@ -103,11 +105,11 @@ public:
   /// This is the default for generic specializations.
   ///
   /// \param alternativeMangling   true for specialized functions with a
-  ///                              differet resilience expansion.
+  ///                              different resilience expansion.
   /// \param metatyeParamsRemoved  true if non-generic metatype parameters are
   ///                              removed in the specialized function.
   std::string mangleReabstracted(SubstitutionMap subs, bool alternativeMangling,
-                                 bool metatyeParamsRemoved = false);
+                                 const SmallBitVector &paramsRemoved = SmallBitVector());
 
   std::string mangleForDebugInfo(GenericSignature sig, SubstitutionMap subs,
                                  bool forInlining);

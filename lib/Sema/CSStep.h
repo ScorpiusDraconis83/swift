@@ -23,12 +23,12 @@
 #include "swift/Sema/ConstraintGraph.h"
 #include "swift/Sema/ConstraintSystem.h"
 #include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/SaveAndRestore.h"
 #include "llvm/Support/raw_ostream.h"
 #include <memory>
+#include <optional>
 
 using namespace llvm;
 
@@ -221,7 +221,7 @@ protected:
 
   Score getCurrentScore() const { return CS.CurrentScore; }
 
-  llvm::Optional<Score> getBestScore() const {
+  std::optional<Score> getBestScore() const {
     return CS.solverState->BestScore;
   }
 
@@ -339,20 +339,23 @@ public:
 class ComponentStep final : public SolverStep {
   class Scope {
     ConstraintSystem &CS;
-    ConstraintSystem::SolverScope *SolverScope;
+    std::optional<ConstraintSystem::SolverScope> SolverScope;
 
     SetVector<TypeVariableType *> TypeVars;
-    ConstraintSystem::SolverScope *PrevPartialScope = nullptr;
+    unsigned prevPartialSolutionFixes = 0;
 
     // The component this scope is associated with.
     ComponentStep &Component;
 
+    Scope(const Scope &) = delete;
+    Scope &operator=(const Scope &) = delete;
+
   public:
-    Scope(ComponentStep &component);
+    explicit Scope(ComponentStep &component);
 
     ~Scope() {
-      delete SolverScope; // rewind back all of the changes.
-      CS.solverState->PartialSolutionScope = PrevPartialScope;
+      SolverScope.reset(); // rewind back all of the changes.
+      CS.solverState->numPartialSolutionFixes = prevPartialSolutionFixes;
 
       // return all of the saved type variables back to the system.
       CS.TypeVariables = std::move(TypeVars);
@@ -379,11 +382,11 @@ class ComponentStep final : public SolverStep {
 
   /// The original best score computed before any of the
   /// component steps belonging to the same "split" are taken.
-  llvm::Optional<Score> OriginalBestScore;
+  std::optional<Score> OriginalBestScore;
 
   /// If this step depends on other smaller steps to be solved first
   /// we need to keep active scope until all of the work is done.
-  std::unique_ptr<Scope> ComponentScope = nullptr;
+  std::optional<Scope> ComponentScope;
 
   /// Type variables and constraints "in scope" of this step.
   TinyPtrVector<TypeVariableType *> TypeVars;
@@ -474,7 +477,7 @@ private:
       log << "(solving component #" << Index << '\n';
     }
     
-    ComponentScope = std::make_unique<Scope>(*this);
+    ComponentScope.emplace(*this);
     
     if (CS.isDebugMode()) {
       auto &log = getDebugLogger();
@@ -516,7 +519,7 @@ protected:
   /// being attempted, helps to rewind state of the
   /// constraint system back to original before attempting
   /// next binding, if any.
-  llvm::Optional<std::pair<std::unique_ptr<Scope>, typename P::Element>>
+  std::optional<std::pair<Scope, typename P::Element>>
       ActiveChoice;
 
   BindingStep(ConstraintSystem &cs, P producer,
@@ -545,14 +548,14 @@ public:
       }
 
       {
-        auto scope = std::make_unique<Scope>(CS);
+        Scope scope(CS);
         if (attempt(*choice)) {
           ActiveChoice.emplace(std::move(scope), *choice);
 
           if (CS.isDebugMode()) {
-            auto &log = llvm::errs();
-            auto &CG = CS.getConstraintGraph();
-            CG.dumpActiveScopeChanges(log, CS.solverState->getCurrentIndent());
+            CS.solverState->Trail.dumpActiveScopeChanges(
+              llvm::errs(), ActiveChoice->first.numTrailChanges,
+              CS.solverState->getCurrentIndent());
           }
           
           return suspend(std::make_unique<SplitterStep>(CS, Solutions));
@@ -683,8 +686,8 @@ class DisjunctionStep final : public BindingStep<DisjunctionChoiceProducer> {
   SmallVector<Constraint *, 4> DisabledChoices;
   ConstraintList::iterator AfterDisjunction;
 
-  llvm::Optional<Score> BestNonGenericScore;
-  llvm::Optional<std::pair<Constraint *, Score>> LastSolvedChoice;
+  std::optional<Score> BestNonGenericScore;
+  std::optional<std::pair<Constraint *, Score>> LastSolvedChoice;
 
 public:
   DisjunctionStep(ConstraintSystem &cs, Constraint *disjunction,
@@ -797,10 +800,10 @@ private:
   };
 
   // Figure out which of the solutions has the smallest score.
-  static llvm::Optional<Score>
+  static std::optional<Score>
   getBestScore(SmallVectorImpl<Solution> &solutions) {
     if (solutions.empty())
-      return None;
+      return std::nullopt;
 
     Score bestScore = solutions.front().getFixedScore();
     if (solutions.size() == 1)
@@ -823,7 +826,7 @@ class ConjunctionStep : public BindingStep<ConjunctionElementProducer> {
     /// The conjunction this snapshot belongs to.
     Constraint *Conjunction;
 
-    llvm::Optional<llvm::SaveAndRestore<DeclContext *>> DC = None;
+    std::optional<llvm::SaveAndRestore<DeclContext *>> DC = std::nullopt;
 
     llvm::SetVector<TypeVariableType *> TypeVars;
     ConstraintList Constraints;
@@ -832,7 +835,7 @@ class ConjunctionStep : public BindingStep<ConjunctionElementProducer> {
     /// this scope would be initialized once all of the
     /// elements are successfully solved to continue solving
     /// along the current path as-if there was no conjunction.
-    std::unique_ptr<Scope> IsolationScope = nullptr;
+    std::optional<Scope> IsolationScope;
 
   public:
     SolverSnapshot(ConstraintSystem &cs, Constraint *conjunction)
@@ -860,10 +863,10 @@ class ConjunctionStep : public BindingStep<ConjunctionElementProducer> {
 
       // Establish isolation scope so that conjunction solution
       // and follow-up steps could be rolled back.
-      IsolationScope = std::make_unique<Scope>(CS);
+      IsolationScope.emplace(CS);
 
       // Apply solution inferred for the conjunction.
-      applySolution(solution);
+      replaySolution(solution);
 
       // Add constraints to the graph after solution
       // has been applied to make sure that all type
@@ -899,13 +902,11 @@ class ConjunctionStep : public BindingStep<ConjunctionElementProducer> {
         CG.addConstraint(&constraint);
     }
 
-    void applySolution(const Solution &solution);
+    void replaySolution(const Solution &solution);
   };
 
   /// Best solution solver reached so far.
-  llvm::Optional<Score> BestScore;
-  /// The score established before conjunction is attempted.
-  Score CurrentScore;
+  std::optional<Score> BestScore;
 
   /// The number of constraint solver scopes already explored
   /// before accepting this conjunction.
@@ -913,8 +914,8 @@ class ConjunctionStep : public BindingStep<ConjunctionElementProducer> {
 
   /// The number of milliseconds until outer constraint system
   /// is considered "too complex" if timer is enabled.
-  llvm::Optional<std::pair<ExpressionTimer::AnchorType, unsigned>>
-      OuterTimeRemaining = None;
+  std::optional<std::pair<ExpressionTimer::AnchorType, unsigned>>
+      OuterTimeRemaining = std::nullopt;
 
   /// Conjunction constraint associated with this step.
   Constraint *Conjunction;
@@ -929,7 +930,7 @@ class ConjunctionStep : public BindingStep<ConjunctionElementProducer> {
   /// If conjunction has to be solved in isolation, this
   /// variable would capture the snapshot of the constraint
   /// system step before conjunction step.
-  llvm::Optional<SolverSnapshot> Snapshot;
+  std::optional<SolverSnapshot> Snapshot;
 
   /// A set of previously deduced solutions. This is used upon
   /// successful solution of an isolated conjunction to introduce
@@ -947,7 +948,7 @@ public:
                   SmallVectorImpl<Solution> &solutions)
       : BindingStep(cs, {cs, conjunction},
                     conjunction->isIsolated() ? IsolatedSolutions : solutions),
-        BestScore(getBestScore()), CurrentScore(getCurrentScore()),
+        BestScore(getBestScore()),
         OuterScopeCount(cs.CountScopes, 0), Conjunction(conjunction),
         AfterConjunction(erase(conjunction)), OuterSolutions(solutions) {
     assert(conjunction->getKind() == ConstraintKind::Conjunction);
@@ -973,11 +974,8 @@ public:
 
     // Restore best score only if conjunction fails because
     // successful outcome should keep a score set by `restoreOuterState`.
-    if (HadFailure) {
-      auto solutionScore = Score();
+    if (HadFailure)
       restoreBestScore();
-      restoreCurrentScore(solutionScore);
-    }
 
     if (OuterTimeRemaining) {
       auto anchor = OuterTimeRemaining->first;
@@ -1029,9 +1027,10 @@ protected:
   }
 
 private:
-  /// Restore best and current scores as they were before conjunction.
-  void restoreCurrentScore(const Score &solutionScore) const {
-    CS.CurrentScore = CurrentScore;
+  /// We need to do this to make sure that we rank solutions with
+  /// invalid closures appropriately and don’t produce a valid
+  /// solution if a multi-statement closure failed.
+  void updateScoreAfterConjunction(const Score &solutionScore) const {
     CS.increaseScore(SK_Fix, Conjunction->getLocator(),
                      solutionScore.Data[SK_Fix]);
     CS.increaseScore(SK_Hole, Conjunction->getLocator(),

@@ -16,6 +16,14 @@
 
 #ifdef __linux__
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+
+#ifndef _LARGEFILE64_SOURCE
+#define _LARGEFILE64_SOURCE 1
+#endif
+
 #include <linux/capability.h>
 #include <linux/futex.h>
 
@@ -814,6 +822,8 @@ const char *backtracer_argv[] = {
   "true",                       // 28
   "--output-to",                // 29
   "stdout",                     // 30
+  "--symbolicate",              // 31
+  "full",                       // 32
   NULL
 };
 
@@ -923,6 +933,18 @@ run_backtracer(int memserver_fd)
   }
 
   backtracer_argv[28] = trueOrFalse(_swift_backtraceSettings.cache);
+
+  switch (_swift_backtraceSettings.symbolicate) {
+  case Symbolication::Off:
+    backtracer_argv[32] = "off";
+    break;
+  case Symbolication::Fast:
+    backtracer_argv[32] = "fast";
+    break;
+  case Symbolication::Full:
+    backtracer_argv[32] = "full";
+    break;
+  }
 
   _swift_formatUnsigned(_swift_backtraceSettings.timeout, timeout_buf);
 

@@ -226,7 +226,7 @@ bool GatherWritesVisitor::visitUse(Operand *op, AccessUseType useTy) {
     if (info.isIndirectInGuaranteed()) {
       return true;
     }
-    if (info.isIndirectMutating() || info.isConsumed()) {
+    if (info.isIndirectMutating() || info.isConsumedInCaller()) {
       writeAccumulator.push_back(op);
       return true;
     }
@@ -259,7 +259,7 @@ bool GatherWritesVisitor::visitUse(Operand *op, AccessUseType useTy) {
       writeAccumulator.push_back(op);
       return true;
     }
-    if (argConv.isOwnedConvention()) {
+    if (argConv.isOwnedConventionInCaller()) {
       writeAccumulator.push_back(op);
       return true;
     }
@@ -337,7 +337,7 @@ bool LoadBorrowImmutabilityAnalysis::isImmutableInScope(
       continue;
     }
 
-    if (borrowLiveness.isWithinBoundary(write)) {
+    if (borrowLiveness.isWithinBoundary(write, /*deadEndBlocks=*/nullptr)) {
       llvm::errs() << "Write: " << *write;
       return false;
     }

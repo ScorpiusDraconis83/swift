@@ -25,6 +25,7 @@
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/raw_ostream.h"
@@ -81,7 +82,7 @@ deriveBodyComparable_enum_noAssociatedValues_lt(AbstractFunctionDecl *ltDecl,
 
   auto *cmpExpr =
       BinaryExpr::create(C, aIndex, cmpFuncExpr, bIndex, /*implicit*/ true);
-  statements.push_back(new (C) ReturnStmt(SourceLoc(), cmpExpr));
+  statements.push_back(ReturnStmt::createImplicit(C, cmpExpr));
 
   BraceStmt *body = BraceStmt::create(C, SourceLoc(), statements, SourceLoc());
   return { body, /*isTypeChecked=*/false };
@@ -113,26 +114,20 @@ deriveBodyComparable_enum_hasAssociatedValues_lt(AbstractFunctionDecl *ltDecl, v
 
     // .<elt>(let l0, let l1, ...)
     SmallVector<VarDecl*, 4> lhsPayloadVars;
-    auto lhsSubpattern = DerivedConformance::enumElementPayloadSubpattern(elt, 'l', ltDecl,
-                                                      lhsPayloadVars);
-    auto *lhsBaseTE = TypeExpr::createImplicit(enumType, C);
-    auto lhsElemPat = new (C)
-        EnumElementPattern(lhsBaseTE, SourceLoc(), DeclNameLoc(), DeclNameRef(),
-                           elt, lhsSubpattern, /*DC*/ ltDecl);
-    lhsElemPat->setImplicit();
+    auto *lhsSubpattern = DerivedConformance::enumElementPayloadSubpattern(
+        elt, 'l', ltDecl, lhsPayloadVars);
+    auto *lhsElemPat = EnumElementPattern::createImplicit(
+        enumType, elt, lhsSubpattern, /*DC*/ ltDecl);
 
     // .<elt>(let r0, let r1, ...)
     SmallVector<VarDecl*, 4> rhsPayloadVars;
-    auto rhsSubpattern = DerivedConformance::enumElementPayloadSubpattern(elt, 'r', ltDecl,
-                                                      rhsPayloadVars);
-    auto *rhsBaseTE = TypeExpr::createImplicit(enumType, C);
-    auto rhsElemPat = new (C)
-        EnumElementPattern(rhsBaseTE, SourceLoc(), DeclNameLoc(), DeclNameRef(),
-                           elt, rhsSubpattern, /*DC*/ ltDecl);
-    rhsElemPat->setImplicit();
+    auto *rhsSubpattern = DerivedConformance::enumElementPayloadSubpattern(
+        elt, 'r', ltDecl, rhsPayloadVars);
+    auto *rhsElemPat = EnumElementPattern::createImplicit(
+        enumType, elt, rhsSubpattern, /*DC*/ ltDecl);
 
     auto hasBoundDecls = !lhsPayloadVars.empty();
-    llvm::Optional<MutableArrayRef<VarDecl *>> caseBodyVarDecls;
+    std::optional<MutableArrayRef<VarDecl *>> caseBodyVarDecls;
     if (hasBoundDecls) {
       // We allocated a direct copy of our lhs var decls for the case
       // body.
@@ -176,7 +171,7 @@ deriveBodyComparable_enum_hasAssociatedValues_lt(AbstractFunctionDecl *ltDecl, v
     // return false 
     auto falseExpr = new (C) BooleanLiteralExpr(false, SourceLoc(),
                                                /*Implicit*/true);
-    auto returnStmt = new (C) ReturnStmt(SourceLoc(), falseExpr);
+    auto *returnStmt = ReturnStmt::createImplicit(C, falseExpr);
     statementsInCase.push_back(returnStmt);
 
     auto body = BraceStmt::create(C, SourceLoc(), statementsInCase,
@@ -197,7 +192,7 @@ deriveBodyComparable_enum_hasAssociatedValues_lt(AbstractFunctionDecl *ltDecl, v
     cases.push_back(CaseStmt::create(C, CaseParentKind::Switch, SourceLoc(),
                                      defaultItem, SourceLoc(), SourceLoc(),
                                      body,
-                                     /*case body var decls*/ llvm::None));
+                                     /*case body var decls*/ std::nullopt));
   }
 
   // switch (a, b) { <case statements> }

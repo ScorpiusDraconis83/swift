@@ -20,15 +20,18 @@
 #include "swift/AST/ASTPrinter.h"
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/AccessScope.h"
+#include "swift/AST/AttrKind.h"
 #include "swift/AST/Builtins.h"
 #include "swift/AST/ClangModuleLoader.h"
 #include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/FileUnit.h"
 #include "swift/AST/GenericEnvironment.h"
+#include "swift/AST/Import.h"
 #include "swift/AST/ImportCache.h"
 #include "swift/AST/LazyResolver.h"
 #include "swift/AST/LinkLibrary.h"
+#include "swift/AST/MacroDefinition.h"
 #include "swift/AST/ModuleLoader.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/NameLookupRequests.h"
@@ -39,7 +42,9 @@
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/SynthesizedFileUnit.h"
+#include "swift/AST/Type.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Compiler.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Basic/Statistic.h"
@@ -722,6 +727,9 @@ ModuleDecl::ModuleDecl(Identifier name, ASTContext &ctx,
   Bits.ModuleDecl.IsConcurrencyChecked = 0;
   Bits.ModuleDecl.ObjCNameLookupCachePopulated = 0;
   Bits.ModuleDecl.HasCxxInteroperability = 0;
+  Bits.ModuleDecl.CXXStdlibKind = 0;
+  Bits.ModuleDecl.AllowNonResilientAccess = 0;
+  Bits.ModuleDecl.SerializePackageEnabled = 0;
 }
 
 void ModuleDecl::setIsSystemModule(bool flag) {
@@ -758,102 +766,14 @@ void ModuleDecl::addFile(FileUnit &newFile) {
   clearLookupCache();
 }
 
-void ModuleDecl::addAuxiliaryFile(SourceFile &sourceFile) {
-  AuxiliaryFiles.push_back(&sourceFile);
-}
-
-namespace {
-  /// Compare the source location ranges for two files, as an ordering to
-  /// use for fast searches.
-  struct SourceFileRangeComparison {
-    SourceManager *sourceMgr;
-
-    bool operator()(SourceFile *lhs, SourceFile *rhs) const {
-      auto lhsRange = sourceMgr->getRangeForBuffer(*lhs->getBufferID());
-      auto rhsRange = sourceMgr->getRangeForBuffer(*rhs->getBufferID());
-
-      std::less<const char *> pointerCompare;
-      return pointerCompare(
-          (const char *)lhsRange.getStart().getOpaquePointerValue(),
-          (const char *)rhsRange.getStart().getOpaquePointerValue());
-    }
-
-    bool operator()(SourceFile *lhs, SourceLoc rhsLoc) const {
-      auto lhsRange = sourceMgr->getRangeForBuffer(*lhs->getBufferID());
-
-      std::less<const char *> pointerCompare;
-      return pointerCompare(
-          (const char *)lhsRange.getEnd().getOpaquePointerValue(),
-          (const char *)rhsLoc.getOpaquePointerValue());
-    }
-
-    bool operator()(SourceLoc lhsLoc, SourceFile *rhs) const {
-      auto rhsRange = sourceMgr->getRangeForBuffer(*rhs->getBufferID());
-
-      std::less<const char *> pointerCompare;
-      return pointerCompare(
-          (const char *)lhsLoc.getOpaquePointerValue(),
-          (const char *)rhsRange.getEnd().getOpaquePointerValue());
-    }
-  };
-}
-
-class swift::ModuleSourceFileLocationMap {
-public:
-  unsigned numFiles = 0;
-  unsigned numAuxiliaryFiles = 0;
-  std::vector<SourceFile *> allSourceFiles;
-  SourceFile *lastSourceFile = nullptr;
-};
-
-void ModuleDecl::updateSourceFileLocationMap() {
-  // Allocate a source file location map, if we don't have one already.
-  if (!sourceFileLocationMap) {
-    ASTContext &ctx = getASTContext();
-    sourceFileLocationMap = ctx.Allocate<ModuleSourceFileLocationMap>();
-    ctx.addCleanup([sourceFileLocationMap=sourceFileLocationMap]() {
-      sourceFileLocationMap->~ModuleSourceFileLocationMap();
-    });
-  }
-
-  // If we are up-to-date, there's nothing to do.
-  ArrayRef<FileUnit *> files = Files;
-  if (sourceFileLocationMap->numFiles == files.size() &&
-      sourceFileLocationMap->numAuxiliaryFiles ==
-          AuxiliaryFiles.size())
-    return;
-
-  // Rebuild the range structure.
-  sourceFileLocationMap->allSourceFiles.clear();
-
-  // First, add all of the source files with a backing buffer.
-  for (auto *fileUnit : files) {
-    if (auto sourceFile = dyn_cast<SourceFile>(fileUnit)) {
-      if (sourceFile->getBufferID())
-        sourceFileLocationMap->allSourceFiles.push_back(sourceFile);
-    }
-  }
-
-  // Next, add all of the macro expansion files.
-  for (auto *sourceFile : AuxiliaryFiles)
-    sourceFileLocationMap->allSourceFiles.push_back(sourceFile);
-
-  // Finally, sort them all so we can do a binary search for lookup.
-  std::sort(sourceFileLocationMap->allSourceFiles.begin(),
-            sourceFileLocationMap->allSourceFiles.end(),
-            SourceFileRangeComparison{&getASTContext().SourceMgr});
-
-  sourceFileLocationMap->numFiles = files.size();
-  sourceFileLocationMap->numAuxiliaryFiles = AuxiliaryFiles.size();
-}
-
 SourceFile *ModuleDecl::getSourceFileContainingLocation(SourceLoc loc) {
   if (loc.isInvalid())
     return nullptr;
 
+  auto &sourceMgr = getASTContext().SourceMgr;
+
   // Check whether this location is in a "replaced" range, in which case
   // we want to use the original source file.
-  auto &sourceMgr = getASTContext().SourceMgr;
   SourceLoc adjustedLoc = loc;
   for (const auto &pair : sourceMgr.getReplacedRanges()) {
     if (sourceMgr.rangeContainsTokenLoc(pair.second, loc)) {
@@ -862,35 +782,14 @@ SourceFile *ModuleDecl::getSourceFileContainingLocation(SourceLoc loc) {
     }
   }
 
-  // Before we do any extra work, check the last source file we found a result
-  // in to see if it contains this.
-  if (sourceFileLocationMap) {
-    if (auto lastSourceFile = sourceFileLocationMap->lastSourceFile) {
-      auto range = sourceMgr.getRangeForBuffer(*lastSourceFile->getBufferID());
-      if (range.contains(adjustedLoc))
-        return lastSourceFile;
-    }
+  auto bufferID = sourceMgr.findBufferContainingLoc(adjustedLoc);
+  auto sourceFiles = sourceMgr.getSourceFilesForBufferID(bufferID);
+  for (auto sourceFile: sourceFiles) {
+    if (sourceFile->getParentModule() == this)
+      return sourceFile;
   }
 
-  updateSourceFileLocationMap();
-
-  auto found = std::lower_bound(sourceFileLocationMap->allSourceFiles.begin(),
-                                sourceFileLocationMap->allSourceFiles.end(),
-                                adjustedLoc,
-                                SourceFileRangeComparison{&sourceMgr});
-  if (found == sourceFileLocationMap->allSourceFiles.end())
-    return nullptr;
-
-  auto foundSourceFile = *found;
-  auto foundRange = sourceMgr.getRangeForBuffer(*foundSourceFile->getBufferID());
-  // Positions inside an empty file or at EOF should still be considered within
-  // this file.
-  if (!foundRange.contains(adjustedLoc) && adjustedLoc != foundRange.getEnd())
-    return nullptr;
-
-  // Update the last source file.
-  sourceFileLocationMap->lastSourceFile = foundSourceFile;
-  return foundSourceFile;
+  return nullptr;
 }
 
 std::pair<unsigned, SourceLoc>
@@ -902,7 +801,7 @@ ModuleDecl::getOriginalLocation(SourceLoc loc) const {
 
   SourceLoc startLoc = loc;
   unsigned startBufferID = bufferID;
-  while (llvm::Optional<GeneratedSourceInfo> info =
+  while (const GeneratedSourceInfo *info =
              SM.getGeneratedSourceInfo(bufferID)) {
     switch (info->kind) {
 #define MACRO_ROLE(Name, Description)  \
@@ -920,6 +819,8 @@ ModuleDecl::getOriginalLocation(SourceLoc loc) const {
       bufferID = SM.findBufferContainingLoc(loc);
       break;
     }
+    case GeneratedSourceInfo::DefaultArgument:
+      // No original location as it's not actually in any source file
     case GeneratedSourceInfo::ReplacedFunctionBody:
       // There's not really any "original" location for locations within
       // replaced function bodies. The body is actually different code to the
@@ -1176,9 +1077,17 @@ ASTNode SourceFile::getMacroExpansion() const {
   if (Kind != SourceFileKind::MacroExpansion)
     return nullptr;
 
-  auto genInfo =
-      *getASTContext().SourceMgr.getGeneratedSourceInfo(*getBufferID());
-  return ASTNode::getFromOpaqueValue(genInfo.astNode);
+  return getNodeInEnclosingSourceFile();
+}
+
+SourceRange SourceFile::getMacroInsertionRange() const {
+  if (Kind != SourceFileKind::MacroExpansion)
+    return SourceRange();
+
+  auto generatedInfo =
+      *getASTContext().SourceMgr.getGeneratedSourceInfo(getBufferID());
+  auto origRange = generatedInfo.originalSourceRange;
+  return {origRange.getStart(), origRange.getEnd()};
 }
 
 CustomAttr *SourceFile::getAttachedMacroAttribute() const {
@@ -1186,16 +1095,16 @@ CustomAttr *SourceFile::getAttachedMacroAttribute() const {
     return nullptr;
 
   auto genInfo =
-      *getASTContext().SourceMgr.getGeneratedSourceInfo(*getBufferID());
+      *getASTContext().SourceMgr.getGeneratedSourceInfo(getBufferID());
   return genInfo.attachedMacroCustomAttr;
 }
 
-llvm::Optional<MacroRole> SourceFile::getFulfilledMacroRole() const {
+std::optional<MacroRole> SourceFile::getFulfilledMacroRole() const {
   if (Kind != SourceFileKind::MacroExpansion)
-    return llvm::None;
+    return std::nullopt;
 
   auto genInfo =
-      *getASTContext().SourceMgr.getGeneratedSourceInfo(*getBufferID());
+      *getASTContext().SourceMgr.getGeneratedSourceInfo(getBufferID());
   switch (genInfo.kind) {
 #define MACRO_ROLE(Name, Description)               \
   case GeneratedSourceInfo::Name##MacroExpansion: \
@@ -1204,18 +1113,30 @@ llvm::Optional<MacroRole> SourceFile::getFulfilledMacroRole() const {
 
   case GeneratedSourceInfo::ReplacedFunctionBody:
   case GeneratedSourceInfo::PrettyPrinted:
-    return llvm::None;
+  case GeneratedSourceInfo::DefaultArgument:
+    return std::nullopt;
   }
 }
 
 SourceFile *SourceFile::getEnclosingSourceFile() const {
-  if (Kind != SourceFileKind::MacroExpansion)
+  if (Kind != SourceFileKind::MacroExpansion &&
+      Kind != SourceFileKind::DefaultArgument)
     return nullptr;
 
   auto genInfo =
-      *getASTContext().SourceMgr.getGeneratedSourceInfo(*getBufferID());
+      *getASTContext().SourceMgr.getGeneratedSourceInfo(getBufferID());
   auto sourceLoc = genInfo.originalSourceRange.getStart();
   return getParentModule()->getSourceFileContainingLocation(sourceLoc);
+}
+
+ASTNode SourceFile::getNodeInEnclosingSourceFile() const {
+  if (Kind != SourceFileKind::MacroExpansion &&
+      Kind != SourceFileKind::DefaultArgument)
+    return nullptr;
+
+  auto genInfo =
+      *getASTContext().SourceMgr.getGeneratedSourceInfo(getBufferID());
+  return ASTNode::getFromOpaqueValue(genInfo.astNode);
 }
 
 void ModuleDecl::lookupClassMember(ImportPath::Access accessPath,
@@ -1262,42 +1183,6 @@ bool ModuleDecl::shouldCollectDisplayDecls() const {
       return false;
   }
   return true;
-}
-
-void swift::collectParsedExportedImports(const ModuleDecl *M,
-                                         SmallPtrSetImpl<ModuleDecl *> &Imports,
-                                         llvm::SmallDenseMap<ModuleDecl *, SmallPtrSet<Decl *, 4>, 4> &QualifiedImports,
-                                         llvm::function_ref<bool(AttributedImport<ImportedModule>)> includeImport) {
-  for (const FileUnit *file : M->getFiles()) {
-    if (const SourceFile *source = dyn_cast<SourceFile>(file)) {
-      if (source->hasImports()) {
-        for (auto import : source->getImports()) {
-          if (import.options.contains(ImportFlags::Exported) &&
-              (!includeImport || includeImport(import)) &&
-              import.module.importedModule->shouldCollectDisplayDecls()) {
-            auto *TheModule = import.module.importedModule;
-
-            if (import.module.getAccessPath().size() > 0) {
-              if (QualifiedImports.find(TheModule) == QualifiedImports.end()) {
-                QualifiedImports.try_emplace(TheModule);
-              }
-              auto collectDecls = [&](ValueDecl *VD,
-                                      DeclVisibilityKind reason) {
-                if (reason == DeclVisibilityKind::VisibleAtTopLevel)
-                  QualifiedImports[TheModule].insert(VD);
-              };
-              auto consumer = makeDeclConsumer(std::move(collectDecls));
-              TheModule->lookupVisibleDecls(
-                  import.module.getAccessPath(), consumer,
-                  NLKind::UnqualifiedLookup);
-            } else if (!Imports.contains(TheModule)) {
-              Imports.insert(TheModule);
-            }
-          }
-        }
-      }
-    }
-  }
 }
 
 void ModuleDecl::getLocalTypeDecls(SmallVectorImpl<TypeDecl*> &Results) const {
@@ -1434,7 +1319,8 @@ void SourceFile::getPrecedenceGroups(
 }
 
 void SourceFile::getLocalTypeDecls(SmallVectorImpl<TypeDecl*> &Results) const {
-  Results.append(LocalTypeDecls.begin(), LocalTypeDecls.end());
+  auto decls = getLocalTypeDecls();
+  Results.append(decls.begin(), decls.end());
 }
 
 void
@@ -1446,7 +1332,7 @@ const {
 
 TypeDecl *SourceFile::lookupLocalType(llvm::StringRef mangledName) const {
   ASTContext &ctx = getASTContext();
-  for (auto typeDecl : LocalTypeDecls) {
+  for (auto typeDecl : getLocalTypeDecls()) {
     auto typeMangledName = evaluateOrDefault(ctx.evaluator,
                                              MangleLocalTypeDeclRequest { typeDecl },
                                              std::string());
@@ -1457,18 +1343,18 @@ TypeDecl *SourceFile::lookupLocalType(llvm::StringRef mangledName) const {
   return nullptr;
 }
 
-llvm::Optional<ExternalSourceLocs::RawLocs>
+std::optional<ExternalSourceLocs::RawLocs>
 SourceFile::getExternalRawLocsForDecl(const Decl *D) const {
   auto *FileCtx = D->getDeclContext()->getModuleScopeContext();
   assert(FileCtx == this && "D doesn't belong to this source file");
   if (FileCtx != this) {
     // D doesn't belong to this file. This shouldn't happen in practice.
-    return llvm::None;
+    return std::nullopt;
   }
 
   SourceLoc MainLoc = D->getLoc(/*SerializedOK=*/false);
   if (MainLoc.isInvalid())
-    return llvm::None;
+    return std::nullopt;
 
   // TODO: Rather than grabbing the location of the macro expansion, we should
   // instead add the generated buffer tree - that would need to include source
@@ -1477,11 +1363,11 @@ SourceFile::getExternalRawLocsForDecl(const Decl *D) const {
   bool InGeneratedBuffer =
       !SM.rangeContainsTokenLoc(SM.getRangeForBuffer(BufferID), MainLoc);
   if (InGeneratedBuffer) {
-    int UnderlyingBufferID;
+    unsigned UnderlyingBufferID;
     std::tie(UnderlyingBufferID, MainLoc) =
         D->getModuleContext()->getOriginalLocation(MainLoc);
     if (BufferID != UnderlyingBufferID)
-      return llvm::None;
+      return std::nullopt;
   }
 
   auto setLoc = [&](ExternalSourceLocs::RawLoc &RawLoc, SourceLoc Loc) {
@@ -1519,662 +1405,117 @@ SourceFile::getExternalRawLocsForDecl(const Decl *D) const {
   return Result;
 }
 
-void ModuleDecl::getDisplayDecls(SmallVectorImpl<Decl*> &Results, bool Recursive) const {
-  if (Recursive && isParsedModule(this)) {
-    SmallPtrSet<ModuleDecl *, 4> Modules;
-    llvm::SmallDenseMap<ModuleDecl *, SmallPtrSet<Decl *, 4>, 4> QualifiedImports;
-    collectParsedExportedImports(this, Modules, QualifiedImports);
-    for (const auto &QI : QualifiedImports) {
-      auto Module = QI.getFirst();
-      if (Modules.contains(Module)) continue;
+void ModuleDecl::ImportCollector::collect(
+    const ImportedModule &importedModule) {
+  auto *module = importedModule.importedModule;
 
-      auto &Decls = QI.getSecond();
-      Results.append(Decls.begin(), Decls.end());
-    }
-    for (const ModuleDecl *import : Modules) {
-      import->getDisplayDecls(Results, Recursive);
-    }
-  }
-  // FIXME: Should this do extra access control filtering?
-  FORWARD(getDisplayDecls, (Results));
+  if (!module->shouldCollectDisplayDecls())
+    return;
 
-#ifndef NDEBUG
-  if (Recursive) {
-    llvm::DenseSet<Decl *> visited;
-    for (auto *D : Results) {
-      // decls synthesized from implicit clang decls may appear multiple times;
-      // e.g. if multiple modules with underlying clang modules are re-exported.
-      // including duplicates of these is harmless, so skip them when counting
-      // this assertion
-      if (const auto *CD = D->getClangDecl()) {
-        if (CD->isImplicit()) continue;
-      }
+  if (importFilter && !importFilter(module))
+    return;
 
-      auto inserted = visited.insert(D).second;
-      assert(inserted && "there should be no duplicate decls");
-    }
-  }
-#endif
-}
-
-ProtocolConformanceRef
-ModuleDecl::lookupExistentialConformance(Type type, ProtocolDecl *protocol) {
-  ASTContext &ctx = getASTContext();
-
-  assert(type->isExistentialType());
-
-  // If the existential type cannot be represented or the protocol does not
-  // conform to itself, there's no point in looking further.
-  if (!protocol->existentialConformsToSelf())
-    return ProtocolConformanceRef::forInvalid();
-
-  if (protocol->isSpecificProtocol(KnownProtocolKind::Copyable)
-      && !ctx.LangOpts.hasFeature(Feature::NoncopyableGenerics)) {
-    // Prior to noncopyable generics, all existentials conform to Copyable.
-        return ProtocolConformanceRef(
-            ctx.getBuiltinConformance(type, protocol,
-                                      BuiltinConformanceKind::Synthesized));
-  }
-
-  auto layout = type->getExistentialLayout();
-
-  // Due to an IRGen limitation, witness tables cannot be passed from an
-  // existential to an archetype parameter, so for now we restrict this to
-  // @objc protocols and marker protocols.
-  if (!layout.isObjC() && !protocol->isMarkerProtocol()) {
-    auto constraint = type;
-    if (auto existential = constraint->getAs<ExistentialType>())
-      constraint = existential->getConstraintType();
-
-    // There's a specific exception for protocols with self-conforming
-    // witness tables, but the existential has to be *exactly* that type.
-    // TODO: synthesize witness tables on-demand for protocol compositions
-    // that can satisfy the requirement.
-    if (protocol->requiresSelfConformanceWitnessTable() &&
-        constraint->is<ProtocolType>() &&
-        constraint->castTo<ProtocolType>()->getDecl() == protocol)
-      return ProtocolConformanceRef(ctx.getSelfConformance(protocol));
-
-    return ProtocolConformanceRef::forInvalid();
-  }
-
-  // If the existential is class-constrained, the class might conform
-  // concretely.
-  if (auto superclass = layout.explicitSuperclass) {
-    if (auto result = lookupConformance(
-            superclass, protocol, /*allowMissing=*/false)) {
-      if (protocol->isSpecificProtocol(KnownProtocolKind::Sendable) &&
-          result.hasUnavailableConformance())
-        result = ProtocolConformanceRef::forInvalid();
-
-      return result;
-    }
-  }
-
-  // Otherwise, the existential might conform abstractly.
-  for (auto protoDecl : layout.getProtocols()) {
-
-    // If we found the protocol we're looking for, return an abstract
-    // conformance to it.
-    if (protoDecl == protocol)
-      return ProtocolConformanceRef(ctx.getSelfConformance(protocol));
-
-    // If the protocol has a superclass constraint, we might conform
-    // concretely.
-    if (auto superclass = protoDecl->getSuperclass()) {
-      if (auto result = lookupConformance(superclass, protocol))
-        return result;
-    }
-
-    // Now check refined protocols.
-    if (protoDecl->inheritsFrom(protocol))
-      return ProtocolConformanceRef(ctx.getSelfConformance(protocol));
-  }
-
-  // We didn't find our protocol in the existential's list; it doesn't
-  // conform.
-  return ProtocolConformanceRef::forInvalid();
-}
-
-/// Whether we should create missing conformances to the given protocol.
-static bool shouldCreateMissingConformances(Type type, ProtocolDecl *proto) {
-  // Sendable may be able to be synthesized.
-  if (proto->isSpecificProtocol(KnownProtocolKind::Sendable)) {
-    return true;
-  }
-
-  return false;
-}
-
-ProtocolConformanceRef ProtocolConformanceRef::forMissingOrInvalid(
-    Type type, ProtocolDecl *proto) {
-  // Introduce "missing" conformances when appropriate, so that type checking
-  // (and even code generation) can continue.
-  ASTContext &ctx = proto->getASTContext();
-  if (shouldCreateMissingConformances(type, proto)) {
-    return ProtocolConformanceRef(
-        ctx.getBuiltinConformance(
-          type, proto, BuiltinConformanceKind::Missing));
-  }
-
-  return ProtocolConformanceRef::forInvalid();
-}
-
-ProtocolConformanceRef ModuleDecl::lookupConformance(Type type,
-                                                     ProtocolDecl *protocol,
-                                                     bool allowMissing) {
-  // If we are recursively checking for implicit conformance of a nominal
-  // type to a KnownProtocol, fail without evaluating this request. This
-  // squashes cycles.
-  LookupConformanceInModuleRequest request{{this, type, protocol}};
-  if (auto kp = protocol->getKnownProtocolKind()) {
-    if (auto nominal = type->getAnyNominal()) {
-      ImplicitKnownProtocolConformanceRequest icvRequest{nominal, *kp};
-      if (getASTContext().evaluator.hasActiveRequest(icvRequest) ||
-          getASTContext().evaluator.hasActiveRequest(request)) {
-        assert(!getInvertibleProtocolKind(*kp));
-        return ProtocolConformanceRef::forInvalid();
-      }
-    }
-  }
-
-  auto result = evaluateOrDefault(
-      getASTContext().evaluator, request, ProtocolConformanceRef::forInvalid());
-
-  // If we aren't supposed to allow missing conformances but we have one,
-  // replace the result with an "invalid" result.
-  if (!allowMissing &&
-      shouldCreateMissingConformances(type, protocol) &&
-      result.hasMissingConformance(this))
-    return ProtocolConformanceRef::forInvalid();
-
-  return result;
-}
-
-/// Synthesize a builtin tuple type conformance to the given protocol, if
-/// appropriate.
-static ProtocolConformanceRef getBuiltinTupleTypeConformance(
-    Type type, const TupleType *tupleType, ProtocolDecl *protocol,
-    ModuleDecl *module) {
-  ASTContext &ctx = protocol->getASTContext();
-
-  auto *tupleDecl = ctx.getBuiltinTupleDecl();
-
-  // Find the (unspecialized) conformance.
-  SmallVector<ProtocolConformance *, 2> conformances;
-  if (tupleDecl->lookupConformance(protocol, conformances)) {
-    // If we have multiple conformances, first try to filter out any that are
-    // unavailable on the current deployment target.
-    //
-    // FIXME: Conformance lookup should really depend on source location for
-    // this to be 100% correct.
-    if (conformances.size() > 1) {
-      SmallVector<ProtocolConformance *, 2> availableConformances;
-
-      for (auto *conformance : conformances) {
-        if (conformance->getDeclContext()->isAlwaysAvailableConformanceContext())
-          availableConformances.push_back(conformance);
-      }
-
-      // Don't filter anything out if all conformances are unavailable.
-      if (!availableConformances.empty())
-        std::swap(availableConformances, conformances);
-    }
-
-    auto *conformance = cast<NormalProtocolConformance>(conformances.front());
-    auto subMap = type->getContextSubstitutionMap(module,
-                                                  conformance->getDeclContext());
-
-    // TODO: labels
-    auto *specialized = ctx.getSpecializedConformance(type, conformance, subMap);
-    return ProtocolConformanceRef(specialized);
-  }
-
-  return ProtocolConformanceRef::forMissingOrInvalid(type, protocol);
-}
-
-using EitherFunctionType =
-    llvm::PointerUnion<const SILFunctionType *, const FunctionType *>;
-
-/// Whether the given function type conforms to Sendable.
-static bool isSendableFunctionType(EitherFunctionType eitherFnTy) {
-  FunctionTypeRepresentation representation;
-
-  if (auto silFnTy = eitherFnTy.dyn_cast<const SILFunctionType *>()) {
-    if (silFnTy->isSendable())
-      return true;
-
-    // convert SILFunctionTypeRepresentation -> FunctionTypeRepresentation
-    auto converted = convertRepresentation(silFnTy->getRepresentation());
-    if (!converted)
-      return false;
-
-    representation = *converted;
-
+  if (importedModule.getAccessPath().size() > 0) {
+    auto collectDecls = [&](ValueDecl *VD, DeclVisibilityKind reason) {
+      if (reason == DeclVisibilityKind::VisibleAtTopLevel)
+        this->qualifiedImports[module].insert(VD);
+    };
+    auto consumer = makeDeclConsumer(std::move(collectDecls));
+    module->lookupVisibleDecls(importedModule.getAccessPath(), consumer,
+                               NLKind::UnqualifiedLookup);
   } else {
-    auto functionType = eitherFnTy.get<const FunctionType *>();
-
-    if (functionType->isSendable())
-      return true;
-
-    representation = functionType->getExtInfo().getRepresentation();
-  }
-
-  // C and thin function types have no captures, so they are Sendable.
-  switch (representation) {
-  case FunctionTypeRepresentation::Block:
-  case FunctionTypeRepresentation::Swift:
-    return false;
-
-  case FunctionTypeRepresentation::CFunctionPointer:
-  case FunctionTypeRepresentation::Thin:
-    return true;
+    imports.insert(module);
   }
 }
 
-/// Whether the given function type conforms to Escapable.
-static bool isEscapableFunctionType(EitherFunctionType eitherFnTy) {
-  if (auto silFnTy = eitherFnTy.dyn_cast<const SILFunctionType *>()) {
-    return !silFnTy->isNoEscape();
-  }
-
-  auto functionType = eitherFnTy.get<const FunctionType *>();
-
-  // TODO: what about autoclosures?
-  return !functionType->isNoEscape();
-}
-
-/// Synthesize a builtin function type conformance to the given protocol, if
-/// appropriate.
-static ProtocolConformanceRef getBuiltinFunctionTypeConformance(
-    Type type, EitherFunctionType functionType, ProtocolDecl *protocol) {
-  ASTContext &ctx = protocol->getASTContext();
-
-  auto synthesizeConformance = [&]() -> ProtocolConformanceRef {
-    return ProtocolConformanceRef(
-        ctx.getBuiltinConformance(type, protocol,
-                                  BuiltinConformanceKind::Synthesized));
-  };
-
-  if (auto kp = protocol->getKnownProtocolKind()) {
-    switch (*kp) {
-    case KnownProtocolKind::Escapable:
-      if (isEscapableFunctionType(functionType))
-        return synthesizeConformance();
-      break;
-    case KnownProtocolKind::Sendable:
-      // @Sendable function types are Sendable.
-      if (isSendableFunctionType(functionType))
-        return synthesizeConformance();
-      break;
-    case KnownProtocolKind::Copyable:
-      // Functions cannot permanently destroy a move-only var/let
-      // that they capture, so it's safe to copy functions, like classes.
-      return synthesizeConformance();
-    default:
-      break;
-    }
-  }
-
-  return ProtocolConformanceRef::forMissingOrInvalid(type, protocol);
-}
-
-/// Synthesize a builtin metatype type conformance to the given protocol, if
-/// appropriate.
-static ProtocolConformanceRef getBuiltinMetaTypeTypeConformance(
-    Type type, const AnyMetatypeType *metatypeType, ProtocolDecl *protocol) {
-  ASTContext &ctx = protocol->getASTContext();
-
-  if (!ctx.LangOpts.hasFeature(swift::Feature::NoncopyableGenerics) &&
-      protocol->isSpecificProtocol(KnownProtocolKind::Copyable)) {
-    // Only metatypes of Copyable types are Copyable.
-    if (metatypeType->getInstanceType()->isNoncopyable()) {
-      return ProtocolConformanceRef::forMissingOrInvalid(type, protocol);
-    } else {
-      return ProtocolConformanceRef(
-          ctx.getBuiltinConformance(type, protocol,
-                                    BuiltinConformanceKind::Synthesized));
-    }
-  }
-
-  // All metatypes are Sendable, Copyable, and Escapable.
-  if (auto kp = protocol->getKnownProtocolKind()) {
-    switch (*kp) {
-    case KnownProtocolKind::Sendable:
-    case KnownProtocolKind::Copyable:
-    case KnownProtocolKind::Escapable:
-      return ProtocolConformanceRef(
-          ctx.getBuiltinConformance(type, protocol,
-                                    BuiltinConformanceKind::Synthesized));
-    default:
-      break;
-    }
-  }
-
-  return ProtocolConformanceRef::forMissingOrInvalid(type, protocol);
-}
-
-/// Synthesize a builtin type conformance to the given protocol, if
-/// appropriate.
-static ProtocolConformanceRef getBuiltinBuiltinTypeConformance(
-    Type type, const BuiltinType *builtinType, ProtocolDecl *protocol) {
-  // All builtin are Sendable, Copyable, and Escapable
-  if (auto kp = protocol->getKnownProtocolKind()) {
-    switch (*kp) {
-    case KnownProtocolKind::Sendable:
-    case KnownProtocolKind::Copyable:
-    case KnownProtocolKind::Escapable: {
-      ASTContext &ctx = protocol->getASTContext();
-      return ProtocolConformanceRef(
-          ctx.getBuiltinConformance(type, protocol,
-                                  BuiltinConformanceKind::Synthesized));
-    }
-    default:
-      break;
-    }
-  }
-
-  return ProtocolConformanceRef::forMissingOrInvalid(type, protocol);
-}
-
-static ProtocolConformanceRef getPackTypeConformance(
-    PackType *type, ProtocolDecl *protocol, ModuleDecl *mod) {
-  SmallVector<ProtocolConformanceRef, 2> patternConformances;
-
-  for (auto packElement : type->getElementTypes()) {
-    if (auto *packExpansion = packElement->getAs<PackExpansionType>()) {
-      auto patternType = packExpansion->getPatternType();
-
-      auto patternConformance =
-          (patternType->isTypeParameter()
-           ? ProtocolConformanceRef(protocol)
-           : mod->lookupConformance(patternType, protocol,
-                                    /*allowMissing=*/true));
-      patternConformances.push_back(patternConformance);
+static void
+collectExportedImports(const ModuleDecl *topLevelModule,
+                       ModuleDecl::ImportCollector &importCollector) {
+  SmallVector<const ModuleDecl *> stack;
+  stack.push_back(topLevelModule);
+  while (!stack.empty()) {
+    const ModuleDecl *module = stack.pop_back_val();
+    if (module->isNonSwiftModule())
       continue;
-    }
 
-    auto patternConformance =
-        (packElement->isTypeParameter()
-         ? ProtocolConformanceRef(protocol)
-         : mod->lookupConformance(packElement, protocol,
-                                  /*allowMissing=*/true));
-    patternConformances.push_back(patternConformance);
-  }
-
-  return ProtocolConformanceRef(
-      PackConformance::get(type, protocol, patternConformances));
-}
-
-ProtocolConformanceRef
-LookupConformanceInModuleRequest::evaluate(
-    Evaluator &evaluator, LookupConformanceDescriptor desc) const {
-  auto *mod = desc.Mod;
-  auto type = desc.Ty;
-  auto *protocol = desc.PD;
-  ASTContext &ctx = mod->getASTContext();
-
-  // A dynamic Self type conforms to whatever its underlying type
-  // conforms to.
-  if (auto selfType = type->getAs<DynamicSelfType>())
-    type = selfType->getSelfType();
-
-  // An archetype conforms to a protocol if the protocol is listed in the
-  // archetype's list of conformances, or if the archetype has a superclass
-  // constraint and the superclass conforms to the protocol.
-  if (auto archetype = type->getAs<ArchetypeType>()) {
-
-    // Without noncopyable generics, all archetypes are Copyable
-    if (!ctx.LangOpts.hasFeature(Feature::NoncopyableGenerics))
-      if (protocol->isSpecificProtocol(KnownProtocolKind::Copyable))
-        return ProtocolConformanceRef(protocol);
-
-    // The generic signature builder drops conformance requirements that are made
-    // redundant by a superclass requirement, so check for a concrete
-    // conformance first, since an abstract conformance might not be
-    // able to be resolved by a substitution that makes the archetype
-    // concrete.
-    if (auto super = archetype->getSuperclass()) {
-      auto inheritedConformance = mod->lookupConformance(
-          super, protocol, /*allowMissing=*/false);
-      if (protocol->isSpecificProtocol(KnownProtocolKind::Sendable) &&
-          inheritedConformance.hasUnavailableConformance())
-        inheritedConformance = ProtocolConformanceRef::forInvalid();
-      if (inheritedConformance) {
-        return ProtocolConformanceRef(ctx.getInheritedConformance(
-            type, inheritedConformance.getConcrete()));
-      }
-    }
-
-    for (auto ap : archetype->getConformsTo()) {
-      if (ap == protocol || ap->inheritsFrom(protocol))
-        return ProtocolConformanceRef(protocol);
-    }
-
-    return ProtocolConformanceRef::forMissingOrInvalid(type, protocol);
-  }
-
-  // An existential conforms to a protocol if the protocol is listed in the
-  // existential's list of conformances and the existential conforms to
-  // itself.
-  if (type->isExistentialType()) {
-    auto result = mod->lookupExistentialConformance(type, protocol);
-    if (result.isInvalid())
-      return ProtocolConformanceRef::forMissingOrInvalid(type, protocol);
-    return result;
-  }
-
-  // Type variables have trivial conformances.
-  if (type->isTypeVariableOrMember())
-    return ProtocolConformanceRef(protocol);
-
-  // UnresolvedType is a placeholder for an unknown type used when generating
-  // diagnostics.  We consider it to conform to all protocols, since the
-  // intended type might have. Same goes for PlaceholderType.
-  if (type->is<UnresolvedType>() || type->is<PlaceholderType>())
-    return ProtocolConformanceRef(protocol);
-
-  // Pack types can conform to protocols.
-  if (auto packType = type->getAs<PackType>()) {
-    return getPackTypeConformance(packType, protocol, mod);
-  }
-
-  // Tuple types can conform to protocols.
-  if (auto tupleType = type->getAs<TupleType>()) {
-    return getBuiltinTupleTypeConformance(type, tupleType, protocol, mod);
-  }
-
-  // Function types can conform to protocols.
-  if (auto functionType = type->getAs<FunctionType>()) {
-    return getBuiltinFunctionTypeConformance(type, functionType, protocol);
-  }
-
-  // SIL function types in the AST can conform to protocols
-  if (auto silFn = type->getAs<SILFunctionType>()) {
-    return getBuiltinFunctionTypeConformance(type, silFn, protocol);
-  }
-
-  // Metatypes can conform to protocols.
-  if (auto metatypeType = type->getAs<AnyMetatypeType>()) {
-    return getBuiltinMetaTypeTypeConformance(type, metatypeType, protocol);
-  }
-
-  // Builtin types can conform to protocols.
-  if (auto builtinType = type->getAs<BuiltinType>()) {
-    return getBuiltinBuiltinTypeConformance(type, builtinType, protocol);
-  }
-
-#ifndef NDEBUG
-  // Ensure we haven't missed queries for the specialty SIL types
-  // in the AST in conformance to one of the invertible protocols.
-  if (auto kp = protocol->getKnownProtocolKind())
-    if (getInvertibleProtocolKind(*kp))
-      assert(!(type->is<SILFunctionType,
-                        SILBoxType,
-                        SILMoveOnlyWrappedType,
-                        SILPackType,
-                        SILTokenType>()));
-#endif
-
-  auto nominal = type->getAnyNominal();
-
-  // If we don't have a nominal type, there are no conformances.
-  if (!nominal || isa<ProtocolDecl>(nominal))
-    return ProtocolConformanceRef::forMissingOrInvalid(type, protocol);
-
-  // Expand conformances added by extension macros.
-  //
-  // FIXME: This expansion should only be done if the
-  // extension macro can generate a conformance to the
-  // given protocol, but conformance macros do not specify
-  // that information upfront.
-  (void)evaluateOrDefault(
-      ctx.evaluator,
-      ExpandExtensionMacros{nominal},
-      { });
-
-  // Find the (unspecialized) conformance.
-  SmallVector<ProtocolConformance *, 2> conformances;
-  if (!nominal->lookupConformance(protocol, conformances)) {
-    if (protocol->isSpecificProtocol(KnownProtocolKind::Sendable)) {
-      // Try to infer Sendable conformance.
-      ImplicitKnownProtocolConformanceRequest
-          cvRequest{nominal, KnownProtocolKind::Sendable};
-      if (auto conformance = evaluateOrDefault(
-              ctx.evaluator, cvRequest, nullptr)) {
-        conformances.clear();
-        conformances.push_back(conformance);
-      } else {
-        return ProtocolConformanceRef::forMissingOrInvalid(type, protocol);
-      }
-    } else if (protocol->isSpecificProtocol(KnownProtocolKind::Encodable) ||
-               protocol->isSpecificProtocol(KnownProtocolKind::Decodable)) {
-      if (nominal->isDistributedActor()) {
-        auto protoKind =
-            protocol->isSpecificProtocol(KnownProtocolKind::Encodable)
-                ? KnownProtocolKind::Encodable
-                : KnownProtocolKind::Decodable;
-        auto request = GetDistributedActorImplicitCodableRequest{
-          nominal, protoKind};
-
-        if (auto conformance =
-                evaluateOrDefault(ctx.evaluator, request, nullptr)) {
-          conformances.clear();
-          conformances.push_back(conformance);
-        } else {
-          return ProtocolConformanceRef::forMissingOrInvalid(type, protocol);
+    for (const FileUnit *file : module->getFiles()) {
+      if (const SourceFile *source = dyn_cast<SourceFile>(file)) {
+        if (source->hasImports()) {
+          for (const auto &import : source->getImports()) {
+            if (import.options.contains(ImportFlags::Exported) &&
+                import.docVisibility.value_or(AccessLevel::Public) >=
+                importCollector.minimumDocVisibility) {
+              importCollector.collect(import.module);
+              stack.push_back(import.module.importedModule);
+            }
+          }
         }
       } else {
-        return ProtocolConformanceRef::forMissingOrInvalid(type, protocol);
+        SmallVector<ImportedModule, 8> exportedImports;
+        file->getImportedModules(exportedImports,
+                                 ModuleDecl::ImportFilterKind::Exported);
+        for (const auto &im : exportedImports) {
+          // Skip collecting the underlying clang module as we already have the relevant import.
+          if (module->isClangOverlayOf(im.importedModule))
+            continue;
+          importCollector.collect(im);
+          stack.push_back(im.importedModule);
+        }
       }
-    } else if (protocol->isSpecificProtocol(KnownProtocolKind::Copyable)
-               || protocol->isSpecificProtocol(KnownProtocolKind::Escapable)) {
-      const auto kp = protocol->getKnownProtocolKind().value();
-
-      if (!ctx.LangOpts.hasFeature(Feature::NoncopyableGenerics)
-          && kp == KnownProtocolKind::Copyable) {
-        // Return an abstract conformance to maintain legacy compatability.
-        // We only need to do this until we are properly dealing with or
-        // omitting Copyable conformances in modules/interfaces.
-
-        if (nominal->canBeNoncopyable())
-          return ProtocolConformanceRef::forMissingOrInvalid(type, protocol);
-        else
-          return ProtocolConformanceRef(protocol);
-      }
-
-      // Try to infer the conformance.
-      ImplicitKnownProtocolConformanceRequest cvRequest{nominal, kp};
-      if (auto conformance = evaluateOrDefault(
-          ctx.evaluator, cvRequest, nullptr)) {
-        conformances.clear();
-        conformances.push_back(conformance);
-      } else {
-        return ProtocolConformanceRef::forMissingOrInvalid(type, protocol);
-      }
-    } else {
-      // Was unable to infer the missing conformance.
-      return ProtocolConformanceRef::forMissingOrInvalid(type, protocol);
     }
   }
+}
 
-  assert(!conformances.empty());
+void ModuleDecl::getDisplayDecls(SmallVectorImpl<Decl*> &Results, bool Recursive) const {
+  if (Recursive) {
+    ImportCollector importCollector;
+    this->getDisplayDeclsRecursivelyAndImports(Results, importCollector);
+  } else {
+    // FIXME: Should this do extra access control filtering?
+    FORWARD(getDisplayDecls, (Results));
+  }
+}
 
-  // If we have multiple conformances, first try to filter out any that are
-  // unavailable on the current deployment target.
-  //
-  // FIXME: Conformance lookup should really depend on source location for
-  // this to be 100% correct.
-  if (conformances.size() > 1) {
-    SmallVector<ProtocolConformance *, 2> availableConformances;
+void ModuleDecl::getDisplayDeclsRecursivelyAndImports(
+    SmallVectorImpl<Decl *> &results, ImportCollector &importCollector) const {
+  this->getDisplayDecls(results, /*Recursive=*/false);
 
-    for (auto *conformance : conformances) {
-      if (conformance->getDeclContext()->isAlwaysAvailableConformanceContext())
-        availableConformances.push_back(conformance);
+  // Look up imports recursively.
+  collectExportedImports(this, importCollector);
+  for (const auto &QI : importCollector.qualifiedImports) {
+    auto Module = QI.getFirst();
+    if (importCollector.imports.contains(Module))
+      continue;
+
+    auto &Decls = QI.getSecond();
+    results.append(Decls.begin(), Decls.end());
+  }
+
+  for (const ModuleDecl *import : importCollector.imports)
+    import->getDisplayDecls(results);
+
+#ifndef NDEBUG
+  llvm::DenseSet<Decl *> visited;
+  for (auto *D : results) {
+    // decls synthesized from implicit clang decls may appear multiple times;
+    // e.g. if multiple modules with underlying clang modules are re-exported.
+    // including duplicates of these is harmless, so skip them when counting
+    // this assertion
+    if (const auto *CD = D->getClangDecl()) {
+      if (CD->isImplicit())
+        continue;
     }
-
-    // Don't filter anything out if all conformances are unavailable.
-    if (!availableConformances.empty())
-      std::swap(availableConformances, conformances);
+    auto inserted = visited.insert(D).second;
+    assert(inserted && "there should be no duplicate decls");
   }
-
-  // If we still have multiple conformances, just pick the first one.
-  auto conformance = conformances.front();
-
-  // Rebuild inherited conformances based on the root normal conformance.
-  // FIXME: This is a hack to work around our inability to handle multiple
-  // levels of substitution through inherited conformances elsewhere in the
-  // compiler.
-  if (auto inherited = dyn_cast<InheritedProtocolConformance>(conformance)) {
-    // Dig out the conforming nominal type.
-    auto rootConformance = inherited->getRootConformance();
-    auto conformingClass
-      = rootConformance->getType()->getClassOrBoundGenericClass();
-
-    // Map up to our superclass's type.
-    auto superclassTy = type->getSuperclassForDecl(conformingClass);
-
-    // Compute the conformance for the inherited type.
-    auto inheritedConformance = mod->lookupConformance(
-        superclassTy, protocol, /*allowMissing=*/true);
-    assert(inheritedConformance &&
-           "We already found the inherited conformance");
-
-    // Create the inherited conformance entry.
-    conformance =
-        ctx.getInheritedConformance(type, inheritedConformance.getConcrete());
-    return ProtocolConformanceRef(conformance);
-  }
-
-  // If the type is specialized, find the conformance for the generic type.
-  if (type->isSpecialized()) {
-    // Figure out the type that's explicitly conforming to this protocol.
-    Type explicitConformanceType = conformance->getType();
-    DeclContext *explicitConformanceDC = conformance->getDeclContext();
-
-    // If the explicit conformance is associated with a type that is different
-    // from the type we're checking, retrieve generic conformance.
-    if (!explicitConformanceType->isEqual(type)) {
-      // Gather the substitutions we need to map the generic conformance to
-      // the specialized conformance.
-      auto subMap = type->getContextSubstitutionMap(mod, explicitConformanceDC);
-
-      // Create the specialized conformance entry.
-      auto result = ctx.getSpecializedConformance(type,
-        cast<RootProtocolConformance>(conformance), subMap);
-      return ProtocolConformanceRef(result);
-    }
-  }
-
-  // Record and return the simple conformance.
-  return ProtocolConformanceRef(conformance);
+#endif
 }
 
 Fingerprint SourceFile::getInterfaceHash() const {
   assert(hasInterfaceHash() && "Interface hash not enabled");
   auto &eval = getASTContext().evaluator;
   auto *mutableThis = const_cast<SourceFile *>(this);
-  llvm::Optional<StableHasher> interfaceHasher =
+  std::optional<StableHasher> interfaceHasher =
       evaluateOrDefault(eval, ParseSourceFileRequest{mutableThis}, {})
           .InterfaceHasher;
   return Fingerprint{StableHasher{interfaceHasher.value()}.finalize()};
@@ -2275,9 +1616,62 @@ void ModuleDecl::getImportedModules(SmallVectorImpl<ImportedModule> &modules,
   FORWARD(getImportedModules, (modules, filter));
 }
 
-void ModuleDecl::getMissingImportedModules(
+void ModuleDecl::getExternalMacros(
+    SmallVectorImpl<ExternalMacroPlugin> &macros) const {
+  FORWARD(getExternalMacros, (macros));
+}
+
+void ModuleDecl::getImplicitImportsForModuleInterface(
     SmallVectorImpl<ImportedModule> &imports) const {
-  FORWARD(getMissingImportedModules, (imports));
+  FORWARD(getImplicitImportsForModuleInterface, (imports));
+}
+
+const llvm::DenseMap<const clang::Module *, ModuleDecl *> &
+ModuleDecl::getVisibleClangModules(PrintOptions::InterfaceMode contentMode) {
+  if (CachedVisibleClangModuleSet.find(contentMode) != CachedVisibleClangModuleSet.end())
+    return CachedVisibleClangModuleSet[contentMode];
+  else
+    CachedVisibleClangModuleSet.emplace(contentMode, VisibleClangModuleSet{});
+  VisibleClangModuleSet &result = CachedVisibleClangModuleSet[contentMode];
+
+  // For the current module, consider both private and public imports.
+  ModuleDecl::ImportFilter Filter = ModuleDecl::ImportFilterKind::Exported;
+  Filter |= ModuleDecl::ImportFilterKind::Default;
+
+  // For private or package swiftinterfaces, also look through @_spiOnly imports.
+  if (contentMode != PrintOptions::InterfaceMode::Public)
+    Filter |= ModuleDecl::ImportFilterKind::SPIOnly;
+  // Consider package import for package interface
+  if (contentMode == PrintOptions::InterfaceMode::Package)
+    Filter |= ModuleDecl::ImportFilterKind::PackageOnly;
+
+  SmallVector<ImportedModule, 32> Imports;
+  getImportedModules(Imports, Filter);
+
+  SmallVector<ModuleDecl *, 32> ModulesToProcess;
+  for (const auto &Import : Imports)
+    ModulesToProcess.push_back(Import.importedModule);
+
+  SmallPtrSet<ModuleDecl *, 32> Processed;
+  while (!ModulesToProcess.empty()) {
+    ModuleDecl *Mod = ModulesToProcess.back();
+    ModulesToProcess.pop_back();
+
+    if (!Processed.insert(Mod).second)
+      continue;
+
+    if (const clang::Module *ClangModule = Mod->findUnderlyingClangModule())
+      result[ClangModule] = Mod;
+
+    // For transitive imports, consider only public imports.
+    Imports.clear();
+    Mod->getImportedModules(Imports, ModuleDecl::ImportFilterKind::Exported);
+    for (const auto &Import : Imports) {
+      ModulesToProcess.push_back(Import.importedModule);
+    }
+  }
+
+  return result;
 }
 
 void
@@ -2318,9 +1712,32 @@ SourceFile::getImportedModules(SmallVectorImpl<ImportedModule> &modules,
   }
 }
 
-void SourceFile::getMissingImportedModules(
+void SourceFile::getExternalMacros(
+    SmallVectorImpl<ExternalMacroPlugin> &macros) const {
+  for (auto *D : getTopLevelDecls()) {
+    auto macroDecl = dyn_cast<MacroDecl>(D);
+    if (!macroDecl)
+      continue;
+
+    auto macroDef = macroDecl->getDefinition();
+    if (macroDef.kind != MacroDefinition::Kind::External)
+      continue;
+
+    auto formalAccess = macroDecl->getFormalAccess();
+    ExternalMacroPlugin::Access access = ExternalMacroPlugin::Access::Internal;
+    if (formalAccess >= AccessLevel::Public)
+      access = ExternalMacroPlugin::Access::Public;
+    else if (formalAccess >= AccessLevel::Package)
+      access = ExternalMacroPlugin::Access::Package;
+
+    auto external = macroDef.getExternalMacro();
+    macros.push_back({external.moduleName.str().str(), access});
+  }
+}
+
+void SourceFile::getImplicitImportsForModuleInterface(
     SmallVectorImpl<ImportedModule> &modules) const {
-  for (auto module : MissingImportedModules)
+  for (auto module : ImplicitImportsForModuleInterface)
     modules.push_back(module);
 }
 
@@ -2426,6 +1843,15 @@ ImportedModule::removeDuplicates(SmallVectorImpl<ImportedModule> &imports) {
   imports.erase(last, imports.end());
 }
 
+Identifier ModuleDecl::getPublicModuleName(bool onlyIfImported) const {
+  if (!PublicModuleName.empty() &&
+      (!onlyIfImported ||
+       getASTContext().getLoadedModule(PublicModuleName)))
+    return PublicModuleName;
+
+  return getName();
+}
+
 Identifier ModuleDecl::getRealName() const {
   // This will return the real name for an alias (if used) or getName()
   return getASTContext().getRealModuleName(getName());
@@ -2458,6 +1884,11 @@ Identifier ModuleDecl::getABIName() const {
   }
 
   return getName();
+}
+
+void ModuleDecl::setABIName(Identifier name) {
+  getASTContext().moduleABINameWillChange(this, name);
+  ModuleABIName = name;
 }
 
 StringRef ModuleDecl::getModuleFilename() const {
@@ -2560,8 +1991,7 @@ NominalTypeDecl *ModuleDecl::getMainTypeDecl() const {
 }
 
 bool ModuleDecl::registerEntryPointFile(
-    FileUnit *file, SourceLoc diagLoc,
-    llvm::Optional<ArtificialMainKind> kind) {
+    FileUnit *file, SourceLoc diagLoc, std::optional<ArtificialMainKind> kind) {
   if (!EntryPointInfo.hasEntryPoint()) {
     EntryPointInfo.setEntryPointFile(file);
     return false;
@@ -2599,8 +2029,8 @@ bool ModuleDecl::registerEntryPointFile(
     if (existingDecl) {
       existingDiagLoc = sourceFile->getMainDeclDiagLoc();
     } else {
-      if (auto bufID = sourceFile->getBufferID())
-        existingDiagLoc = getASTContext().SourceMgr.getLocForBufferStart(*bufID);
+      auto bufID = sourceFile->getBufferID();
+      existingDiagLoc = getASTContext().SourceMgr.getLocForBufferStart(bufID);
     }
   }
 
@@ -2643,12 +2073,23 @@ bool ModuleDecl::registerEntryPointFile(
 }
 
 void ModuleDecl::collectLinkLibraries(LinkLibraryCallback callback) const {
-  // FIXME: The proper way to do this depends on the decls used.
-  FORWARD(collectLinkLibraries, (callback));
-}
+  bool hasSourceFile = false;
 
-void
-SourceFile::collectLinkLibraries(ModuleDecl::LinkLibraryCallback callback) const {
+  for (auto *file : getFiles()) {
+    if (isa<SourceFile>(file)) {
+      hasSourceFile = true;
+    } else {
+      file->collectLinkLibraries(callback);
+    }
+
+    if (auto *synth = file->getSynthesizedFile()) {
+      synth->collectLinkLibraries(callback);
+    }
+  }
+
+  if (!hasSourceFile)
+    return;
+
   llvm::SmallDenseSet<ModuleDecl *, 32> visited;
   SmallVector<ImportedModule, 32> stack;
 
@@ -2656,17 +2097,15 @@ SourceFile::collectLinkLibraries(ModuleDecl::LinkLibraryCallback callback) const
       ModuleDecl::ImportFilterKind::Exported,
       ModuleDecl::ImportFilterKind::Default};
 
-  auto *topLevel = getParentModule();
-
   ModuleDecl::ImportFilter topLevelFilter = filter;
   topLevelFilter |= ModuleDecl::ImportFilterKind::ImplementationOnly;
   topLevelFilter |= ModuleDecl::ImportFilterKind::InternalOrBelow;
   topLevelFilter |= ModuleDecl::ImportFilterKind::PackageOnly,
   topLevelFilter |= ModuleDecl::ImportFilterKind::SPIOnly;
-  topLevel->getImportedModules(stack, topLevelFilter);
+  getImportedModules(stack, topLevelFilter);
 
   // Make sure the top-level module is first; we want pre-order-ish traversal.
-  stack.emplace_back(ImportPath::Access(), topLevel);
+  stack.emplace_back(ImportPath::Access(), const_cast<ModuleDecl *>(this));
 
   while (!stack.empty()) {
     auto next = stack.pop_back_val().importedModule;
@@ -2674,13 +2113,16 @@ SourceFile::collectLinkLibraries(ModuleDecl::LinkLibraryCallback callback) const
     if (!visited.insert(next).second)
       continue;
 
-    if (next->getName() != getParentModule()->getName()) {
+    if (next->getName() != getName()) {
       next->collectLinkLibraries(callback);
     }
 
     next->getImportedModules(stack, filter);
   }
 }
+
+void
+SourceFile::collectLinkLibraries(ModuleDecl::LinkLibraryCallback callback) const {}
 
 bool ModuleDecl::walk(ASTWalker &Walker) {
   llvm::SaveAndRestore<ASTWalker::ParentTy> SAR(Walker.Parent, this);
@@ -2704,14 +2146,6 @@ const clang::Module *ModuleDecl::findUnderlyingClangModule() const {
       return Mod;
   }
   return nullptr;
-}
-
-bool ModuleDecl::isExportedAs(const ModuleDecl *other) const {
-  auto clangModule = findUnderlyingClangModule();
-  if (!clangModule)
-    return false;
-
-  return other->getRealName().str() == clangModule->ExportAsModule;
 }
 
 void ModuleDecl::collectBasicSourceFileInfo(
@@ -2903,7 +2337,7 @@ void ModuleDecl::findDeclaredCrossImportOverlaysTransitive(
         for (Identifier overlay: overlays) {
           // We don't present non-underscored overlays as part of the underlying
           // module, so ignore them.
-          if (!overlay.str().startswith("_"))
+          if (!overlay.hasUnderscoredNaming())
             continue;
           ModuleDecl *overlayMod =
               getASTContext().getModuleByName(overlay.str());
@@ -2991,7 +2425,7 @@ ModuleDecl::getDeclaringModuleAndBystander() {
   return *(declaringModuleAndBystander = {nullptr, Identifier()});
 }
 
-bool ModuleDecl::isClangOverlayOf(ModuleDecl *potentialUnderlying) {
+bool ModuleDecl::isClangOverlayOf(ModuleDecl *potentialUnderlying) const {
   return getUnderlyingModuleIfOverlay() == potentialUnderlying;
 }
 
@@ -3035,6 +2469,14 @@ bool ModuleDecl::getRequiredBystandersIfCrossImportOverlay(
       return true;
   }
   return false;
+}
+
+bool ModuleDecl::isClangHeaderImportModule() const {
+  auto importer = getASTContext().getClangModuleLoader();
+  if (!importer)
+    return false;
+
+  return this == importer->getImportedHeaderModule();
 }
 
 namespace {
@@ -3178,6 +2620,41 @@ SourceFile::setImports(ArrayRef<AttributedImport<ImportedModule>> imports) {
   Imports = getASTContext().AllocateCopy(imports);
 }
 
+std::optional<AttributedImport<ImportedModule>>
+SourceFile::findImport(const ModuleDecl *module) const {
+  return evaluateOrDefault(getASTContext().evaluator,
+                           ImportDeclRequest{this, module}, std::nullopt);
+}
+
+std::optional<AttributedImport<ImportedModule>>
+ImportDeclRequest::evaluate(Evaluator &evaluator, const SourceFile *sf,
+                            const ModuleDecl *module) const {
+  auto &ctx = sf->getASTContext();
+  auto imports = sf->getImports();
+
+  auto mutModule = const_cast<ModuleDecl *>(module);
+  // Look to see if the owning module was directly imported.
+  for (const auto &import : imports) {
+    if (import.module.importedModule
+            ->isSameModuleLookingThroughOverlays(mutModule))
+      return import;
+  }
+
+  // Now look for transitive imports.
+  auto &importCache = ctx.getImportCache();
+  for (const auto &import : imports) {
+    auto &importSet = importCache.getImportSet(import.module.importedModule);
+    for (const auto &transitive : importSet.getTransitiveImports()) {
+      if (transitive.importedModule
+              ->isSameModuleLookingThroughOverlays(mutModule)) {
+        return import;
+      }
+    }
+  }
+
+  return std::nullopt;
+}
+
 bool SourceFile::hasImportUsedPreconcurrency(
     AttributedImport<ImportedModule> import) const {
   return PreconcurrencyImportsUsed.count(import) != 0;
@@ -3190,21 +2667,40 @@ void SourceFile::setImportUsedPreconcurrency(
 
 AccessLevel
 SourceFile::getMaxAccessLevelUsingImport(
-    AttributedImport<ImportedModule> import) const {
-  auto known = ImportsUseAccessLevel.find(import);
+    const ModuleDecl *mod) const {
+  auto known = ImportsUseAccessLevel.find(mod);
   if (known == ImportsUseAccessLevel.end())
     return AccessLevel::Internal;
   return known->second;
 }
 
-void SourceFile::registerAccessLevelUsingImport(
-    AttributedImport<ImportedModule> import,
-    AccessLevel accessLevel) {
-  auto known = ImportsUseAccessLevel.find(import);
+void SourceFile::registerRequiredAccessLevelForModule(ModuleDecl *mod,
+                                                      AccessLevel accessLevel) {
+  auto known = ImportsUseAccessLevel.find(mod);
   if (known == ImportsUseAccessLevel.end())
-    ImportsUseAccessLevel[import] = accessLevel;
+    ImportsUseAccessLevel[mod] = accessLevel;
   else
-    ImportsUseAccessLevel[import] = std::max(accessLevel, known->second);
+    ImportsUseAccessLevel[mod] = std::max(accessLevel, known->second);
+
+  // Also register modules triggering the import of cross-import overlays.
+  auto declaringMod = mod->getDeclaringModuleIfCrossImportOverlay();
+  if (!declaringMod)
+    return;
+
+  SmallVector<Identifier, 1> bystanders;
+  auto bystandersValid =
+    mod->getRequiredBystandersIfCrossImportOverlay(declaringMod, bystanders);
+  if (!bystandersValid)
+    return;
+
+  for (auto &otherImport : *Imports) {
+    auto otherImportMod = otherImport.module.importedModule;
+    auto otherImportModName = otherImportMod->getName();
+    if (otherImportMod == declaringMod ||
+        llvm::find(bystanders, otherImportModName) != bystanders.end()) {
+      registerRequiredAccessLevelForModule(otherImportMod, accessLevel);
+    }
+  }
 }
 
 bool HasImportsMatchingFlagRequest::evaluate(Evaluator &evaluator,
@@ -3217,13 +2713,13 @@ bool HasImportsMatchingFlagRequest::evaluate(Evaluator &evaluator,
   return false;
 }
 
-llvm::Optional<bool> HasImportsMatchingFlagRequest::getCachedResult() const {
+std::optional<bool> HasImportsMatchingFlagRequest::getCachedResult() const {
   SourceFile *sourceFile = std::get<0>(getStorage());
   ImportFlags flag = std::get<1>(getStorage());
   if (sourceFile->validCachedImportOptions.contains(flag))
     return sourceFile->cachedImportOptions.contains(flag);
 
-  return llvm::None;
+  return std::nullopt;
 }
 
 void HasImportsMatchingFlagRequest::cacheResult(bool value) const {
@@ -3265,6 +2761,15 @@ bool SourceFile::hasImportsWithFlag(ImportFlags flag) const {
   auto *mutableThis = const_cast<SourceFile *>(this);
   return evaluateOrDefault(
       ctx.evaluator, HasImportsMatchingFlagRequest{mutableThis, flag}, false);
+}
+
+void SourceFile::forEachImportOfModule(
+    const ModuleDecl *module,
+    llvm::function_ref<void(AttributedImport<ImportedModule> &)> callback) {
+  for (auto import : *Imports) {
+    if (import.module.importedModule == module)
+      callback(import);
+  }
 }
 
 bool SourceFile::hasTestableOrPrivateImport(
@@ -3369,82 +2874,70 @@ SourceFile::getImportAccessLevel(const ModuleDecl *targetModule) const {
   assert(targetModule != getParentModule() &&
          "getImportAccessLevel doesn't support checking for a self-import");
 
-  auto &imports = getASTContext().getImportCache();
-  ImportAccessLevel restrictiveImport = llvm::None;
+  /// Order of relevancy of `import` to reach `targetModule`.
+  /// Lower is better/more authoritative.
+  auto rateImport = [&](const ImportAccessLevel import) -> int {
+    auto importedModule = import->module.importedModule;
 
+    // Prioritize public names:
+    if (targetModule->getExportAsName() == importedModule->getBaseIdentifier())
+      return 0;
+    if (targetModule->getPublicModuleName(/*onlyIfImported*/false) ==
+          importedModule->getName())
+      return 1;
+
+    // The defining module or overlay:
+    if (targetModule == importedModule)
+      return 2;
+    if (targetModule == importedModule->getUnderlyingModuleIfOverlay())
+      return 3;
+
+    // Any import in the sources.
+    if (import->importLoc.isValid())
+      return 4;
+
+    return 10;
+  };
+
+  // Find the import with the least restrictive access-level.
+  // Among those prioritize more relevant one.
+  auto &imports = getASTContext().getImportCache();
+  ImportAccessLevel restrictiveImport = std::nullopt;
   for (auto &import : *Imports) {
     if ((!restrictiveImport.has_value() ||
-         import.accessLevel > restrictiveImport->accessLevel) &&
+         import.accessLevel > restrictiveImport->accessLevel ||
+         (import.accessLevel == restrictiveImport->accessLevel &&
+          rateImport(import) < rateImport(restrictiveImport))) &&
         imports.isImportedBy(targetModule, import.module.importedModule)) {
       restrictiveImport = import;
     }
   }
-
   return restrictiveImport;
 }
 
-SmallVector<CharSourceRange, 2>
-IfConfigRangeInfo::getRangesWithoutActiveBody(const SourceManager &SM) const {
-  SmallVector<CharSourceRange, 2> result;
-  if (ActiveBodyRange.isValid()) {
-    // Split the whole range by the active range.
-    result.emplace_back(SM, WholeRange.getStart(), ActiveBodyRange.getStart());
-    result.emplace_back(SM, ActiveBodyRange.getEnd(), WholeRange.getEnd());
-  } else {
-    // No active body, we just return the whole range.
-    result.push_back(WholeRange);
-  }
-  return result;
+CharSourceRange
+IfConfigClauseRangeInfo::getDirectiveRange(const SourceManager &SM) const {
+  return CharSourceRange(SM, DirectiveLoc, BodyLoc);
 }
 
-void SourceFile::recordIfConfigRangeInfo(IfConfigRangeInfo ranges) {
-  IfConfigRanges.Ranges.push_back(ranges);
-  IfConfigRanges.IsSorted = false;
+CharSourceRange
+IfConfigClauseRangeInfo::getBodyRange(const SourceManager &SM) const {
+  return CharSourceRange(SM, BodyLoc, EndLoc);
 }
 
-ArrayRef<IfConfigRangeInfo>
-SourceFile::getIfConfigsWithin(SourceRange outer) const {
-  auto &SM = getASTContext().SourceMgr;
-  assert(SM.getRangeForBuffer(BufferID).contains(outer.Start) &&
-         "Range not within this file?");
+CharSourceRange
+IfConfigClauseRangeInfo::getWholeRange(const SourceManager &SM) const {
+  return CharSourceRange(SM, DirectiveLoc, EndLoc);
+}
 
-  if (!IfConfigRanges.IsSorted) {
-    // Sort the ranges if we need to.
-    llvm::sort(IfConfigRanges.Ranges, [&](IfConfigRangeInfo lhs,
-                                          IfConfigRangeInfo rhs) {
-      return SM.isBeforeInBuffer(lhs.getStartLoc(), rhs.getStartLoc());
-    });
-
-    // Be defensive and eliminate duplicates in case we've parsed twice.
-    auto newEnd = std::unique(
-        IfConfigRanges.Ranges.begin(), IfConfigRanges.Ranges.end(),
-        [&](const IfConfigRangeInfo &lhs, const IfConfigRangeInfo &rhs) {
-          if (lhs.getWholeRange() != rhs.getWholeRange())
-            return false;
-
-          assert(lhs == rhs && "Active ranges changed on a re-parse?");
-          return true;
-        });
-    IfConfigRanges.Ranges.erase(newEnd, IfConfigRanges.Ranges.end());
-    IfConfigRanges.IsSorted = true;
-  }
-
-  // First let's find the first #if that is after the outer start loc.
-  auto ranges = llvm::makeArrayRef(IfConfigRanges.Ranges);
-  auto lower = llvm::lower_bound(
-      ranges, outer.Start, [&](IfConfigRangeInfo range, SourceLoc loc) {
-        return SM.isBeforeInBuffer(range.getStartLoc(), loc);
-      });
-  if (lower == ranges.end() ||
-      SM.isBeforeInBuffer(outer.End, lower->getStartLoc())) {
-    return {};
-  }
-  // Next let's find the first #if that's after the outer end loc.
-  auto upper = llvm::upper_bound(
-      ranges, outer.End, [&](SourceLoc loc, IfConfigRangeInfo range) {
-        return SM.isBeforeInBuffer(loc, range.getStartLoc());
-      });
-  return llvm::makeArrayRef(lower, upper - lower);
+void SourceFile::recordIfConfigClauseRangeInfo(
+    const IfConfigClauseRangeInfo &range) {
+#if SWIFT_BUILD_SWIFT_SYNTAX
+  // Don't record ranges; they'll be extracted from swift-syntax when needed.
+#else
+  IfConfigClauseRanges.Ranges.push_back(range);
+  IfConfigClauseRanges.IsSorted = false;
+#endif
 }
 
 void ModuleDecl::setPackageName(Identifier name) {
@@ -3509,8 +3002,8 @@ void SourceFile::lookupImportedSPIGroups(
   for (auto &import : *Imports) {
     if (import.options.contains(ImportFlags::SPIAccessControl) &&
         (importedModule == import.module.importedModule ||
-         (imports.isImportedBy(importedModule, import.module.importedModule) &&
-          importedModule->isExportedAs(import.module.importedModule)))) {
+         imports.isImportedByViaSwiftOnly(importedModule,
+                                       import.module.importedModule))) {
       spiGroups.insert(import.spiGroups.begin(), import.spiGroups.end());
     }
   }
@@ -3549,35 +3042,6 @@ bool SourceFile::isImportedAsSPI(const ValueDecl *targetDecl) const {
   return false;
 }
 
-bool SourceFile::importsModuleAsWeakLinked(const ModuleDecl *module) const {
-  for (auto &import : *Imports) {
-    if (!import.options.contains(ImportFlags::WeakLinked))
-      continue;
-
-    const ModuleDecl *importedModule = import.module.importedModule;
-    if (module == importedModule)
-      return true;
-
-    // Also check whether the target module is actually the underlyingClang
-    // module for this @_weakLinked import.
-    const ModuleDecl *clangModule =
-        importedModule->getUnderlyingModuleIfOverlay();
-    if (module == clangModule)
-      return true;
-
-    // Traverse the exported modules of this weakly-linked module to ensure
-    // that we weak-link declarations from its exported peers.
-    SmallVector<ImportedModule, 8> reexportedModules;
-    importedModule->getImportedModules(reexportedModules,
-                                       ModuleDecl::ImportFilterKind::Exported);
-    for (const ImportedModule &reexportedModule : reexportedModules) {
-      if (module == reexportedModule.importedModule)
-        return true;
-    }
-  }
-  return false;
-}
-
 bool ModuleDecl::isImportedAsSPI(const SpecializeAttr *attr,
                                  const ValueDecl *targetDecl) const {
   auto declSPIGroups = attr->getSPIGroups();
@@ -3609,11 +3073,7 @@ bool ModuleDecl::isImportedAsSPI(Identifier spiGroup,
 }
 
 bool ModuleDecl::isImportedAsWeakLinked(const ModuleDecl *module) const {
-  for (auto file : getFiles()) {
-    if (file->importsModuleAsWeakLinked(module))
-      return true;
-  }
-  return false;
+  return getASTContext().getImportCache().isWeakImportedBy(module, this);
 }
 
 bool Decl::isSPI() const {
@@ -3696,7 +3156,7 @@ ModuleLibraryLevelRequest::evaluate(Evaluator &evaluator,
     scratch = ctx.SearchPathOpts.getSDKPath();
     path::append(scratch, a, b, c, d);
     path::append(scratch, e);
-    return path.startswith(scratch);
+    return path.starts_with(scratch);
   };
 
   /// Is \p modulePath from System/Library/PrivateFrameworks/?
@@ -3765,10 +3225,8 @@ llvm::StringMap<SourceFilePathInfo>
 SourceFile::getInfoForUsedFilePaths() const {
   llvm::StringMap<SourceFilePathInfo> result;
 
-  if (BufferID != -1) {
-    result[getFilename()].physicalFileLoc =
-        getASTContext().SourceMgr.getLocForBufferStart(BufferID);
-  }
+  result[getFilename()].physicalFileLoc =
+      getASTContext().SourceMgr.getLocForBufferStart(BufferID);
 
   for (auto &vpath : VirtualFilePaths) {
     result[vpath.Item].virtualFileLocs.insert(vpath.Loc);
@@ -3902,23 +3360,23 @@ ModuleDecl::computeFileIDMap(bool shouldDiagnose) const {
 }
 
 SourceFile::SourceFile(ModuleDecl &M, SourceFileKind K,
-                       llvm::Optional<unsigned> bufferID,
+                       unsigned bufferID,
                        ParsingOptions parsingOpts, bool isPrimary)
-    : FileUnit(FileUnitKind::Source, M), BufferID(bufferID ? *bufferID : -1),
+    : FileUnit(FileUnitKind::Source, M), BufferID(bufferID),
       ParsingOpts(parsingOpts), IsPrimary(isPrimary), Kind(K) {
+  assert(BufferID != (unsigned)~0);
   M.getASTContext().addDestructorCleanup(*this);
 
   assert(!IsPrimary || M.isMainModule() &&
          "A primary cannot appear outside the main module");
 
   if (isScriptMode()) {
-    bool problem = M.registerEntryPointFile(this, SourceLoc(), llvm::None);
+    bool problem = M.registerEntryPointFile(this, SourceLoc(), std::nullopt);
     assert(!problem && "multiple main files?");
     (void)problem;
   }
 
-  if (Kind == SourceFileKind::MacroExpansion)
-    M.addAuxiliaryFile(*this);
+  M.getASTContext().SourceMgr.recordSourceFile(bufferID, this);
 }
 
 SourceFile::ParsingOptions
@@ -4012,6 +3470,7 @@ void SourceFile::typeCheckDelayedFunctions() {
     auto *AFD = DelayedFunctions[i];
     assert(!AFD->getDeclContext()->isLocalContext());
     AFD->getTypecheckedBody();
+    (void) AFD->getCaptureInfo();
   }
 
   DelayedFunctions.clear();
@@ -4110,8 +3569,6 @@ bool SourceFile::walk(ASTWalker &walker) {
 }
 
 StringRef SourceFile::getFilename() const {
-  if (BufferID == -1)
-    return "";
   SourceManager &SM = getASTContext().SourceMgr;
   return SM.getIdentifierForBuffer(BufferID);
 }
@@ -4240,6 +3697,50 @@ ASTNode GetSourceFileAsyncNode::evaluate(Evaluator &eval,
     }
   }
   return ASTNode();
+}
+
+ArrayRef<TypeDecl *> SourceFile::getLocalTypeDecls() const {
+  auto *mutableThis = const_cast<SourceFile *>(this);
+  return evaluateOrDefault(getASTContext().evaluator,
+                           LocalTypeDeclsRequest{mutableThis}, {});
+}
+
+namespace {
+class LocalTypeDeclCollector : public ASTWalker {
+  SmallVectorImpl<TypeDecl *> &results;
+
+public:
+  LocalTypeDeclCollector(SmallVectorImpl<TypeDecl *> &results)
+      : results(results) {}
+
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::Expansion;
+  }
+
+  PreWalkAction walkToDeclPre(Decl *D) override {
+    switch (D->getKind()) {
+    case DeclKind::Enum:
+    case DeclKind::Struct:
+    case DeclKind::Class:
+    case DeclKind::Protocol:
+    case DeclKind::TypeAlias:
+      if (D->getDeclContext()->isLocalContext())
+        results.push_back(cast<TypeDecl>(D));
+      break;
+    default:
+      break;
+    }
+    return Action::Continue();
+  }
+};
+} // namespace
+
+ArrayRef<TypeDecl *> LocalTypeDeclsRequest::evaluate(Evaluator &evaluator,
+                                                     SourceFile *sf) const {
+  SmallVector<TypeDecl *> results;
+  LocalTypeDeclCollector collector(results);
+  sf->walk(collector);
+  return sf->getASTContext().AllocateCopy(results);
 }
 
 //===----------------------------------------------------------------------===//
@@ -4471,13 +3972,10 @@ FrontendStatsTracer::getTraceFormatter<const SourceFile *>() {
 }
 
 bool IsNonUserModuleRequest::evaluate(Evaluator &evaluator, ModuleDecl *mod) const {
-  // stdlib is non-user by definition
-  if (mod->isStdlibModule())
-    return true;
-  
   // If there's no SDK path, fallback to checking whether the module was
   // in the system search path or a clang system module
-  SearchPathOptions &searchPathOpts = mod->getASTContext().SearchPathOpts;
+  auto &ctx = mod->getASTContext();
+  SearchPathOptions &searchPathOpts = ctx.SearchPathOpts;
   StringRef sdkPath = searchPathOpts.getSDKPath();
   if (sdkPath.empty() && mod->isSystemModule())
     return true;
@@ -4488,15 +3986,38 @@ bool IsNonUserModuleRequest::evaluate(Evaluator &evaluator, ModuleDecl *mod) con
   if (!mod->hasName() || mod->getFiles().empty())
     return false;
   
-  auto *LF = dyn_cast_or_null<LoadedFile>(mod->getFiles().front());
-  if (!LF)
-    return false;
-  
-  StringRef modulePath = LF->getSourceFilename();
+  StringRef modulePath;
+  auto fileUnit = mod->getFiles().front();
+  if (auto *LF = dyn_cast_or_null<LoadedFile>(fileUnit)) {
+    modulePath = LF->getSourceFilename();
+  } else if (auto *SF = dyn_cast_or_null<SourceFile>(fileUnit)) {
+    // Checking for SourceFiles lets custom tools get the correct is-system
+    // state for index units when compiling a textual interface directly.
+    modulePath = SF->getFilename();
+  }
   if (modulePath.empty())
     return false;
 
+  // If we have a platform path, check against that as it will be a parent of
+  // the SDK path.
+  auto *FS = ctx.SourceMgr.getFileSystem().get();
+  auto sdkOrPlatform = searchPathOpts.getSDKPlatformPath(FS).value_or(sdkPath);
+
   StringRef runtimePath = searchPathOpts.RuntimeResourcePath;
   return (!runtimePath.empty() && pathStartsWith(runtimePath, modulePath)) ||
-      (!sdkPath.empty() && pathStartsWith(sdkPath, modulePath));
+      (!sdkOrPlatform.empty() && pathStartsWith(sdkOrPlatform, modulePath));
+}
+
+version::Version ModuleDecl::getLanguageVersionBuiltWith() const {
+  for (auto *F : getFiles()) {
+    auto *LD = dyn_cast<LoadedFile>(F);
+    if (!LD)
+      continue;
+
+    auto version = LD->getLanguageVersionBuiltWith();
+    if (!version.empty())
+      return version;
+  }
+
+  return version::Version();
 }

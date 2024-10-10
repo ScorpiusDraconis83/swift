@@ -19,10 +19,13 @@
 #include "swift/AST/Module.h"
 #include "swift/AST/SemanticAttrs.h"
 #include "swift/AST/Type.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/AbstractionPattern.h"
 #include "swift/SIL/SILFunctionConventions.h"
 #include "swift/SIL/SILModule.h"
+#include "swift/SIL/Test.h"
 #include "swift/SIL/TypeLowering.h"
+#include "swift/Sema/Concurrency.h"
 #include <tuple>
 
 using namespace swift;
@@ -108,6 +111,12 @@ SILType SILType::getPackIndexType(const ASTContext &C) {
   return getPrimitiveObjectType(C.ThePackIndexType);
 }
 
+SILType SILType::getOpaqueIsolationType(const ASTContext &C) {
+  auto actorProtocol = C.getProtocol(KnownProtocolKind::Actor);
+  auto actorType = ExistentialType::get(actorProtocol->getDeclaredInterfaceType());
+  return getPrimitiveObjectType(CanType(actorType).wrapInOptionalType());
+}
+
 bool SILType::isTrivial(const SILFunction &F) const {
   auto contextType = hasTypeParameter() ? F.mapTypeIntoContext(*this) : *this;
   
@@ -126,6 +135,11 @@ bool SILType::isNonTrivialOrContainsRawPointer(const SILFunction *f) const {
   assert((result || !isFunctionTypeWithContext()) &&
          "a function type with context must either be non trivial or marked as containing a pointer");
   return result;
+}
+
+bool SILType::isOrContainsPack(const SILFunction &F) const {
+  auto contextType = hasTypeParameter() ? F.mapTypeIntoContext(*this) : *this;
+  return F.getTypeLowering(contextType).isOrContainsPack();
 }
 
 bool SILType::isEmpty(const SILFunction &F) const {
@@ -311,7 +325,7 @@ static void addFieldSubstitutionsIfNeeded(TypeConverter &TC, SILType ty,
                                           AbstractionPattern &origType) {
   if (needsFieldSubstitutions(origType)) {
     auto subMap = ty.getASTType()->getContextSubstitutionMap(
-                    &TC.M, field->getDeclContext());
+                    field->getDeclContext());
     origType = origType.withSubstitutions(subMap);
   }
 }
@@ -335,7 +349,7 @@ SILType SILType::getFieldType(VarDecl *field, TypeConverter &TC,
     // to ensure that we can correctly get our substituted field type. If we
     // need to rewrap the type layer, we do it below.
     substFieldTy =
-        getASTType()->getTypeOfMember(&TC.M, field)->getCanonicalType();
+        getASTType()->getTypeOfMember(field)->getCanonicalType();
   }
 
   auto loweredTy =
@@ -400,7 +414,7 @@ SILType SILType::getEnumElementType(EnumElementDecl *elt, TypeConverter &TC,
   addFieldSubstitutionsIfNeeded(TC, *this, elt, origEltType);
 
   auto substEltTy = getASTType()->getTypeOfMember(
-      &TC.M, elt, elt->getArgumentInterfaceType());
+      elt, elt->getPayloadInterfaceType());
   auto loweredTy = TC.getLoweredRValueType(
       context, TC.getAbstractionPattern(elt), substEltTy);
 
@@ -438,6 +452,11 @@ bool SILType::isAddressOnly(const SILFunction &F) const {
   return F.getTypeLowering(contextType).isAddressOnly();
 }
 
+bool SILType::isFixedABI(const SILFunction &F) const {
+  auto contextType = hasTypeParameter() ? F.mapTypeIntoContext(*this) : *this;
+  return F.getTypeLowering(contextType).isFixedABI();
+}
+
 SILType SILType::substGenericArgs(SILModule &M, SubstitutionMap SubMap,
                                   TypeExpansionContext context) const {
   auto fnTy = castTo<SILFunctionType>();
@@ -456,56 +475,6 @@ bool SILType::isHeapObjectReferenceType() const {
     return true;
   if (is<SILBoxType>())
     return true;
-  return false;
-}
-
-bool SILType::aggregateContainsRecord(SILType Record, SILModule &Mod,
-                                      TypeExpansionContext context) const {
-  assert(!hasArchetype() && "Agg should be proven to not be generic "
-                             "before passed to this function.");
-  assert(!Record.hasArchetype() && "Record should be proven to not be generic "
-                                    "before passed to this function.");
-
-  llvm::SmallVector<SILType, 8> Worklist;
-  Worklist.push_back(*this);
-
-  // For each "subrecord" of agg in the worklist...
-  while (!Worklist.empty()) {
-    SILType Ty = Worklist.pop_back_val();
-
-    // If it is record, we succeeded. Return true.
-    if (Ty == Record)
-      return true;
-
-    // Otherwise, we gather up sub-records that need to be checked for
-    // checking... First handle the tuple case.
-    if (CanTupleType TT = Ty.getAs<TupleType>()) {
-      for (unsigned i = 0, e = TT->getNumElements(); i != e; ++i)
-        Worklist.push_back(Ty.getTupleElementType(i));
-      continue;
-    }
-
-    // Then if we have an enum...
-    if (EnumDecl *E = Ty.getEnumOrBoundGenericEnum()) {
-      for (auto Elt : E->getAllElements())
-        if (Elt->hasAssociatedValues())
-          Worklist.push_back(Ty.getEnumElementType(Elt, Mod, context));
-      continue;
-    }
-
-    // Then if we have a struct address...
-    if (StructDecl *S = Ty.getStructOrBoundGenericStruct())
-      for (VarDecl *Var : S->getStoredProperties())
-        Worklist.push_back(Ty.getFieldType(Var, Mod, context));
-
-    // If we have a class address, it is a pointer so it cannot contain other
-    // types.
-
-    // If we reached this point, then this type has no subrecords. Since it does
-    // not equal our record, we can skip it.
-  }
-
-  // Could not find the record in the aggregate.
   return false;
 }
 
@@ -881,13 +850,13 @@ bool SILType::isLoweringOf(TypeExpansionContext context, SILModule &Mod,
 
 bool SILType::isDifferentiable(SILModule &M) const {
   return getASTType()
-      ->getAutoDiffTangentSpace(LookUpConformanceInModule(M.getSwiftModule()))
+      ->getAutoDiffTangentSpace(LookUpConformanceInModule())
       .has_value();
 }
 
 Type
 TypeBase::replaceSubstitutedSILFunctionTypesWithUnsubstituted(SILModule &M) const {
-  return Type(const_cast<TypeBase *>(this)).transform([&](Type t) -> Type {
+  return Type(const_cast<TypeBase *>(this)).transformRec([&](TypeBase *t) -> std::optional<Type> {
     if (auto *f = t->getAs<SILFunctionType>()) {
       auto sft = f->getUnsubstitutedType(M);
       
@@ -897,7 +866,7 @@ TypeBase::replaceSubstitutedSILFunctionTypesWithUnsubstituted(SILModule &M) cons
       SmallVector<SILParameterInfo, 4> newParams;
       SmallVector<SILYieldInfo, 4> newYields;
       SmallVector<SILResultInfo, 4> newResults;
-      llvm::Optional<SILResultInfo> newErrorResult;
+      std::optional<SILResultInfo> newErrorResult;
       for (auto param : sft->getParameters()) {
         auto newParamTy = param.getInterfaceType()
           ->replaceSubstitutedSILFunctionTypesWithUnsubstituted(M)
@@ -939,7 +908,7 @@ TypeBase::replaceSubstitutedSILFunctionTypesWithUnsubstituted(SILModule &M) cons
                                   SubstitutionMap(),
                                   M.getASTContext());
     }
-    return t;
+    return std::nullopt;
   });
 }
 
@@ -1040,25 +1009,52 @@ SILType::getSingletonAggregateFieldType(SILModule &M,
   return SILType();
 }
 
-bool SILType::isEscapable() const {
-  return getASTType()->isEscapable();
-}
+bool SILType::isEscapable(const SILFunction &function) const {
+  CanType ty = getASTType();
 
-bool SILType::isMoveOnly() const {
-  // Legacy check.
-  if (!getASTContext().LangOpts.hasFeature(Feature::NoncopyableGenerics)) {
-    return getASTType()->isNoncopyable() || isMoveOnlyWrapped();
+  // For storage with reference ownership, check the referent.
+  if (auto refStorage = ty->getAs<ReferenceStorageType>())
+    ty = refStorage->getReferentType()->getCanonicalType();
+
+  if (auto fnTy = getAs<SILFunctionType>()) {
+    // Use isNoEscape instead to determine whether a function type may escape.
+    return true;
+  }
+  if (auto boxTy = getAs<SILBoxType>()) {
+    auto fields = boxTy->getLayout()->getFields();
+    assert(fields.size() == 1);
+    ty = ::getSILBoxFieldLoweredType(function.getTypeExpansionContext(), boxTy,
+                                     function.getModule().Types, 0);
   }
 
-  // Anything within the move-only wrapper is move-only.
-  if (isMoveOnlyWrapped())
+  if (auto *moveOnlyTy = ty->getAs<SILMoveOnlyWrappedType>())
+    ty = moveOnlyTy->getInnerType();
+
+  // TODO: Support ~Escapable in parameter packs.
+  //
+  // Treat all other SIL-specific types as Escapable.
+  if (isa<SILBlockStorageType,
+          SILBoxType,
+          SILPackType,
+          SILTokenType>(ty)) {
     return true;
+  }
+  return ty->isEscapable();
+}
 
-  auto ty = getASTType();
+bool SILType::isMoveOnly(bool orWrapped) const {
+  // If it's inside the move-only wrapper, return true iff we want to include
+  // such types as "move-only" in this query. Such values are typically
+  // just "no-implicit-copy" and not "move-only".
+  if (isMoveOnlyWrapped())
+    return orWrapped;
 
-  // All kinds of references are copyable.
-  if (isa<ReferenceStorageType>(ty))
-    return false;
+  // NOTE: getASTType strips the MoveOnlyWrapper off!
+  CanType ty = getASTType();
+
+  // For storage with reference ownership, check the referent.
+  if (auto refStorage = ty->getAs<ReferenceStorageType>())
+    ty = refStorage->getReferentType()->getCanonicalType();
 
   // TODO: Nonescaping closures ought to be treated as move-only in SIL.
   // They aren't marked move-only now, because the necessary move-only passes
@@ -1097,7 +1093,7 @@ bool SILType::isValueTypeWithDeinit() const {
   return false;
 }
 
-SILType SILType::getInstanceTypeOfMetatype(SILFunction *function) const {
+SILType SILType::getLoweredInstanceTypeOfMetatype(SILFunction *function) const {
   auto metaType = castTo<MetatypeType>();
   CanType instanceTy = metaType.getInstanceType();
   auto &tl = function->getModule().Types.getTypeLowering(instanceTy, TypeExpansionContext(*function));
@@ -1227,7 +1223,7 @@ SILType SILType::addingMoveOnlyWrapperToBoxedType(const SILFunction *fn) {
   return SILType::getPrimitiveObjectType(newBoxType);
 }
 
-SILType SILType::removingMoveOnlyWrapperToBoxedType(const SILFunction *fn) {
+SILType SILType::removingMoveOnlyWrapperFromBoxedType(const SILFunction *fn) {
   auto boxTy = castTo<SILBoxType>();
   auto *oldLayout = boxTy->getLayout();
   auto oldField = oldLayout->getFields()[0];
@@ -1245,11 +1241,76 @@ SILType SILType::removingMoveOnlyWrapperToBoxedType(const SILFunction *fn) {
   return SILType::getPrimitiveObjectType(newBoxType);
 }
 
-ProtocolConformanceRef
-SILType::conformsToProtocol(SILFunction *fn, ProtocolDecl *protocol) const {
-  return fn->getParentModule()->conformsToProtocol(getASTType(), protocol);
+SILType SILType::removingAnyMoveOnlyWrapping(const SILFunction *fn) {
+  if (!isMoveOnlyWrapped() && !isBoxedMoveOnlyWrappedType(fn))
+    return *this;
+
+  if (isMoveOnlyWrapped())
+    return removingMoveOnlyWrapper();
+
+  assert(isBoxedMoveOnlyWrappedType(fn));
+  return removingMoveOnlyWrapperFromBoxedType(fn);
 }
 
 bool SILType::isSendable(SILFunction *fn) const {
-  return getASTType()->isSendableType(fn->getParentModule());
+  return getASTType()->isSendableType();
 }
+
+Type SILType::getRawLayoutSubstitutedLikeType() const {
+  auto rawLayout = getRawLayout();
+
+  if (!rawLayout)
+    return Type();
+
+  if (rawLayout->getSizeAndAlignment())
+    return Type();
+
+  auto structDecl = getStructOrBoundGenericStruct();
+  auto likeType = rawLayout->getResolvedLikeType(structDecl);
+  auto astT = getASTType();
+  auto subs = astT->getContextSubstitutionMap();
+  return likeType.subst(subs);
+}
+
+Type SILType::getRawLayoutSubstitutedCountType() const {
+  auto rawLayout = getRawLayout();
+
+  if (!rawLayout)
+    return Type();
+
+  if (rawLayout->getSizeAndAlignment() || rawLayout->getScalarLikeType())
+    return Type();
+
+  auto structDecl = getStructOrBoundGenericStruct();
+  auto countType = rawLayout->getResolvedCountType(structDecl);
+  auto astT = getASTType();
+  auto subs = astT->getContextSubstitutionMap();
+  return countType.subst(subs);
+}
+
+std::optional<DiagnosticBehavior>
+SILType::getConcurrencyDiagnosticBehavior(SILFunction *fn) const {
+  auto declRef = fn->getDeclRef();
+  if (!declRef)
+    return {};
+  auto *fromDC = declRef.getInnermostDeclContext();
+  return getASTType()->getConcurrencyDiagnosticBehaviorLimit(fromDC);
+}
+
+namespace swift::test {
+// Arguments:
+// - SILValue: value
+// Dumps:
+// - message
+static FunctionTest IsSILTrivial("is_sil_trivial", [](auto &function,
+                                                      auto &arguments,
+                                                      auto &test) {
+  SILValue value = arguments.takeValue();
+  llvm::outs() << value;
+  if (value->getType().isTrivial(value->getFunction())) {
+    llvm::outs() << " is trivial\n";
+  } else {
+    llvm::outs() << " is not trivial\n";
+  }
+});
+} // end namespace swift::test

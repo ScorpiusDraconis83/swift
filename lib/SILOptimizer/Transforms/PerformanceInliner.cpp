@@ -13,6 +13,7 @@
 #define DEBUG_TYPE "sil-inliner"
 #include "swift/AST/Module.h"
 #include "swift/AST/SemanticAttrs.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/MemAccessUtils.h"
 #include "swift/SIL/OptimizationRemark.h"
 #include "swift/SILOptimizer/Analysis/BasicCalleeAnalysis.h"
@@ -21,6 +22,7 @@
 #include "swift/SILOptimizer/Utils/CFGOptUtils.h"
 #include "swift/SILOptimizer/Utils/Devirtualize.h"
 #include "swift/SILOptimizer/Utils/Generics.h"
+#include "swift/SILOptimizer/Utils/OwnershipOptUtils.h"
 #include "swift/SILOptimizer/Utils/PerformanceInlinerUtils.h"
 #include "swift/SILOptimizer/Utils/SILOptFunctionBuilder.h"
 #include "swift/SILOptimizer/Utils/StackNesting.h"
@@ -237,10 +239,11 @@ public:
   SILPerformanceInliner(StringRef PassName, SILOptFunctionBuilder &FuncBuilder,
                         InlineSelection WhatToInline,
                         SILPassManager *pm, DominanceAnalysis *DA,
+                        PostDominanceAnalysis *PDA,
                         SILLoopAnalysis *LA, BasicCalleeAnalysis *BCA,
                         OptimizationMode OptMode, OptRemark::Emitter &ORE)
       : PassName(PassName), FuncBuilder(FuncBuilder),
-        WhatToInline(WhatToInline), pm(pm), DA(DA), LA(LA), BCA(BCA), CBI(DA), ORE(ORE),
+        WhatToInline(WhatToInline), pm(pm), DA(DA), LA(LA), BCA(BCA), CBI(DA, PDA), ORE(ORE),
         OptMode(OptMode) {}
 
   bool inlineCallsIntoFunction(SILFunction *F);
@@ -355,7 +358,7 @@ bool SILPerformanceInliner::isAutoDiffLinearMapWithControlFlow(
   // branch tracing enum.
   if (auto *arg = dyn_cast<SILFunctionArgument>(val)) {
     if (auto *enumDecl = arg->getType().getEnumOrBoundGenericEnum()) {
-      return enumDecl->getName().str().startswith(
+      return enumDecl->getName().str().starts_with(
           LinearMapBranchTracingEnumPrefix);
     }
   }
@@ -386,6 +389,70 @@ bool SILPerformanceInliner::isTupleWithAllocsOrPartialApplies(SILValue val) {
   return false;
 }
 
+// Uses a function's mangled name to determine if it is an Autodiff VJP
+// function.
+//
+// TODO: VJPs of differentiable functions with custom silgen names are not
+// recognized as VJPs by this function. However, this is not a hard limitation
+// and can be fixed.
+bool isFunctionAutodiffVJP(SILFunction *callee) {
+  swift::Demangle::Context Ctx;
+  if (auto *Root = Ctx.demangleSymbolAsNode(callee->getName())) {
+    if (auto *node = Root->findByKind(
+            swift::Demangle::Node::Kind::AutoDiffFunctionKind, 3)) {
+      if (node->hasIndex()) {
+        auto index = (char)node->getIndex();
+        auto ADFunctionKind = swift::Demangle::AutoDiffFunctionKind(index);
+        if (ADFunctionKind == swift::Demangle::AutoDiffFunctionKind::VJP) {
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
+bool isProfitableToInlineAutodiffVJP(SILFunction *vjp, SILFunction *caller,
+                                     InlineSelection whatToInline,
+                                     StringRef stageName) {
+  bool isLowLevelFunctionPassPipeline = stageName == "LowLevel,Function";
+  auto isHighLevelFunctionPassPipeline =
+      stageName == "HighLevel,Function+EarlyLoopOpt";
+  auto calleeHasControlFlow = vjp->size() > 1;
+  auto isCallerVJP = isFunctionAutodiffVJP(caller);
+  auto callerHasControlFlow = caller->size() > 1;
+
+  // If the pass is being run as part of the low-level function pass pipeline,
+  // the autodiff closure-spec optimization is done doing its work. Therefore,
+  // all VJPs should be considered for inlining.
+  if (isLowLevelFunctionPassPipeline) {
+    return true;
+  }
+
+  // If callee has control-flow it will definitely not be handled by the
+  // Autodiff closure-spec optimization. Therefore, we should consider it for
+  // inlining.
+  if (calleeHasControlFlow) {
+    return true;
+  }
+
+  // If this is the EarlyPerfInline pass we want to have the Autodiff
+  // closure-spec optimization pass optimize VJPs in isolation before they are
+  // inlined into other VJPs.
+  if (isHighLevelFunctionPassPipeline) {
+    return false;
+  }
+
+  // If this is not the EarlyPerfInline pass, VJPs should only be inlined into
+  // other VJPs that do not contain any control-flow.
+  if (!isCallerVJP || (isCallerVJP && callerHasControlFlow)) {
+    return false;
+  }
+
+  return true;
+}
+
 bool SILPerformanceInliner::isProfitableToInline(
     FullApplySite AI, Weight CallerWeight, ConstantTracker &callerTracker,
     int &NumCallerBlocks,
@@ -393,6 +460,12 @@ bool SILPerformanceInliner::isProfitableToInline(
   SILFunction *Callee = AI.getReferencedFunctionOrNull();
   assert(Callee);
   bool IsGeneric = AI.hasSubstitutions();
+
+  if (isFunctionAutodiffVJP(Callee) &&
+      !isProfitableToInlineAutodiffVJP(Callee, AI.getFunction(), WhatToInline,
+                                       this->pm->getStageName())) {
+    return false;
+  }
 
   // Start with a base benefit.
   int BaseBenefit = isa<BeginApplyInst>(AI) ? RemovedCoroutineCallBenefit
@@ -453,9 +526,15 @@ bool SILPerformanceInliner::isProfitableToInline(
     return false;
   }
 
-  SILLoopInfo *LI = LA->get(Callee);
-  ShortestPathAnalysis *SPA = getSPA(Callee, LI);
-  assert(SPA->isValid());
+  SILLoopInfo *CalleeLI = LA->get(Callee);
+  ShortestPathAnalysis *CalleeSPA = getSPA(Callee, CalleeLI);
+  if (!CalleeSPA->isValid()) {
+    CalleeSPA->analyze(CBI, [](FullApplySite FAS) {
+      // We don't compute SPA for another call-level. Functions called from
+      // the callee are assumed to have DefaultApplyLength.
+      return DefaultApplyLength;
+    });
+  }
 
   ConstantTracker constTracker(Callee, &callerTracker, AI);
   DominanceInfo *DT = DA->get(Callee);
@@ -488,7 +567,7 @@ bool SILPerformanceInliner::isProfitableToInline(
   // benefits.
   while (SILBasicBlock *block = domOrder.getNext()) {
     constTracker.beginBlock();
-    Weight BlockW = SPA->getWeight(block, CallerWeight);
+    Weight BlockW = CalleeSPA->getWeight(block, CallerWeight);
 
     for (SILInstruction &I : *block) {
       constTracker.trackInst(&I);
@@ -701,7 +780,7 @@ bool SILPerformanceInliner::isProfitableToInline(
   LLVM_DEBUG(dumpCaller(AI.getFunction());
              llvm::dbgs() << "    decision {c=" << CalleeCost
                           << ", b=" << Benefit
-                          << ", l=" << SPA->getScopeLength(CalleeEntry, 0)
+                          << ", l=" << CalleeSPA->getScopeLength(CalleeEntry, 0)
                           << ", c-w=" << CallerWeight
                           << ", bb=" << Callee->size()
                           << ", c-bb=" << NumCallerBlocks
@@ -759,8 +838,8 @@ static bool isInlineAlwaysCallSite(SILFunction *Callee, int numCallerBlocks) {
 /// It returns false if a function should not be inlined.
 /// It returns None if the decision cannot be made without a more complex
 /// analysis.
-static llvm::Optional<bool> shouldInlineGeneric(FullApplySite AI,
-                                                int numCallerBlocks) {
+static std::optional<bool> shouldInlineGeneric(FullApplySite AI,
+                                               int numCallerBlocks) {
   assert(AI.hasSubstitutions() &&
          "Expected a generic apply");
 
@@ -786,7 +865,7 @@ static llvm::Optional<bool> shouldInlineGeneric(FullApplySite AI,
   // If all substitutions are concrete, then there is no need to perform the
   // generic inlining. Let the generic specializer create a specialized
   // function and then decide if it is beneficial to inline it.
-  if (!AI.getSubstitutionMap().hasArchetypes())
+  if (!AI.getSubstitutionMap().getRecursiveProperties().hasArchetype())
     return false;
 
   if (Callee->getLoweredFunctionType()->getCoroutineKind() !=
@@ -795,7 +874,7 @@ static llvm::Optional<bool> shouldInlineGeneric(FullApplySite AI,
     // enable inlining them in a generic context. Though the final inlining
     // decision is done by the usual heuristics. Therefore we return None and
     // not true.
-    return llvm::None;
+    return std::nullopt;
   }
 
   // The returned partial_apply of a thunk is most likely being optimized away
@@ -811,7 +890,7 @@ static llvm::Optional<bool> shouldInlineGeneric(FullApplySite AI,
     return false;
 
   // It is not clear yet if this function should be decided or not.
-  return llvm::None;
+  return std::nullopt;
 }
 
 bool SILPerformanceInliner::decideInWarmBlock(
@@ -1079,7 +1158,7 @@ void SILPerformanceInliner::collectAppliesToInline(
     }
 
     domOrder.pushChildrenIf(block, [&] (SILBasicBlock *child) {
-      if (CBI.isSlowPath(block, child)) {
+      if (CBI.isCold(child)) {
         // Handle cold blocks separately.
         visitColdBlocks(InitialCandidates, child, DT, NumCallerBlocks);
         return false;
@@ -1195,6 +1274,7 @@ bool SILPerformanceInliner::inlineCallsIntoFunction(SILFunction *Caller) {
       }
 
       Caller->verify();
+      pm->runSwiftFunctionVerification(Caller);
     }
   }
   deleter.cleanupDeadInstructions();
@@ -1206,12 +1286,14 @@ bool SILPerformanceInliner::inlineCallsIntoFunction(SILFunction *Caller) {
   if (invalidatedStackNesting) {
     StackNesting::fixNesting(Caller);
   }
+  updateBorrowedFrom(pm, Caller);
 
   // If we were asked to verify our caller after inlining all callees we could
   // find into it, do so now. This makes it easier to catch verification bugs in
   // the inliner without running the entire inliner.
   if (EnableVerifyAfterInlining) {
     Caller->verify();
+    pm->runSwiftFunctionVerification(Caller);
   }
 
   return true;
@@ -1256,6 +1338,7 @@ public:
 
   void run() override {
     DominanceAnalysis *DA = PM->getAnalysis<DominanceAnalysis>();
+    PostDominanceAnalysis *PDA = PM->getAnalysis<PostDominanceAnalysis>();
     SILLoopAnalysis *LA = PM->getAnalysis<SILLoopAnalysis>();
     BasicCalleeAnalysis *BCA = PM->getAnalysis<BasicCalleeAnalysis>();
     OptRemark::Emitter ORE(DEBUG_TYPE, *getFunction());
@@ -1269,7 +1352,7 @@ public:
     SILOptFunctionBuilder FuncBuilder(*this);
 
     SILPerformanceInliner Inliner(getID(), FuncBuilder, WhatToInline,
-                                  getPassManager(), DA, LA, BCA, OptMode, ORE);
+                              getPassManager(), DA, PDA, LA, BCA, OptMode, ORE);
 
     assert(getFunction()->isDefinition() &&
            "Expected only functions with bodies!");

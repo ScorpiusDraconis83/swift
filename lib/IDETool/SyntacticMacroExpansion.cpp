@@ -15,6 +15,7 @@
 #include "swift/AST/MacroDefinition.h"
 #include "swift/AST/PluginLoader.h"
 #include "swift/AST/TypeRepr.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Driver/FrontendUtil.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/IDE/Utils.h"
@@ -62,7 +63,7 @@ bool SyntacticMacroExpansionInstance::setup(
       invocation.getLangOptions(), invocation.getTypeCheckerOptions(),
       invocation.getSILOptions(), invocation.getSearchPathOptions(),
       invocation.getClangImporterOptions(), invocation.getSymbolGraphOptions(),
-      SourceMgr, Diags));
+      invocation.getCASOptions(), SourceMgr, Diags));
   registerParseRequestFunctions(Ctx->evaluator);
   registerTypeCheckerRequestFunctions(Ctx->evaluator);
 
@@ -177,8 +178,8 @@ MacroDecl *SyntacticMacroExpansionInstance::getSynthesizedMacroDecl(
 /// Create a unique name of the expansion. The result is *appended* to \p out.
 static void addExpansionDiscriminator(
     SmallString<32> &out, const SourceFile *SF, SourceLoc loc,
-    llvm::Optional<SourceLoc> supplementalLoc = llvm::None,
-    llvm::Optional<MacroRole> role = llvm::None) {
+    std::optional<SourceLoc> supplementalLoc = std::nullopt,
+    std::optional<MacroRole> role = std::nullopt) {
   SourceManager &SM = SF->getASTContext().SourceMgr;
 
   StableHasher hasher = StableHasher::defaultHasher();
@@ -230,7 +231,7 @@ expandFreestandingMacro(MacroDecl *macro,
   SourceFile *expandedSource =
       swift::evaluateFreestandingMacro(expansion, discriminator);
   if (expandedSource)
-    bufferIDs.push_back(*expandedSource->getBufferID());
+    bufferIDs.push_back(expandedSource->getBufferID());
 
   return bufferIDs;
 }
@@ -253,7 +254,7 @@ expandAttachedMacro(MacroDecl *macro, CustomAttr *attr, Decl *attachedDecl) {
     SourceFile *expandedSource = swift::evaluateAttachedMacro(
         macro, target, attr, passParent, role, discriminator);
     if (expandedSource)
-      bufferIDs.push_back(*expandedSource->getBufferID());
+      bufferIDs.push_back(expandedSource->getBufferID());
   };
 
   MacroRoles roles = macro->getMacroRoles();
@@ -329,7 +330,7 @@ struct ExpansionNode {
 class MacroExpansionFinder : public ASTWalker {
   SourceManager &SM;
   SourceLoc locToResolve;
-  llvm::Optional<ExpansionNode> result;
+  std::optional<ExpansionNode> result;
 
   bool rangeContainsLocToResolve(SourceRange Range) const {
     return SM.rangeContainsTokenLoc(Range, locToResolve);
@@ -339,7 +340,7 @@ public:
   MacroExpansionFinder(SourceManager &SM, SourceLoc locToResolve)
       : SM(SM), locToResolve(locToResolve) {}
 
-  llvm::Optional<ExpansionNode> getResult() const { return result; }
+  std::optional<ExpansionNode> getResult() const { return result; }
 
   MacroWalking getMacroWalkingBehavior() const override {
     return MacroWalking::None;
@@ -350,7 +351,7 @@ public:
     // include its attribute ranges (because attributes are part of PBD.)
     if (!isa<VarDecl>(D) &&
         !rangeContainsLocToResolve(D->getSourceRangeIncludingAttrs())) {
-      return Action::SkipChildren();
+      return Action::SkipNode();
     }
 
     // Check the attributes.
@@ -380,7 +381,7 @@ public:
 
   PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
     if (!rangeContainsLocToResolve(E->getSourceRange())) {
-      return Action::SkipChildren(E);
+      return Action::SkipNode(E);
     }
 
     // Check 'MacroExpansionExpr'.
@@ -398,26 +399,26 @@ public:
 
   PreWalkResult<Stmt *> walkToStmtPre(Stmt *S) override {
     if (!rangeContainsLocToResolve(S->getSourceRange())) {
-      return Action::SkipChildren(S);
+      return Action::SkipNode(S);
     }
     return Action::Continue(S);
   }
   PreWalkResult<ArgumentList *>
   walkToArgumentListPre(ArgumentList *AL) override {
     if (!rangeContainsLocToResolve(AL->getSourceRange())) {
-      return Action::SkipChildren(AL);
+      return Action::SkipNode(AL);
     }
     return Action::Continue(AL);
   }
   PreWalkAction walkToParameterListPre(ParameterList *PL) override {
     if (!rangeContainsLocToResolve(PL->getSourceRange())) {
-      return Action::SkipChildren();
+      return Action::SkipNode();
     }
     return Action::Continue();
   }
   PreWalkAction walkToTypeReprPre(TypeRepr *T) override {
     // TypeRepr cannot have macro expansions in it.
-    return Action::SkipChildren();
+    return Action::SkipNode();
   }
 };
 } // namespace
@@ -429,7 +430,7 @@ void SyntacticMacroExpansionInstance::expand(
   // Find the expansion at 'expansion.offset'.
   MacroExpansionFinder expansionFinder(
       SourceMgr,
-      SourceMgr.getLocForOffset(*SF->getBufferID(), expansion.offset));
+      SourceMgr.getLocForOffset(SF->getBufferID(), expansion.offset));
   SF->walk(expansionFinder);
   auto expansionNode = expansionFinder.getResult();
   if (!expansionNode)

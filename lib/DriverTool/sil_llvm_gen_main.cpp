@@ -20,6 +20,7 @@
 #include "swift/AST/DiagnosticsFrontend.h"
 #include "swift/AST/IRGenRequests.h"
 #include "swift/AST/SILOptions.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/LLVMInitialize.h"
 #include "swift/Frontend/DiagnosticVerifier.h"
 #include "swift/Frontend/Frontend.h"
@@ -221,7 +222,7 @@ int sil_llvm_gen_main(ArrayRef<const char *> argv, void *MainAddr) {
   auto &eval = CI.getASTContext().evaluator;
   auto desc = getDescriptor();
   desc.out = &outFile->getOS();
-  auto generatedMod = llvm::cantFail(eval(OptimizedIRRequest{desc}));
+  auto generatedMod = evaluateOrFatal(eval, OptimizedIRRequest{desc});
   if (!generatedMod)
     return 1;
 

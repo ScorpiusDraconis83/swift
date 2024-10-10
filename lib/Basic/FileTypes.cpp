@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/FileTypes.h"
 
 #include "swift/Strings.h"
@@ -56,6 +57,29 @@ ID file_types::lookupTypeForExtension(StringRef Ext) {
       .Default(TY_INVALID);
 }
 
+// Compute the file type from filename. This handles the lookup for extensions
+// with multiple dots, like `.private.swiftinterface` correctly.
+ID file_types::lookupTypeFromFilename(StringRef Filename) {
+  StringRef MaybeExt = Filename;
+  // Search from leftmost `.`, return the first match or till all dots are
+  // consumed.
+  size_t Pos = MaybeExt.find_first_of('.');
+  while(Pos != StringRef::npos) {
+    MaybeExt = MaybeExt.substr(Pos);
+    // If size is 1, that means only `.` is left, return invalid.
+    if (MaybeExt.size() == 1)
+      return TY_INVALID;
+    ID Type = lookupTypeForExtension(MaybeExt);
+    if (Type != TY_INVALID)
+      return Type;
+    // Drop `.` and keep looking.
+    MaybeExt = MaybeExt.drop_front();
+    Pos = MaybeExt.find_first_of('.');
+  }
+
+  return TY_INVALID;
+}
+
 ID file_types::lookupTypeForName(StringRef Name) {
   return llvm::StringSwitch<file_types::ID>(Name)
 #define TYPE(NAME, ID, EXTENSION, FLAGS) \
@@ -73,6 +97,7 @@ bool file_types::isTextual(ID Id) {
   case file_types::TY_Assembly:
   case file_types::TY_ASTDump:
   case file_types::TY_RawSIL:
+  case file_types::TY_RawLLVM_IR:
   case file_types::TY_LLVM_IR:
   case file_types::TY_ClangHeader:
   case file_types::TY_AutolinkFile:
@@ -141,6 +166,7 @@ bool file_types::isAfterLLVM(ID Id) {
   case file_types::TY_ClangHeader:
   case file_types::TY_AutolinkFile:
   case file_types::TY_Image:
+  case file_types::TY_RawLLVM_IR:
   case file_types::TY_dSYM:
   case file_types::TY_SIB:
   case file_types::TY_RawSIB:
@@ -190,6 +216,7 @@ bool file_types::isPartOfSwiftCompilation(ID Id) {
   case file_types::TY_RawSIB:
     return true;
   case file_types::TY_Assembly:
+  case file_types::TY_RawLLVM_IR:
   case file_types::TY_LLVM_IR:
   case file_types::TY_LLVM_BC:
   case file_types::TY_Object:
@@ -251,6 +278,7 @@ bool file_types::isProducedFromDiagnostics(ID Id) {
   case file_types::TY_SIB:
   case file_types::TY_RawSIB:
   case file_types::TY_Assembly:
+  case file_types::TY_RawLLVM_IR:
   case file_types::TY_LLVM_IR:
   case file_types::TY_LLVM_BC:
   case file_types::TY_Object:

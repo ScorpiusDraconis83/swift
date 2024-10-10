@@ -1,5 +1,5 @@
-// RUN: %target-swift-emit-sil -sil-verify-all -verify -enable-experimental-feature MoveOnlyPartialConsumption -enable-experimental-feature NoImplicitCopy -enable-experimental-feature MoveOnlyClasses %s -Xllvm -sil-print-final-ossa-module | %FileCheck %s
-// RUN: %target-swift-emit-sil -O -sil-verify-all -verify -enable-experimental-feature MoveOnlyPartialConsumption -enable-experimental-feature NoImplicitCopy -enable-experimental-feature MoveOnlyClasses %s
+// RUN: %target-swift-emit-sil -sil-verify-all -verify -enable-experimental-feature NoImplicitCopy -enable-experimental-feature MoveOnlyClasses %s -Xllvm -sil-print-final-ossa-module | %FileCheck %s
+// RUN: %target-swift-emit-sil -O -sil-verify-all -verify -enable-experimental-feature NoImplicitCopy -enable-experimental-feature MoveOnlyClasses %s
 
 // This file contains tests that used to crash due to verifier errors. It must
 // be separate from moveonly_addresschecker_diagnostics since when we fail on
@@ -33,5 +33,16 @@ func testAssertLikeUseDifferentBits() {
             assert(index >= currentPosition)
             currentPosition = index
         }
+    }
+}
+
+// issue #75312
+struct S
+{
+    @usableFromInline
+    init(utf8:consuming [UInt8])
+    {
+        utf8.withUnsafeBufferPointer { _ in }
+        fatalError()
     }
 }

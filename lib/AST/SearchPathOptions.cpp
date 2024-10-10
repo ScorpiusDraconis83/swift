@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/AST/SearchPathOptions.h"
+#include "swift/Basic/Assertions.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/Support/Errc.h"
 
@@ -77,6 +78,34 @@ void ModuleSearchPathLookup::rebuildLookupTable(const SearchPathOptions *Opts,
   State.IsOSDarwin = IsOSDarwin;
   State.Opts = Opts;
   State.IsPopulated = true;
+}
+
+static std::string computeSDKPlatformPath(StringRef SDKPath,
+                                          llvm::vfs::FileSystem *FS) {
+  if (SDKPath.empty())
+    return "";
+
+  SmallString<128> platformPath;
+  if (auto err = FS->getRealPath(SDKPath, platformPath))
+    llvm::sys::path::append(platformPath, SDKPath);
+
+  llvm::sys::path::remove_filename(platformPath); // specific SDK
+  llvm::sys::path::remove_filename(platformPath); // SDKs
+  llvm::sys::path::remove_filename(platformPath); // Developer
+
+  if (!llvm::sys::path::filename(platformPath).ends_with(".platform"))
+    return "";
+
+  return platformPath.str().str();
+}
+
+std::optional<StringRef>
+SearchPathOptions::getSDKPlatformPath(llvm::vfs::FileSystem *FS) const {
+  if (!SDKPlatformPath)
+    SDKPlatformPath = computeSDKPlatformPath(getSDKPath(), FS);
+  if (SDKPlatformPath->empty())
+    return std::nullopt;
+  return *SDKPlatformPath;
 }
 
 void SearchPathOptions::dump(bool isDarwin) const {

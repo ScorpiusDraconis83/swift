@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 import Basic
+import AST
 import SILBridging
 
 @_semantics("arc.immortal")
@@ -19,6 +20,10 @@ final public class Function : CustomStringConvertible, HasShortDescription, Hash
 
   public var name: StringRef {
     return StringRef(bridged: bridged.getName())
+  }
+
+  public var location: Location {
+    return Location(bridged: bridged.getLocation())
   }
 
   final public var description: String {
@@ -31,9 +36,28 @@ final public class Function : CustomStringConvertible, HasShortDescription, Hash
     hasher.combine(ObjectIdentifier(self))
   }
 
+  public var isTrapNoReturn: Bool { bridged.isTrapNoReturn() }
+
+  public var isAutodiffVJP: Bool { bridged.isAutodiffVJP() }
+
+  public var specializationLevel: Int { bridged.specializationLevel() }
+  
   public var hasOwnership: Bool { bridged.hasOwnership() }
 
   public var hasLoweredAddresses: Bool { bridged.hasLoweredAddresses() }
+
+  /// The lowered function type in the expansion context of self.
+  ///
+  /// Always expanding a function type means that the opaque result types
+  /// have the correct generic signature. For example:
+  ///    @substituted <τ_0_0> () -> @out τ_0_0 for <some P>
+  /// is lowered to this inside its module:
+  ///    @substituted <τ_0_0> () -> @out τ_0_0 for <ActualResultType>
+  /// and this outside its module
+  ///    @substituted <τ_0_0> () -> @out τ_0_0 for <some P>
+  public var loweredFunctionType: CanonicalType {
+    CanonicalType(bridged: bridged.getLoweredFunctionTypeInContext())
+  }
 
   /// Returns true if the function is a definition and not only an external declaration.
   ///
@@ -48,6 +72,10 @@ final public class Function : CustomStringConvertible, HasShortDescription, Hash
     entryBlock.arguments.lazy.map { $0 as! FunctionArgument }
   }
 
+  public func argument(at index: Int) -> FunctionArgument {
+    entryBlock.arguments[index] as! FunctionArgument
+  }
+
   /// All instructions of all blocks.
   public var instructions: LazySequence<FlattenSequence<LazyMapSequence<BasicBlockList, InstructionList>>> {
     blocks.lazy.flatMap { $0.instructions }
@@ -56,76 +84,12 @@ final public class Function : CustomStringConvertible, HasShortDescription, Hash
   public var reversedInstructions: LazySequence<FlattenSequence<LazyMapSequence<ReverseBasicBlockList, ReverseInstructionList>>>  {
     blocks.reversed().lazy.flatMap { $0.instructions.reversed() }
   }
-
-  public var numIndirectResultArguments: Int { bridged.getNumIndirectFormalResults() }
-  public var hasIndirectErrorArgument: Bool { bridged.hasIndirectErrorResult() }
-
-  /// The number of arguments which correspond to parameters (and not to indirect results).
-  public var numParameterArguments: Int { bridged.getNumParameters() }
-
-  /// The total number of arguments.
-  ///
-  /// This is the sum of indirect result arguments and parameter arguments.
-  /// If the function is a definition (i.e. it has at least an entry block), this is the
-  /// number of arguments of the function's entry block.
-  public var numArguments: Int {
-    numIndirectResultArguments + (hasIndirectErrorArgument ? 1 : 0) + numParameterArguments
-  }
-
-  public var hasSelfArgument: Bool {
-    bridged.getSelfArgumentIndex() >= 0
-  }
-
-  public var selfArgumentIndex: Int {
-    let selfIdx = bridged.getSelfArgumentIndex()
-    assert(selfIdx >= 0)
-    return selfIdx
-  }
-
-  public var selfArgument: FunctionArgument { arguments[selfArgumentIndex] }
   
-  public var argumentTypes: ArgumentTypeArray { ArgumentTypeArray(function: self) }
-  public var resultType: Type { bridged.getSILResultType().type }
-
-  public func getArgumentConvention(for argumentIndex: Int) -> ArgumentConvention {
-    return bridged.getSILArgumentConvention(argumentIndex).convention
-  }
-
   public var returnInstruction: ReturnInst? {
     for block in blocks.reversed() {
       if let retInst = block.terminator as? ReturnInst { return retInst }
     }
     return nil
-  }
-
-  /// True, if the linkage of the function indicates that it is visible outside the current
-  /// compilation unit and therefore not all of its uses are known.
-  ///
-  /// For example, `public` linkage.
-  public var isPossiblyUsedExternally: Bool {
-    return bridged.isPossiblyUsedExternally()
-  }
-
-  /// True, if the linkage of the function indicates that it has a definition outside the
-  /// current compilation unit.
-  ///
-  /// For example, `public_external` linkage.
-  public var isAvailableExternally: Bool {
-    return bridged.isAvailableExternally()
-  }
-
-  public func hasSemanticsAttribute(_ attr: StaticString) -> Bool {
-    attr.withUTF8Buffer { (buffer: UnsafeBufferPointer<UInt8>) in
-      bridged.hasSemanticsAttr(BridgedStringRef(data: buffer.baseAddress!, count: buffer.count))
-    }
-  }
-
-  public var hasUnsafeNonEscapableResult: Bool {
-    return bridged.hasUnsafeNonEscapableResult()
-  }
-
-  public var hasResultDependsOnSelf: Bool {
-    return bridged.hasResultDependsOnSelf()
   }
 
   /// True if the callee function is annotated with @_semantics("programtermination_point").
@@ -150,8 +114,206 @@ final public class Function : CustomStringConvertible, HasShortDescription, Hash
 
   public var isDestructor: Bool { bridged.isDestructor() }
 
-  public var isGenericFunction: Bool { bridged.isGenericFunction() }
+  public var isGeneric: Bool { bridged.isGeneric() }
 
+  public var linkage: Linkage { bridged.getLinkage().linkage }
+
+  /// True, if the linkage of the function indicates that it is visible outside the current
+  /// compilation unit and therefore not all of its uses are known.
+  ///
+  /// For example, `public` linkage.
+  public var isPossiblyUsedExternally: Bool {
+    return bridged.isPossiblyUsedExternally()
+  }
+
+  /// True, if the linkage of the function indicates that it has a definition outside the
+  /// current compilation unit.
+  ///
+  /// For example, `public_external` linkage.
+  public var isDefinedExternally: Bool { linkage.isExternal }
+
+  public func hasSemanticsAttribute(_ attr: StaticString) -> Bool {
+    attr.withUTF8Buffer { (buffer: UnsafeBufferPointer<UInt8>) in
+      bridged.hasSemanticsAttr(BridgedStringRef(data: buffer.baseAddress!, count: buffer.count))
+    }
+  }
+  public var isSerialized: Bool { bridged.isSerialized() }
+
+  public var isAnySerialized: Bool { bridged.isAnySerialized() }
+
+  public enum SerializedKind {
+    case notSerialized, serialized, serializedForPackage
+  }
+
+  public var serializedKind: SerializedKind {
+    switch bridged.getSerializedKind() {
+    case .IsNotSerialized: return .notSerialized
+    case .IsSerialized: return .serialized
+    case .IsSerializedForPackage: return .serializedForPackage
+    @unknown default: fatalError()
+    }
+  }
+
+  private func serializedKindBridged(_ arg: SerializedKind) -> BridgedFunction.SerializedKind {
+    switch arg {
+    case .notSerialized: return .IsNotSerialized
+    case .serialized: return .IsSerialized
+    case .serializedForPackage: return .IsSerializedForPackage
+    }
+  }
+
+  public func canBeInlinedIntoCaller(_ kind: SerializedKind) -> Bool {
+    bridged.canBeInlinedIntoCaller(serializedKindBridged(kind))
+  }
+
+  public func hasValidLinkageForFragileRef(_ kind: SerializedKind) -> Bool {
+    bridged.hasValidLinkageForFragileRef(serializedKindBridged(kind))
+  }
+
+  public enum ThunkKind {
+    case noThunk, thunk, reabstractionThunk, signatureOptimizedThunk
+  }
+
+  public var thunkKind: ThunkKind {
+    switch bridged.isThunk() {
+    case .IsNotThunk:                return .noThunk
+    case .IsThunk:                   return .thunk
+    case .IsReabstractionThunk:      return .reabstractionThunk
+    case .IsSignatureOptimizedThunk: return .signatureOptimizedThunk
+    default:
+      fatalError()
+    }
+  }
+
+  /// True, if the function runs with a swift 5.1 runtime.
+  /// Note that this is function specific, because inlinable functions are de-serialized
+  /// in a client module, which might be compiled with a different deployment target.
+  public var isSwift51RuntimeAvailable: Bool {
+    bridged.isSwift51RuntimeAvailable()
+  }
+
+  public var needsStackProtection: Bool {
+    bridged.needsStackProtection()
+  }
+
+  public var isDeinitBarrier: Bool {
+    effects.sideEffects?.global.isDeinitBarrier ?? true
+  }
+
+  public enum PerformanceConstraints {
+    case none
+    case noAllocations
+    case noLocks
+    case noRuntime
+    case noExistentials
+    case noObjCRuntime
+  }
+
+  public var performanceConstraints: PerformanceConstraints {
+    switch bridged.getPerformanceConstraints() {
+      case .None: return .none
+      case .NoAllocation: return .noAllocations
+      case .NoLocks: return .noLocks
+      case .NoRuntime: return .noRuntime
+      case .NoExistentials: return .noExistentials
+      case .NoObjCBridging: return .noObjCRuntime
+      default: fatalError("unknown performance constraint")
+    }
+  }
+
+  public enum InlineStrategy {
+    case automatic
+    case never
+    case always
+  }
+
+  public var inlineStrategy: InlineStrategy {
+    switch bridged.getInlineStrategy() {
+      case .InlineDefault: return .automatic
+      case .NoInline: return .never
+      case .AlwaysInline: return .always
+      default:
+        fatalError()
+    }
+  }
+}
+
+public func == (lhs: Function, rhs: Function) -> Bool { lhs === rhs }
+public func != (lhs: Function, rhs: Function) -> Bool { lhs !== rhs }
+
+// Function conventions.
+extension Function {
+  public var convention: FunctionConvention {
+    FunctionConvention(for: loweredFunctionType, in: self)
+  }
+
+  public var argumentConventions: ArgumentConventions {
+    ArgumentConventions(convention: convention)
+  }
+
+  // FIXME: Change this to argumentConventions.indirectSILResultCount.
+  // This is incorrect in two cases: it does not include the indirect
+  // error result, and, prior to address lowering, does not include
+  // pack results.
+  public var numIndirectResultArguments: Int { bridged.getNumIndirectFormalResults() }
+
+  public var hasIndirectErrorArgument: Bool { bridged.hasIndirectErrorResult() }
+
+  /// The number of arguments which correspond to parameters (and not to indirect results).
+  public var numParameterArguments: Int { convention.parameters.count }
+
+  /// The slice of arguments starting at argumentConventions.firstParameterIndex.
+  public var parameters: LazyMapSequence<Slice<ArgumentArray>, FunctionArgument> {
+    let args = arguments
+    return args[argumentConventions.firstParameterIndex..<args.count]
+  }
+
+  /// The total number of arguments.
+  ///
+  /// This is the sum of indirect result arguments and parameter arguments.
+  /// If the function is a definition (i.e. it has at least an entry block), this is the
+  /// number of arguments of the function's entry block.
+  public var numArguments: Int { argumentConventions.count }
+
+  public var hasSelfArgument: Bool { argumentConventions.selfIndex != nil }
+
+  public var selfArgumentIndex: Int { argumentConventions.selfIndex! }
+
+  public var selfArgument: FunctionArgument { arguments[selfArgumentIndex] }
+  
+  public var dynamicSelfMetadata: FunctionArgument? {
+    if bridged.hasDynamicSelfMetadata() {
+      return arguments.last!
+    }
+    return nil
+  }
+
+  public var argumentTypes: ArgumentTypeArray { ArgumentTypeArray(function: self) }
+
+  public var resultType: Type { bridged.getSILResultType().type }
+
+  public var hasUnsafeNonEscapableResult: Bool {
+    return bridged.hasUnsafeNonEscapableResult()
+  }
+
+  public var hasResultDependence: Bool {
+    convention.resultDependencies != nil
+  }
+}
+
+public struct ArgumentTypeArray : RandomAccessCollection, FormattedLikeArray {
+  fileprivate let function: Function
+
+  public var startIndex: Int { return 0 }
+  public var endIndex: Int { function.bridged.getNumSILArguments() }
+
+  public subscript(_ index: Int) -> Type {
+    function.bridged.getSILArgumentType(index).type
+  }
+}
+
+// Function effects.
+extension Function {
   /// Kinds of effect attributes which can be defined for a Swift function.
   public enum EffectAttribute {
     /// No effect attribute is specified.
@@ -205,64 +367,17 @@ final public class Function : CustomStringConvertible, HasShortDescription, Hash
     }
   }
 
-  public enum PerformanceConstraints {
-    case none
-    case noAllocations
-    case noLocks
-    case noRuntime
-    case noExistentials
-    case noObjCRuntime
-  }
-
-  public var performanceConstraints: PerformanceConstraints {
-    switch bridged.getPerformanceConstraints() {
-      case .None: return .none
-      case .NoAllocation: return .noAllocations
-      case .NoLocks: return .noLocks
-      case .NoRuntime: return .noRuntime
-      case .NoExistentials: return .noExistentials
-      case .NoObjCBridging: return .noObjCRuntime
-      default: fatalError("unknown performance constraint")
-    }
-  }
-
-  public enum InlineStrategy {
-    case automatic
-    case never
-    case always
-  }
-
-  public var inlineStrategy: InlineStrategy {
-    switch bridged.getInlineStrategy() {
-      case .InlineDefault: return .automatic
-      case .NoInline: return .never
-      case .AlwaysInline: return .always
-      default:
-        fatalError()
-    }
-  }
-
-  public var isSerialized: Bool { bridged.isSerialized() }
-  public var hasValidLinkageForFragileRef: Bool { bridged.hasValidLinkageForFragileRef() }
-
-  /// True, if the function runs with a swift 5.1 runtime.
-  /// Note that this is function specific, because inlinable functions are de-serialized
-  /// in a client module, which might be compiled with a different deployment target.
-  public var isSwift51RuntimeAvailable: Bool {
-    bridged.isSwift51RuntimeAvailable()
-  }
-
-  public var needsStackProtection: Bool {
-    bridged.needsStackProtection()
-  }
-
-  public var isDeinitBarrier: Bool {
-    effects.sideEffects?.global.isDeinitBarrier ?? true
-  }
-
   // Only to be called by PassContext
   public func _modifyEffects(_ body: (inout FunctionEffects) -> ()) {
     body(&effects)
+  }
+}
+
+// Bridging utilities
+
+extension Function {
+  public var bridged: BridgedFunction {
+    BridgedFunction(obj: SwiftObject(self))
   }
 
   static func register() {
@@ -387,9 +502,8 @@ final public class Function : CustomStringConvertible, HasShortDescription, Hash
         let addr = bridgedAddr.value
         let applySite = argOp.instruction as! FullApplySite
         let addrPath = addr.accessPath
-        let argIdx = argOp.index - ApplyOperands.firstArgumentIndex
-        let calleeArgIdx = applySite.calleeArgIndex(callerArgIndex: argIdx)
-        let convention = applySite.getArgumentConvention(calleeArgIndex: calleeArgIdx)
+        let calleeArgIdx = applySite.calleeArgumentIndex(of: argOp)!
+        let convention = applySite.convention(of: argOp)!
         assert(convention.isIndirectIn || convention.isInout)
         let argPath = argOp.value.accessPath
         assert(!argPath.isDistinct(from: addrPath))
@@ -401,25 +515,7 @@ final public class Function : CustomStringConvertible, HasShortDescription, Hash
       }
     )
   }
-
-  public var bridged: BridgedFunction { BridgedFunction(obj: SwiftObject(self)) }
 }
-
-public func == (lhs: Function, rhs: Function) -> Bool { lhs === rhs }
-public func != (lhs: Function, rhs: Function) -> Bool { lhs !== rhs }
-
-public struct ArgumentTypeArray : RandomAccessCollection, FormattedLikeArray {
-  fileprivate let function: Function
-
-  public var startIndex: Int { return 0 }
-  public var endIndex: Int { function.bridged.getNumSILArguments() }
-
-  public subscript(_ index: Int) -> Type {
-    function.bridged.getSILArgumentType(index).type
-  }
-}
-
-// Bridging utilities
 
 extension BridgedFunction {
   public var function: Function { obj.getAs(Function.self) }

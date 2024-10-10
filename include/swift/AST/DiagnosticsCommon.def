@@ -32,6 +32,9 @@ ERROR(error_opening_output,none,
 ERROR(error_closing_output,none,
       "error closing '%0' for output: %1", (StringRef, StringRef))
 
+ERROR(error_mccas,none,
+      "error trying to materialize MCCAS object file: %0", (StringRef))
+
 ERROR(cannot_find_group_info_file,none,
       "cannot find group info file at path: '%0'", (StringRef))
 
@@ -45,8 +48,12 @@ NOTE(brace_stmt_suggest_do,none,
      "did you mean to use a 'do' statement?", ())
 
 WARNING(error_in_future_swift_version,none,
-        "%0; this is an error in Swift %1",
+        "%0; this is an error in the Swift %1 language mode",
         (DiagnosticInfo *, unsigned))
+
+WARNING(error_in_a_future_swift_version,none,
+        "%0; this will be an error in a future Swift language mode",
+        (DiagnosticInfo *))
 
 // Generic disambiguation
 NOTE(while_parsing_as_left_angle_bracket,none,
@@ -55,11 +62,6 @@ NOTE(while_parsing_as_left_angle_bracket,none,
 // Generic determinism-forcing override.
 REMARK(remark_max_determinism_overriding,none,
          "SWIFTC_MAXIMUM_DETERMINISM overriding %0", (StringRef))
-
-// FIXME: This is used both as a parse error (a literal "super" outside a
-// method) and a type-checker error ("super" in a method of a non-class type).
-ERROR(super_not_in_class_method,none,
-      "'super' cannot be used outside of class members", ())
 
 ERROR(class_func_not_in_class,none,
       "class methods are only allowed within classes; "
@@ -114,10 +116,6 @@ ERROR(generic_signature_not_valid,none,
 ERROR(generic_signature_not_equal,none,
       "generic signature %0 is not equal to new signature %1",
       (StringRef, StringRef))
-
-// Used in diagnostics that are split across requests implemented in several places.
-ERROR(concurrency_default_actor_not_found,none,
-      "broken standard library: cannot find default actor type '%0'", (StringRef))
 
 // FIXME: Used by swift-api-digester. Don't want to set up a separate diagnostics
 // file just for a few errors.
@@ -199,7 +197,10 @@ WARNING(cross_imported_by_both_modules, none,
 //------------------------------------------------------------------------------
 
 ERROR(scanner_find_cycle, none,
-      "dependency scanner detected dependency cycle: '%0'", (StringRef))
+      "module dependency cycle: '%0'", (StringRef))
+
+NOTE(scanner_find_cycle_swift_overlay_path, none,
+     "Swift Overlay dependency of '%0' on '%1' via Clang module dependency: '%2'", (StringRef, StringRef, StringRef))
 
 ERROR(scanner_arguments_invalid, none,
       "dependencies scanner cannot be configured with arguments: '%0'", (StringRef))
@@ -231,8 +232,6 @@ NOTE(in_macro_expansion,none,
 ERROR(macro_experimental,none,
       "%0 macros are an experimental feature that is not enabled %select{|(%1)}1",
       (StringRef, StringRef))
-ERROR(ambiguous_macro_reference,none,
-      "ambiguous reference to macro %0", (DeclName))
 
 //------------------------------------------------------------------------------
 // MARK: bridged diagnostics

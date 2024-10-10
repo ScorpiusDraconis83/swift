@@ -123,6 +123,11 @@ final class NewHalfOpenRangeGenerator : NewRangeGenerator1 {
   override init(start: Int32, end: Int32)
 }
 
+class COpt {
+  final var i: Optional<Int32>
+  init()
+}
+
 sil_global @total : $Int32
 
 sil @use : $@convention(thin) (Builtin.Int32) -> ()
@@ -134,6 +139,7 @@ sil @use_twofield : $@convention(thin) (TwoField) -> ()
 sil @escaped_a_ptr : $@convention(thin) () -> @out A
 sil @escaped_a : $@convention(thin) () -> Builtin.RawPointer
 sil @init_twofield : $@convention(thin) (@thin TwoField.Type) -> TwoField
+sil @in_ptr : $@convention(thin) (@in Builtin.RawPointer) -> ()
 
 
 // We have a bug in the old projection code which this test case exposes.
@@ -1291,7 +1297,47 @@ bb0:
   (%1, %2, %3) = begin_apply %0() : $@yield_once @convention(thin) () -> (@yields @in_guaranteed String, @yields @in_guaranteed Int64)
   %4 = load %1 : $*String
   %5 = load %2 : $*Int64
-  end_apply %3
+  end_apply %3 as $()
   %7 = tuple (%4 : $String, %5 : $Int64)
   return %7 : $(String, Int64)
 }
+
+// CHECK-LABEL: sil @dont_remove_load_from_stored_pointer :
+// CHECK:         [[L:%[0-9]+]] = load
+// CHECK:         return [[L]]
+// CHECK-LABEL: } // end sil function 'dont_remove_load_from_stored_pointer'
+sil @dont_remove_load_from_stored_pointer : $@convention(thin) (Int) -> Int {
+bb0(%0 : $Int):
+  %1 = alloc_stack $Int
+  store %0 to %1 : $*Int
+  %5 = address_to_pointer %1 : $*Int to $Builtin.RawPointer
+  %32 = alloc_stack $Builtin.RawPointer
+  store %5 to %32 : $*Builtin.RawPointer
+  %34 = function_ref @in_ptr : $@convention(thin) (@in Builtin.RawPointer) -> ()
+  %35 = apply %34(%32) : $@convention(thin) (@in Builtin.RawPointer) -> ()
+  dealloc_stack %32 : $*Builtin.RawPointer
+  %53 = load %1 : $*Int
+  dealloc_stack %1 : $*Int
+  return %53 : $Int
+}
+
+// CHECK-LABEL: sil [ossa] @test_anyobject_cast :
+// CHECK:         store
+// CHECK:         [[L:%[0-9]+]] = load
+// CHECK:         return [[L]]
+// CHECK-LABEL: } // end sil function 'test_anyobject_cast'
+sil [ossa] @test_anyobject_cast : $@convention(thin) (@guaranteed COpt, Int32) -> Optional<Int32> {
+bb0(%0 : @guaranteed $COpt, %1 : $Int32):
+  %2 = init_existential_ref %0 : $COpt : $COpt, $AnyObject
+  %3 = unchecked_ref_cast %2 : $AnyObject to $COpt
+  %4 = ref_element_addr %3 : $COpt, #COpt.i
+  %5 = load [trivial] %4 : $*Optional<Int32>
+  %6 = ref_element_addr %3 : $COpt, #COpt.i
+  %7 = init_enum_data_addr %6 : $*Optional<Int32>, #Optional.some!enumelt
+  store %1 to [trivial] %7 : $*Int32
+  %9 = ref_element_addr %3 : $COpt, #COpt.i
+  %10 = load [trivial] %9 : $*Optional<Int32>
+  return %10 : $Optional<Int32>
+}
+
+

@@ -21,6 +21,7 @@
 #include "swift/AST/LazyResolver.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/ParameterList.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/StringExtras.h"
 
 #include "clang/AST/DeclObjC.h"
@@ -211,11 +212,11 @@ swift::cxx_translation::getNameForCxx(const ValueDecl *VD,
 
 swift::cxx_translation::DeclRepresentation
 swift::cxx_translation::getDeclRepresentation(const ValueDecl *VD) {
-  if (VD->isObjC())
-    return {Unsupported, UnrepresentableObjC};
   if (getActorIsolation(const_cast<ValueDecl *>(VD)).isActorIsolated())
     return {Unsupported, UnrepresentableIsolatedInActor};
-  llvm::Optional<CanGenericSignature> genericSignature;
+  if (isa<MacroDecl>(VD))
+    return {Unsupported, UnrepresentableMacro};
+  GenericSignature genericSignature;
   // Don't expose @_alwaysEmitIntoClient decls as they require their
   // bodies to be emitted into client.
   if (VD->getAttrs().hasAttribute<AlwaysEmitIntoClientAttr>())
@@ -228,22 +229,23 @@ swift::cxx_translation::getDeclRepresentation(const ValueDecl *VD) {
             Feature::GenerateBindingsForThrowingFunctionsInCXX))
       return {Unsupported, UnrepresentableThrows};
     if (AFD->isGeneric())
-      genericSignature = AFD->getGenericSignature().getCanonicalSignature();
+      genericSignature = AFD->getGenericSignature();
   }
   if (const auto *typeDecl = dyn_cast<NominalTypeDecl>(VD)) {
     if (isa<ProtocolDecl>(typeDecl))
       return {Unsupported, UnrepresentableProtocol};
     // Swift's consume semantics are not yet supported in C++.
-    if (typeDecl->canBeNoncopyable())
+    if (!typeDecl->canBeCopyable())
       return {Unsupported, UnrepresentableMoveOnly};
+    if (isa<ClassDecl>(VD) && VD->isObjC())
+      return {Unsupported, UnrepresentableObjC};
     if (typeDecl->isGeneric()) {
       if (isa<ClassDecl>(VD))
         return {Unsupported, UnrepresentableGeneric};
-      genericSignature =
-          typeDecl->getGenericSignature().getCanonicalSignature();
+      genericSignature = typeDecl->getGenericSignature();
     }
-    // Nested types are not yet supported.
-    if (!typeDecl->hasClangNode() &&
+    // Nested classes are not yet supported.
+    if (isa<ClassDecl>(VD) && !typeDecl->hasClangNode() &&
         isa_and_nonnull<NominalTypeDecl>(
             typeDecl->getDeclContext()->getAsDecl()))
       return {Unsupported, UnrepresentableNested};
@@ -262,6 +264,8 @@ swift::cxx_translation::getDeclRepresentation(const ValueDecl *VD) {
       for (const auto *elementDecl : enumCase->getElements()) {
         if (!elementDecl->hasAssociatedValues())
           continue;
+        if (elementDecl->isIndirect())
+          return {Unsupported, UnrepresentableIndirectEnum};
         // Do not expose any enums with > 1
         // enum parameter, or any enum parameter
         // whose type we do not yet support.
@@ -280,10 +284,13 @@ swift::cxx_translation::getDeclRepresentation(const ValueDecl *VD) {
       }
     }
   }
+
   // Generic requirements are not yet supported in C++.
-  if (genericSignature && !genericSignature->getRequirements().empty())
+  if (!isExposableToCxx(genericSignature)) {
     return {Unsupported, UnrepresentableGenericRequirements};
-  return {Representable, llvm::None};
+  }
+
+  return {Representable, std::nullopt};
 }
 
 bool swift::cxx_translation::isVisibleToCxx(const ValueDecl *VD,
@@ -303,6 +310,51 @@ bool swift::cxx_translation::isVisibleToCxx(const ValueDecl *VD,
     }
   }
   return false;
+}
+
+bool swift::cxx_translation::isExposableToCxx(GenericSignature genericSig) {
+  // If there's no generic signature, it's fine.
+  if (!genericSig)
+    return true;
+
+  // FIXME: This should use getRequirements() and actually
+  // support arbitrary requirements. We don't really want
+  // to use getRequirementsWithInverses() here.
+  //
+  // For now, we use the inverse transform as a quick way to
+  // check for the "default" generic signature where each
+  // generic parameter is Copyable and Escapable, but not
+  // subject to any other requirements; that's exactly the
+  // generic signature that C++ interop supports today.
+  SmallVector<Requirement, 2> reqs;
+  SmallVector<InverseRequirement, 2> inverseReqs;
+  genericSig->getRequirementsWithInverses(reqs, inverseReqs);
+  if (!reqs.empty()) {
+    // Conformance requirements to marker protocols are okay.
+    for (const auto &req: reqs) {
+      if (req.getKind() != RequirementKind::Conformance)
+        return false;
+
+      auto proto = req.getProtocolDecl();
+      if (!proto->isMarkerProtocol())
+        return false;
+    }
+  }
+
+  // Allow Copyable and Escapable.
+  for (const auto &req: inverseReqs) {
+    switch (req.getKind()) {
+    case InvertibleProtocolKind::Copyable:
+      continue;
+
+    case InvertibleProtocolKind::Escapable:
+      continue;
+    }
+
+    return false;
+  }
+
+  return true;
 }
 
 Diagnostic
@@ -335,5 +387,7 @@ swift::cxx_translation::diagnoseRepresenationError(RepresentationError error,
     return Diagnostic(diag::expose_move_only_to_cxx, vd);
   case UnrepresentableNested:
     return Diagnostic(diag::expose_nested_type_to_cxx, vd);
+  case UnrepresentableMacro:
+    return Diagnostic(diag::expose_macro_to_cxx, vd);
   }
 }

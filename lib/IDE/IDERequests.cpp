@@ -15,6 +15,7 @@
 #include "swift/AST/Effects.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/ASTDemangler.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
@@ -100,7 +101,7 @@ private:
   bool isDone() const { return CursorInfo->isValid(); }
   bool tryResolve(ValueDecl *D, TypeDecl *CtorTyRef, ExtensionDecl *ExtTyRef,
                   SourceLoc Loc, bool IsRef, Type Ty = Type(),
-                  llvm::Optional<ReferenceMetaData> Data = llvm::None);
+                  std::optional<ReferenceMetaData> Data = std::nullopt);
   bool tryResolve(ModuleEntity Mod, SourceLoc Loc);
   bool tryResolve(Stmt *St);
   bool visitSubscriptReference(ValueDecl *D, CharSourceRange Range,
@@ -132,7 +133,7 @@ static bool locationMatches(SourceLoc currentLoc, SourceLoc toResolveLoc,
 bool CursorInfoResolver::tryResolve(ValueDecl *D, TypeDecl *CtorTyRef,
                                     ExtensionDecl *ExtTyRef, SourceLoc Loc,
                                     bool IsRef, Type Ty,
-                                    llvm::Optional<ReferenceMetaData> Data) {
+                                    std::optional<ReferenceMetaData> Data) {
   if (!D->hasName())
     return false;
 
@@ -151,13 +152,20 @@ bool CursorInfoResolver::tryResolve(ValueDecl *D, TypeDecl *CtorTyRef,
 
   SmallVector<NominalTypeDecl *> ReceiverTypes;
   bool IsDynamic = false;
-  llvm::Optional<std::pair<const CustomAttr *, Decl *>> CustomAttrRef =
-      llvm::None;
+  std::optional<std::pair<const CustomAttr *, Decl *>> CustomAttrRef =
+      std::nullopt;
   if (Expr *BaseE = getBase(ExprStack)) {
     if (isDynamicRef(BaseE, D)) {
       IsDynamic = true;
       ide::getReceiverType(BaseE, ReceiverTypes);
     }
+  } else if (ExprStack.empty() && isDeclOverridable(D)) {
+    // We aren't in a call (otherwise we would have an expression stack wouldn't
+    // be empty), so we're at the declaration of an overridable declaration.
+    // Mark the declaration as dynamic so that jump-to-definition can offer to
+    // jump to any declaration that overrides this declaration.
+    IsDynamic = true;
+    ReceiverTypes.push_back(D->getDeclContext()->getSelfNominalTypeDecl());
   }
 
   if (Data)
@@ -165,7 +173,8 @@ bool CursorInfoResolver::tryResolve(ValueDecl *D, TypeDecl *CtorTyRef,
 
   CursorInfo = new ResolvedValueRefCursorInfo(
       CursorInfo->getSourceFile(), CursorInfo->getLoc(), D, CtorTyRef, ExtTyRef,
-      IsRef, Ty, ContainerType, CustomAttrRef,
+      IsRef, /*SolutionSpecificInterfaceType=*/Type(), ContainerType,
+      CustomAttrRef,
       /*IsKeywordArgument=*/false, IsDynamic, ReceiverTypes,
       /*ShorthandShadowedDecls=*/{});
 
@@ -422,7 +431,7 @@ void swift::simple_display(llvm::raw_ostream &out, const CursorInfoOwner &owner)
   if (!owner.isValid())
     return;
   auto &SM = owner.File->getASTContext().SourceMgr;
-  out << SM.getIdentifierForBuffer(*owner.File->getBufferID());
+  out << SM.getIdentifierForBuffer(owner.File->getBufferID());
   auto LC = SM.getLineAndColumnInBuffer(owner.Loc);
   out << ":" << LC.first << ":" << LC.second;
 }
@@ -433,7 +442,7 @@ void swift::ide::simple_display(llvm::raw_ostream &out,
     return;
   out << "Resolved cursor info at ";
   auto &SM = info->getSourceFile()->getASTContext().SourceMgr;
-  out << SM.getIdentifierForBuffer(*info->getSourceFile()->getBufferID());
+  out << SM.getIdentifierForBuffer(info->getSourceFile()->getBufferID());
   auto LC = SM.getLineAndColumnInBuffer(info->getLoc());
   out << ":" << LC.first << ":" << LC.second;
 }
@@ -556,7 +565,7 @@ private:
   SourceLoc Start;
   SourceLoc End;
 
-  llvm::Optional<ResolvedRangeInfo> Result;
+  std::optional<ResolvedRangeInfo> Result;
   std::vector<ContextInfo> ContextStack;
   ContextInfo &getCurrentDC() {
     assert(!ContextStack.empty());
@@ -639,39 +648,29 @@ private:
     auto UnhandledEffects = getUnhandledEffects({Node});
     OrphanKind Kind = getOrphanKind(ContainedASTNodes);
     if (Node.is<Expr*>())
-      return ResolvedRangeInfo(RangeKind::SingleExpression,
-                               resolveNodeType(Node, RangeKind::SingleExpression),
-                               TokensInRange,
-                               getImmediateContext(),
-                               /*Common Parent Expr*/nullptr,
-                               SingleEntry,
-                               UnhandledEffects, Kind,
-                               llvm::makeArrayRef(ContainedASTNodes),
-                               llvm::makeArrayRef(DeclaredDecls),
-                               llvm::makeArrayRef(ReferencedDecls));
+      return ResolvedRangeInfo(
+          RangeKind::SingleExpression,
+          resolveNodeType(Node, RangeKind::SingleExpression), TokensInRange,
+          getImmediateContext(),
+          /*Common Parent Expr*/ nullptr, SingleEntry, UnhandledEffects, Kind,
+          llvm::ArrayRef(ContainedASTNodes), llvm::ArrayRef(DeclaredDecls),
+          llvm::ArrayRef(ReferencedDecls));
     else if (Node.is<Stmt*>())
-      return ResolvedRangeInfo(RangeKind::SingleStatement,
-                               resolveNodeType(Node, RangeKind::SingleStatement),
-                               TokensInRange,
-                               getImmediateContext(),
-                               /*Common Parent Expr*/nullptr,
-                               SingleEntry,
-                               UnhandledEffects, Kind,
-                               llvm::makeArrayRef(ContainedASTNodes),
-                               llvm::makeArrayRef(DeclaredDecls),
-                               llvm::makeArrayRef(ReferencedDecls));
+      return ResolvedRangeInfo(
+          RangeKind::SingleStatement,
+          resolveNodeType(Node, RangeKind::SingleStatement), TokensInRange,
+          getImmediateContext(),
+          /*Common Parent Expr*/ nullptr, SingleEntry, UnhandledEffects, Kind,
+          llvm::ArrayRef(ContainedASTNodes), llvm::ArrayRef(DeclaredDecls),
+          llvm::ArrayRef(ReferencedDecls));
     else {
       assert(Node.is<Decl*>());
-      return ResolvedRangeInfo(RangeKind::SingleDecl,
-                               ReturnInfo(),
-                               TokensInRange,
-                               getImmediateContext(),
-                               /*Common Parent Expr*/nullptr,
-                               SingleEntry,
-                               UnhandledEffects, Kind,
-                               llvm::makeArrayRef(ContainedASTNodes),
-                               llvm::makeArrayRef(DeclaredDecls),
-                               llvm::makeArrayRef(ReferencedDecls));
+      return ResolvedRangeInfo(
+          RangeKind::SingleDecl, ReturnInfo(), TokensInRange,
+          getImmediateContext(),
+          /*Common Parent Expr*/ nullptr, SingleEntry, UnhandledEffects, Kind,
+          llvm::ArrayRef(ContainedASTNodes), llvm::ArrayRef(DeclaredDecls),
+          llvm::ArrayRef(ReferencedDecls));
     }
   }
 
@@ -722,19 +721,17 @@ public:
   void leave(ASTNode Node) {
     if (!hasResult() && !Node.isImplicit() && nodeContainSelection(Node)) {
       if (auto Parent = Node.is<Expr*>() ? Node.get<Expr*>() : nullptr) {
-        Result = {
-          RangeKind::PartOfExpression,
-          ReturnInfo(),
-          TokensInRange,
-          getImmediateContext(),
-          Parent,
-          hasSingleEntryPoint(ContainedASTNodes),
-          getUnhandledEffects(ContainedASTNodes),
-          getOrphanKind(ContainedASTNodes),
-          llvm::makeArrayRef(ContainedASTNodes),
-          llvm::makeArrayRef(DeclaredDecls),
-          llvm::makeArrayRef(ReferencedDecls)
-        };
+        Result = {RangeKind::PartOfExpression,
+                  ReturnInfo(),
+                  TokensInRange,
+                  getImmediateContext(),
+                  Parent,
+                  hasSingleEntryPoint(ContainedASTNodes),
+                  getUnhandledEffects(ContainedASTNodes),
+                  getOrphanKind(ContainedASTNodes),
+                  llvm::ArrayRef(ContainedASTNodes),
+                  llvm::ArrayRef(DeclaredDecls),
+                  llvm::ArrayRef(ReferencedDecls)};
       }
     }
 
@@ -969,18 +966,15 @@ public:
 
     if (DCInfo.isMultiStatement()) {
       postAnalysis(DCInfo.EndMatches.back());
-      Result = {RangeKind::MultiStatement,
-                /* Last node has the type */
-                resolveNodeType(DCInfo.EndMatches.back(),
-                                RangeKind::MultiStatement),
-                TokensInRange,
-                getImmediateContext(), nullptr,
-                hasSingleEntryPoint(ContainedASTNodes),
-                getUnhandledEffects(ContainedASTNodes),
-                getOrphanKind(ContainedASTNodes),
-                llvm::makeArrayRef(ContainedASTNodes),
-                llvm::makeArrayRef(DeclaredDecls),
-                llvm::makeArrayRef(ReferencedDecls)};
+      Result = {
+          RangeKind::MultiStatement,
+          /* Last node has the type */
+          resolveNodeType(DCInfo.EndMatches.back(), RangeKind::MultiStatement),
+          TokensInRange, getImmediateContext(), nullptr,
+          hasSingleEntryPoint(ContainedASTNodes),
+          getUnhandledEffects(ContainedASTNodes),
+          getOrphanKind(ContainedASTNodes), llvm::ArrayRef(ContainedASTNodes),
+          llvm::ArrayRef(DeclaredDecls), llvm::ArrayRef(ReferencedDecls)};
     }
 
     if (DCInfo.isMultiTypeMemberDecl()) {
@@ -993,9 +987,9 @@ public:
                 /*SinleEntry*/ true,
                 getUnhandledEffects(ContainedASTNodes),
                 getOrphanKind(ContainedASTNodes),
-                llvm::makeArrayRef(ContainedASTNodes),
-                llvm::makeArrayRef(DeclaredDecls),
-                llvm::makeArrayRef(ReferencedDecls)};
+                llvm::ArrayRef(ContainedASTNodes),
+                llvm::ArrayRef(DeclaredDecls),
+                llvm::ArrayRef(ReferencedDecls)};
     }
   }
 
@@ -1184,7 +1178,7 @@ void swift::simple_display(llvm::raw_ostream &out,
   if (!owner.isValid())
     return;
   auto &SM = owner.File->getASTContext().SourceMgr;
-  out << SM.getIdentifierForBuffer(*owner.File->getBufferID());
+  out << SM.getIdentifierForBuffer(owner.File->getBufferID());
   auto SLC = SM.getLineAndColumnInBuffer(owner.StartLoc);
   auto ELC = SM.getLineAndColumnInBuffer(owner.EndLoc);
   out << ": (" << SLC.first << ":" << SLC.second << ", "
@@ -1194,7 +1188,7 @@ void swift::simple_display(llvm::raw_ostream &out,
 RangeInfoOwner::RangeInfoOwner(SourceFile *File, unsigned Offset,
                                unsigned Length): File(File) {
   SourceManager &SM = File->getASTContext().SourceMgr;
-  unsigned BufferId = File->getBufferID().value();
+  unsigned BufferId = File->getBufferID();
   StartLoc = SM.getLocForOffset(BufferId, Offset);
   EndLoc = SM.getLocForOffset(BufferId, Offset + Length);
 }
@@ -1253,7 +1247,7 @@ ProvideDefaultImplForRequest::evaluate(Evaluator &eval, ValueDecl* VD) const {
       }
     }
   }
-  return copyToContext(VD->getASTContext(), llvm::makeArrayRef(Results));
+  return copyToContext(VD->getASTContext(), llvm::ArrayRef(Results));
 }
 
 //----------------------------------------------------------------------------//
@@ -1281,7 +1275,7 @@ CollectOverriddenDeclsRequest::evaluate(Evaluator &evaluator,
     }
   }
 
-  return copyToContext(VD->getASTContext(), llvm::makeArrayRef(results));
+  return copyToContext(VD->getASTContext(), llvm::ArrayRef(results));
 }
 
 

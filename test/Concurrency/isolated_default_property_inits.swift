@@ -2,8 +2,8 @@
 
 // RUN: %target-swift-frontend -emit-module -emit-module-path %t/OtherActors.swiftmodule -module-name OtherActors %S/Inputs/OtherActors.swift -disable-availability-checking
 
-// RUN: %target-swift-frontend -I %t  -disable-availability-checking -strict-concurrency=complete -enable-experimental-feature IsolatedDefaultValues -parse-as-library -emit-sil -o /dev/null -verify %s
-// RUN: %target-swift-frontend -I %t  -disable-availability-checking -strict-concurrency=complete -parse-as-library -emit-sil -o /dev/null -verify -enable-experimental-feature IsolatedDefaultValues -enable-experimental-feature RegionBasedIsolation %s
+// RUN: %target-swift-frontend -I %t  -disable-availability-checking -strict-concurrency=complete -enable-upcoming-feature IsolatedDefaultValues -parse-as-library -emit-sil -o /dev/null -verify %s
+// RUN: %target-swift-frontend -I %t  -disable-availability-checking -strict-concurrency=complete -parse-as-library -emit-sil -o /dev/null -verify -enable-upcoming-feature IsolatedDefaultValues -enable-upcoming-feature RegionBasedIsolation %s
 
 // REQUIRES: concurrency
 // REQUIRES: asserts
@@ -20,9 +20,11 @@ func requiresMainActor() -> Int { 0 }
 func requiresSomeGlobalActor() -> Int { 0 }
 
 class C1 {
-  // expected-note@+1 2 {{'self.x' not initialized}}
+  // expected-note@+2 {{main actor-isolated default value of 'self.x' cannot be used in a nonisolated initalizer}}
+  // expected-note@+1 {{main actor-isolated default value of 'self.x' cannot be used in a global actor 'SomeGlobalActor'-isolated initalizer}}
   @MainActor var x = requiresMainActor()
-  // expected-note@+1 2 {{'self.y' not initialized}}
+  // expected-note@+2 {{global actor 'SomeGlobalActor'-isolated default value of 'self.y' cannot be used in a nonisolated initalizer}}
+  // expected-note@+1 {{global actor 'SomeGlobalActor'-isolated default value of 'self.y' cannot be used in a main actor-isolated initalizer}}
   @SomeGlobalActor var y = requiresSomeGlobalActor()
   var z = 10
 

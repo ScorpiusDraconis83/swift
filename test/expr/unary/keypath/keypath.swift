@@ -1,4 +1,6 @@
-// RUN: %target-swift-frontend -typecheck -parse-as-library %s -verify
+// RUN: %target-swift-frontend -typecheck -enable-experimental-feature KeyPathWithStaticMembers -parse-as-library %s -verify
+
+// REQUIRES: asserts
 
 struct Sub: Hashable {
   static func ==(_: Sub, _: Sub) -> Bool { return true }
@@ -123,12 +125,14 @@ func testKeyPath(sub: Sub, optSub: OptSub,
   _ = \(() -> ()).noMember
 
   let _: (A) -> Prop = \.property
+  let _: (A) -> Prop? = \.property
   let _: PartialKeyPath<A> = \.property
   let _: KeyPath<A, Prop> = \.property
   let _: WritableKeyPath<A, Prop> = \.property
   let _: ReferenceWritableKeyPath<A, Prop> = \.property
   //expected-error@-1 {{cannot convert key path type 'WritableKeyPath<A, Prop>' to contextual type 'ReferenceWritableKeyPath<A, Prop>'}}
 
+  let _: (A) -> A? = \.[sub]
   let _: (A) -> A = \.[sub]
   let _: PartialKeyPath<A> = \.[sub]
   let _: KeyPath<A, A> = \.[sub]
@@ -136,6 +140,7 @@ func testKeyPath(sub: Sub, optSub: OptSub,
   let _: ReferenceWritableKeyPath<A, A> = \.[sub]
   //expected-error@-1 {{cannot convert key path type 'WritableKeyPath<A, A>' to contextual type 'ReferenceWritableKeyPath<A, A>'}}
 
+  let _: (A) -> Prop?? = \.optProperty?
   let _: (A) -> Prop? = \.optProperty?
   let _: PartialKeyPath<A> = \.optProperty?
   let _: KeyPath<A, Prop?> = \.optProperty?
@@ -144,6 +149,7 @@ func testKeyPath(sub: Sub, optSub: OptSub,
   // expected-error@+1{{cannot convert}}
   let _: ReferenceWritableKeyPath<A, Prop?> = \.optProperty?
 
+  let _: (A) -> A?? = \.optProperty?[sub]
   let _: (A) -> A? = \.optProperty?[sub]
   let _: PartialKeyPath<A> = \.optProperty?[sub]
   let _: KeyPath<A, A?> = \.optProperty?[sub]
@@ -157,6 +163,7 @@ func testKeyPath(sub: Sub, optSub: OptSub,
   let _: KeyPath<A, Prop?> = \.property[optSub]?.optProperty!
   let _: KeyPath<A, A?> = \.property[optSub]?.optProperty![sub]
 
+  let _: (C<A>) -> A? = \.value
   let _: (C<A>) -> A = \.value
   let _: PartialKeyPath<C<A>> = \.value
   let _: KeyPath<C<A>, A> = \.value
@@ -164,6 +171,7 @@ func testKeyPath(sub: Sub, optSub: OptSub,
   let _: ReferenceWritableKeyPath<C<A>, A> = \.value
   // expected-error@-1 {{cannot convert key path type 'WritableKeyPath<C<A>, A>' to contextual type 'ReferenceWritableKeyPath<C<A>, A>'}}
 
+  let _: (C<A>) -> A? = \C.value
   let _: (C<A>) -> A = \C.value
   let _: PartialKeyPath<C<A>> = \C.value
   let _: KeyPath<C<A>, A> = \C.value
@@ -171,6 +179,7 @@ func testKeyPath(sub: Sub, optSub: OptSub,
   // expected-error@+1{{cannot convert}}
   let _: ReferenceWritableKeyPath<C<A>, A> = \C.value
 
+  let _: (Prop) -> B? = \.nonMutatingProperty
   let _: (Prop) -> B = \.nonMutatingProperty
   let _: PartialKeyPath<Prop> = \.nonMutatingProperty
   let _: KeyPath<Prop, B> = \.nonMutatingProperty
@@ -517,16 +526,39 @@ func testInvalidKeyPathComponents() {
   let _ = \.{return 0} // expected-error* {{}}
 }
 
+struct W {
+  static let h = 50
+}
+
 class X {
   class var a: Int { return 1 }
-  static var b = 2
+  static var b = 20
+  let c = true
+  static subscript(d: Int) -> String { "\(d)" }
+  var e: W.Type? { return W.self }
+}
+
+class Y : X {
+  subscript(f: Int) -> W.Type { W.self }
+  static subscript(g: Int) -> W.Type { W.self }
 }
 
 func testStaticKeyPathComponent() {
-  _ = \X.a // expected-error{{cannot refer to static member}}
-  _ = \X.Type.a // expected-error{{cannot refer to static member}}
-  _ = \X.b // expected-error{{cannot refer to static member}}
-  _ = \X.Type.b // expected-error{{cannot refer to static member}}
+  _ = \X.a // expected-error{{static member 'a' cannot be used on instance of type 'X'}}
+  _ = \X.Type.a
+  _ = \X.b // expected-error{{static member 'b' cannot be used on instance of type 'X'}}
+  _ = \X.Type.b
+  _ = \X.c
+  _ = \X.Type.c // expected-error{{instance member 'c' cannot be used on type 'X'}}
+  _ = \X.[42] // expected-error{{static member 'subscript(_:)' cannot be used on instance of type 'X'}}
+  _ = \X.Type.[42]
+
+  let _: KeyPath<X, Int?> = \.e?.h
+  let _: PartialKeyPath<X> = \.e?.h
+  let _: AnyKeyPath = \X.e?.h
+  
+  let _ : KeyPath<Y, W.Type> = \Y.[40]
+  let _ : KeyPath<Y.Type, W.Type> = \Y.Type.[70]
 }
 
 class Bass: Hashable {
@@ -716,6 +748,8 @@ var identity10: PartialKeyPath<Container> = \.self
 var identity11: AnyKeyPath = \Container.self
 var identity12: (Container) -> Container = \Container.self
 var identity13: (Container) -> Container = \.self
+var identity14: (Container) -> Container? = \Container.self
+var identity15: (Container) -> Container? = \.self
 
 var interleavedIdentityComponents = \Container.self.base.self?.self.i.self
 
@@ -726,13 +760,13 @@ protocol P_With_Static_Members {
 
 func test_keypath_with_static_members(_ p: P_With_Static_Members) {
   let _ = p[keyPath: \.x]
-  // expected-error@-1 {{key path cannot refer to static member 'x'}}
+  // expected-error@-1 {{static member 'x' cannot be used on instance of type 'any P_With_Static_Members'}}
   let _: KeyPath<P_With_Static_Members, Int> = \.x
-  // expected-error@-1 {{key path cannot refer to static member 'x'}}
+  // expected-error@-1 {{static member 'x' cannot be used on instance of type 'any P_With_Static_Members'}}
   let _ = \P_With_Static_Members.arr.count
-  // expected-error@-1 {{key path cannot refer to static member 'arr'}}
+  // expected-error@-1 {{static member 'arr' cannot be used on instance of type 'any P_With_Static_Members'}}
   let _ = p[keyPath: \.arr.count]
-  // expected-error@-1 {{key path cannot refer to static member 'arr'}}
+  // expected-error@-1 {{static member 'arr' cannot be used on instance of type 'any P_With_Static_Members'}}
 
   struct S {
     static var foo: String = "Hello"
@@ -745,17 +779,16 @@ func test_keypath_with_static_members(_ p: P_With_Static_Members) {
 
   func foo(_ s: S) {
     let _ = \S.Type.foo
-    // expected-error@-1 {{key path cannot refer to static member 'foo'}}
     let _ = s[keyPath: \.foo]
-    // expected-error@-1 {{key path cannot refer to static member 'foo'}}
+    // expected-error@-1 {{static member 'foo' cannot be used on instance of type 'S'}}
     let _: KeyPath<S, String> = \.foo
-    // expected-error@-1 {{key path cannot refer to static member 'foo'}}
+    // expected-error@-1 {{static member 'foo' cannot be used on instance of type 'S'}}
     let _ = \S.foo
-    // expected-error@-1 {{key path cannot refer to static member 'foo'}}
+    // expected-error@-1 {{static member 'foo' cannot be used on instance of type 'S'}}
     let _ = \S.bar.baz
-    // expected-error@-1 {{key path cannot refer to static member 'baz'}}
+    // expected-error@-1 {{static member 'baz' cannot be used on instance of type 'Bar'}}
     let _ = s[keyPath: \.bar.baz]
-    // expected-error@-1 {{key path cannot refer to static member 'baz'}}
+    // expected-error@-1 {{static member 'baz' cannot be used on instance of type 'Bar'}}
   }
 }
 
@@ -914,13 +947,13 @@ func testKeyPathHole() {
 
   func f(_ i: Int) {}
   f(\.x) // expected-error {{cannot infer key path type from context; consider explicitly specifying a root type}} {{6-6=<#Root#>}}
-  // expected-error@-1 {{cannot convert value of key path type to expected argument type 'Int'}}
   f(\.x.y) // expected-error {{cannot infer key path type from context; consider explicitly specifying a root type}} {{6-6=<#Root#>}}
-  // expected-error@-1 {{cannot convert value of key path type to expected argument type 'Int'}}
 
-  func provideValueButNotRoot<T>(_ fn: (T) -> String) {} 
+func provideValueButNotRoot<T>(_ fn: (T) -> String) {} // expected-note 2 {{in call to function 'provideValueButNotRoot'}}
   provideValueButNotRoot(\.x) // expected-error {{cannot infer key path type from context; consider explicitly specifying a root type}}
+  // expected-error@-1 {{generic parameter 'T' could not be inferred}}
   provideValueButNotRoot(\.x.y) // expected-error {{cannot infer key path type from context; consider explicitly specifying a root type}}
+// expected-error@-1 {{generic parameter 'T' could not be inferred}}
   provideValueButNotRoot(\String.foo) // expected-error {{value of type 'String' has no member 'foo'}}
 
   func provideKPValueButNotRoot<T>(_ kp: KeyPath<T, String>) {} 
@@ -1236,4 +1269,74 @@ func test_keypath_coercion_to_function() {
 
 func test_keypath_application_with_composition(v: String, kp: any KeyPath<String, Int> & PP) {
   _ = v[keyPath: kp] // Ok
+}
+
+func test_leading_dot_key_path_without_context() {
+  func test(_: AnyKeyPath?) {}
+  test(\.utf8)
+  // expected-error@-1 {{cannot infer key path type from context; consider explicitly specifying a root type}}
+}
+
+func keypath_function_transitive_conversions() {
+  class Base {
+    var derived: Derived { Derived() }
+    var base: Base { Base() }
+    var int: Int { 0 }
+  }
+
+  class Derived: Base {
+    override var derived: Derived { Derived() }
+    override var base: Base { Base() }
+  }
+
+  struct S {
+    var base: Base { Base() }
+    var derived: Derived { Derived() }
+  }
+
+  let _: (Base) -> Base = \Base.base
+  let _: (Base) -> Base = \Derived.base
+  let _: (Base) -> Base? = \Base?.self
+  let _: (Base) -> Base? = \Base?.self?.base
+  // FIXME: This error text is bogus due to KeyPath base covariance.
+  let _: (Base?) -> Base = \Base.base // expected-error {{value of optional type 'Base?' must be unwrapped to refer to member 'base' of wrapped base type 'Base'}} expected-note {{use unwrapped type 'Base' as key path root}} {{29-33=Base}}
+  let _: (Base) -> Base = \.base
+  let _: (Base) -> Base = \Base.derived
+  let _: (Base) -> Base = \.derived
+  let _: (Base) -> Int = \Base.int
+  let _: (Derived) -> Base = \Base.base
+  let _: (Derived) -> Base = \Derived.base
+  let _: (Derived) -> Base = \.base
+  let _: (Derived) -> Int = \Base.int
+  let _: (Derived) -> Int = \Derived.int
+  let _: (Derived) -> Int = \.int
+  let _: (Base) async throws -> Int = \.int
+
+  let _: (Derived) -> Base = \Base.derived
+
+  let _: (S) -> Base = \.derived
+  let _: (S) -> Derived = \.base // expected-error {{key path value type 'Base' cannot be converted to contextual type 'Derived'}}
+}
+
+func testMinimalKeypaths(_ arr: [Int?]) {
+  // These keypaths don't have any components that need 'resolving'. We still
+  // should not eagerly turn them into keypaths; they should get converted to
+  // functions instead
+  let _: [Int] = arr.compactMap(\.self)
+  let _: [Int] = arr.compactMap(\.?)
+  let _: [Int] = arr.map(\.!)
+}
+
+func testKeyPathInout() {
+  let _: (inout String) -> Int = \.count
+  let _: (inout String) -> Int = \String.count
+  let _: (inout String) -> Int? = \.count
+
+  func takesInout(_: (inout String) -> Int) {}
+  func takesInoutOpt(_: (inout String) -> Int?) {}
+
+  takesInout(\.count)
+  takesInout(\String.count)
+  takesInoutOpt(\.count)
+  takesInoutOpt(\String.count)
 }

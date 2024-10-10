@@ -71,9 +71,14 @@ template <class T> struct Dep { using TT = T; };
 
 template <class T> void useDependentType(typename Dep<T>::TT) {}
 
+template <class T> void takesValue(T value) { }
+
 template <class T> void lvalueReference(T &ref) { ref = 42; }
+template <class T> void lvalueReferenceZero(T &ref) { ref = 0; }
 
 template <class T> void constLvalueReference(const T &) {}
+
+template <class T> bool constLvalueReferenceToBool(const T &t) { return t; }
 
 template <class T> void forwardingReference(T &&) {}
 
@@ -101,7 +106,7 @@ template <class T> void takesDependent(Dependent<T> d) {}
 
 void takesAtomic(_Atomic(int) a) {}
 
-struct HasImposibleMember {
+struct HasImpossibleMember {
   void memberTakesAtomic(_Atomic(int) a) {}
 };
 

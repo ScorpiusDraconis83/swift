@@ -513,7 +513,7 @@ struct S_24329052<T> { // expected-note {{generic parameter 'T' of generic struc
   // expected-note@+1 {{generic parameter 'T' of instance method 'bar(_:)' declared here}}
   func bar<T>(_ v: T) { foo(v) }
   // expected-error@-1 {{cannot convert value of type 'T' (generic parameter of instance method 'bar(_:)') to expected argument type 'T' (generic parameter of generic struct 'S_24329052')}}
-  // expected-warning@-2 {{generic parameter 'T' shadows generic parameter from outer scope with the same name; this is an error in Swift 6}}
+  // expected-warning@-2 {{generic parameter 'T' shadows generic parameter from outer scope with the same name; this is an error in the Swift 6 language mode}}
 }
 
 extension Sequence {
@@ -1056,4 +1056,19 @@ func test_mismatches_with_dependent_member_generic_arguments() {
   test2(Optional<Int>(nil), Data())
   // expected-error@-1 {{cannot convert value of type 'Optional<Int>' to expected argument type 'Optional<Data.SomeAssociated>'}}
   // expected-note@-2 {{arguments to generic parameter 'Wrapped' ('Int' and 'Data.SomeAssociated') are expected to be equal}}
+}
+
+extension Dictionary where Value == Any { // expected-note {{where 'Value' = 'any P'}}
+  func compute() {}
+}
+
+do {
+  struct S {
+    var test: [String: any P] = [:]
+  }
+
+  func test_existential_mismatch(s: S) {
+    s.test.compute()
+    // expected-error@-1 {{referencing instance method 'compute()' on 'Dictionary' requires the types 'any P' and 'Any' be equivalent}}
+  }
 }

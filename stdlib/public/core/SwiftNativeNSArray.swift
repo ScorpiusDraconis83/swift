@@ -500,6 +500,10 @@ internal class __SwiftNativeNSArrayWithContiguousStorage {
   @inlinable
   deinit {}
 }
+
+@available(*, unavailable)
+extension __SwiftNativeNSArrayWithContiguousStorage: Sendable {}
+
 #endif
 
 /// Base class of the heap buffer backing arrays.  

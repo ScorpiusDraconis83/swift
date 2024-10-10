@@ -782,6 +782,13 @@ swift_updateClassMetadata2(ClassMetadata *self,
                            size_t numFields,
                            const TypeLayout * const *fieldTypes,
                            size_t *fieldOffsets);
+
+SWIFT_RUNTIME_EXPORT SWIFT_CC(swift)
+Class
+swift_updatePureObjCClassMetadata(Class self,
+                                  ClassLayoutFlags flags,
+                                  size_t numFields,
+                                  const TypeLayout * const *fieldTypes);
 #endif
 
 /// Given class metadata, a class descriptor and a method descriptor, look up
@@ -1053,6 +1060,15 @@ void swift_initRawStructMetadata(StructMetadata *self,
                                  StructLayoutFlags flags,
                                  const TypeLayout *likeType,
                                  int32_t count);
+
+/// Initialize the value witness table for a struct using the provided like type
+/// as the basis for the layout.
+SWIFT_RUNTIME_EXPORT
+void swift_initRawStructMetadata2(StructMetadata *self,
+                                  StructLayoutFlags structLayoutFlags,
+                                  const TypeLayout *likeType,
+                                  intptr_t count,
+                                  RawLayoutFlags rawLayoutFlags);
 
 /// Check if the given generic arguments are valid inputs for the generic type
 /// context and if so call the metadata access function and return the metadata.

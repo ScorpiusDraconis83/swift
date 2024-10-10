@@ -1,4 +1,7 @@
+// RUN: %target-swift-ide-test -print-module -module-to-print=TypeClassification -I %S/Inputs -source-filename=x -cxx-interoperability-mode=swift-5.9 | %FileCheck %s
+// RUN: %target-swift-ide-test -print-module -module-to-print=TypeClassification -I %S/Inputs -source-filename=x -cxx-interoperability-mode=swift-6 | %FileCheck %s
 // RUN: %target-swift-ide-test -print-module -module-to-print=TypeClassification -I %S/Inputs -source-filename=x -cxx-interoperability-mode=upcoming-swift | %FileCheck %s
+// RUN: %target-swift-ide-test -print-module -skip-unsafe-cxx-methods -module-to-print=TypeClassification -I %S/Inputs -source-filename=x -cxx-interoperability-mode=swift-6 | %FileCheck %s -check-prefix=CHECK-SKIP-UNSAFE
 // RUN: %target-swift-ide-test -print-module -skip-unsafe-cxx-methods -module-to-print=TypeClassification -I %S/Inputs -source-filename=x -cxx-interoperability-mode=upcoming-swift | %FileCheck %s -check-prefix=CHECK-SKIP-UNSAFE
 
 // Make sure we don't import objects that we can't copy or destroy.
@@ -44,3 +47,5 @@
 // CHECK:   func __getIteratorBoxUnsafe() -> IteratorBox
 // CHECK-SKIP-UNSAFE-NOT: func __getIteratorBoxUnsafe() -> IteratorBox
 // CHECK: }
+
+// CHECK: struct StructCopyableMovableAnnotatedNonCopyable

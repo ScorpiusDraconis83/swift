@@ -13,6 +13,7 @@
 #define DEBUG_TYPE "sil-combine"
 
 #include "SILCombiner.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/DynamicCasts.h"
 #include "swift/SIL/PatternMatch.h"
@@ -576,12 +577,12 @@ SILInstruction *optimizeBitOp(BuiltinInst *BI,
 
 /// Returns a 64-bit integer constant if \p op is an integer_literal instruction
 /// with a value which fits into 64 bits.
-static llvm::Optional<uint64_t> getIntConst(SILValue op) {
+static std::optional<uint64_t> getIntConst(SILValue op) {
   if (auto *ILI = dyn_cast<IntegerLiteralInst>(op)) {
     if (ILI->getValue().getActiveBits() <= 64)
       return ILI->getValue().getZExtValue();
   }
-  return llvm::None;
+  return std::nullopt;
 }
 
 /// Optimize the bit extract of a string object. Example in SIL pseudo-code,

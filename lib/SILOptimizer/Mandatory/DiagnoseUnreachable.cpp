@@ -16,6 +16,7 @@
 #include "swift/AST/Expr.h"
 #include "swift/AST/Pattern.h"
 #include "swift/AST/Stmt.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/SIL/MemAccessUtils.h"
 #include "swift/SIL/Projection.h"
@@ -24,6 +25,7 @@
 #include "swift/SIL/SILUndef.h"
 #include "swift/SIL/TerminatorUtils.h"
 #include "swift/SIL/BasicBlockDatastructures.h"
+#include "swift/SIL/OwnershipUtils.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SILOptimizer/Utils/BasicBlockOptUtils.h"
@@ -190,7 +192,12 @@ static void propagateBasicBlockArgs(SILBasicBlock &BB) {
     SILArgument *Arg = *AI;
 
     // We were able to fold, so all users should use the new folded value.
-    Arg->replaceAllUsesWith(Args[Idx]);
+    if (auto *bfi = getBorrowedFromUser(Arg)) {
+      bfi->replaceAllUsesWith(Args[Idx]);
+      bfi->eraseFromParent();
+    } else {
+      Arg->replaceAllUsesWith(Args[Idx]);
+    }
     ++NumBasicBlockArgsPropagated;
   }
 
@@ -658,7 +665,6 @@ static void setOutsideBlockUsesToUndef(SILInstruction *I) {
     return;
 
   SILBasicBlock *BB = I->getParent();
-  auto *F = BB->getParent();
 
   // Replace all uses outside of I's basic block by undef.
   llvm::SmallVector<Operand *, 16> Uses;
@@ -667,7 +673,7 @@ static void setOutsideBlockUsesToUndef(SILInstruction *I) {
 
   for (auto *Use : Uses)
     if (Use->getUser()->getParent() != BB)
-      Use->set(SILUndef::get(Use->get()->getType(), *F));
+      Use->set(SILUndef::get(Use->get()));
 }
 
 static SILInstruction *getAsCallToNoReturn(SILInstruction *I) {

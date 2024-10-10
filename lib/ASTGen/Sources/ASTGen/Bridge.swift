@@ -14,7 +14,7 @@ import ASTBridging
 import BasicBridging
 @_spi(RawSyntax) import SwiftSyntax
 
-protocol BridgedNullable: ExpressibleByNilLiteral {
+public protocol BridgedNullable: ExpressibleByNilLiteral {
   associatedtype RawPtr
   init(raw: RawPtr?)
 }
@@ -24,18 +24,18 @@ extension BridgedNullable {
   }
 }
 
-extension BridgedSourceLoc: BridgedNullable {}
-extension BridgedIdentifier: BridgedNullable {}
-extension BridgedNullableExpr: BridgedNullable {}
-extension BridgedNullableStmt: BridgedNullable {}
-extension BridgedNullableTypeRepr: BridgedNullable {}
-extension BridgedNullablePattern: BridgedNullable {}
-extension BridgedNullableGenericParamList: BridgedNullable {}
-extension BridgedNullableTrailingWhereClause: BridgedNullable {}
-extension BridgedNullableParameterList: BridgedNullable {}
-extension BridgedNullablePatternBindingInitializer: BridgedNullable {}
+extension BridgedSourceLoc: /*@retroactive*/ swiftASTGen.BridgedNullable {}
+extension BridgedIdentifier: /*@retroactive*/ swiftASTGen.BridgedNullable {}
+extension BridgedNullableExpr: /*@retroactive*/ swiftASTGen.BridgedNullable {}
+extension BridgedNullableStmt: /*@retroactive*/ swiftASTGen.BridgedNullable {}
+extension BridgedNullableTypeRepr: /*@retroactive*/ swiftASTGen.BridgedNullable {}
+extension BridgedNullablePattern: /*@retroactive*/ swiftASTGen.BridgedNullable {}
+extension BridgedNullableGenericParamList: /*@retroactive*/ swiftASTGen.BridgedNullable {}
+extension BridgedNullableTrailingWhereClause: /*@retroactive*/ swiftASTGen.BridgedNullable {}
+extension BridgedNullableParameterList: /*@retroactive*/ swiftASTGen.BridgedNullable {}
+extension BridgedNullablePatternBindingInitializer: /*@retroactive*/ swiftASTGen.BridgedNullable {}
 
-extension BridgedIdentifier: Equatable {
+extension BridgedIdentifier: /*@retroactive*/ Swift.Equatable {
   public static func == (lhs: Self, rhs: Self) -> Bool {
     lhs.raw == rhs.raw
   }
@@ -91,7 +91,7 @@ public extension BridgedSourceLoc {
   }
 }
 
-extension BridgedLabeledStmtInfo: ExpressibleByNilLiteral {
+extension BridgedLabeledStmtInfo: /*@retroactive*/ Swift.ExpressibleByNilLiteral {
   public init(nilLiteral: ()) {
     self.init()
   }
@@ -105,7 +105,7 @@ extension String {
     )
   }
 
-  mutating func withBridgedString<R>(_ body: (BridgedStringRef) throws -> R) rethrows -> R {
+  public mutating func withBridgedString<R>(_ body: (BridgedStringRef) throws -> R) rethrows -> R {
     try withUTF8 { buffer in
       try body(BridgedStringRef(data: buffer.baseAddress, count: buffer.count))
     }
@@ -119,7 +119,7 @@ extension SyntaxText {
 }
 
 /// Allocate a copy of the given string as a null-terminated UTF-8 string.
-func allocateBridgedString(
+public func allocateBridgedString(
   _ string: String
 ) -> BridgedStringRef {
   var string = string
@@ -143,13 +143,7 @@ public func freeBridgedString(bridged: BridgedStringRef) {
   bridged.data?.deallocate()
 }
 
-extension BridgedStringRef {
-  var isEmptyInitialized: Bool {
-    return self.data == nil && self.count == 0
-  }
-}
-
-extension BridgedStringRef: ExpressibleByStringLiteral {
+extension BridgedStringRef: /*@retroactive*/ Swift.ExpressibleByStringLiteral {
   public init(stringLiteral str: StaticString) {
     self.init(data: str.utf8Start, count: str.utf8CodeUnitCount)
   }
@@ -234,5 +228,47 @@ extension BridgedSourceRange {
   @inline(__always)
   init(startToken: TokenSyntax, endToken: TokenSyntax, in astgen: ASTGenVisitor) {
     self = astgen.generateSourceRange(start: startToken, end: endToken)
+  }
+}
+
+/// Helper collection type that lazily concatenates two collections.
+struct ConcatCollection<C1: Collection, C2: Collection> where C1.Element == C2.Element {
+  let c1: C1
+  let c2: C2
+
+  init(_ c1: C1, _ c2: C2) {
+    self.c1 = c1
+    self.c2 = c2
+  }
+}
+
+extension ConcatCollection: LazyCollectionProtocol {
+  typealias Element = C1.Element
+  enum Index: Comparable {
+    case c1(C1.Index)
+    case c2(C2.Index)
+  }
+
+  var count: Int { c1.count + c2.count }
+
+  private func _normalizedIndex(_ i: C1.Index) -> Index {
+    return i != c1.endIndex ? .c1(i) : .c2(c2.startIndex)
+  }
+
+  var startIndex: Index { _normalizedIndex(c1.startIndex) }
+  var endIndex: Index { .c2(c2.endIndex) }
+
+  func index(after i: Index) -> Index {
+    switch i {
+    case .c1(let i): return _normalizedIndex(c1.index(after: i))
+    case .c2(let i): return .c2(c2.index(after: i))
+    }
+  }
+
+  subscript(i: Index) -> Element {
+    switch i {
+    case .c1(let i): return c1[i]
+    case .c2(let i): return c2[i]
+    }
   }
 }

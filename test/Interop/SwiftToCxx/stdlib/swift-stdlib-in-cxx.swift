@@ -48,6 +48,8 @@
 
 // CHECK: template<class T_0_0>
 // CHECK: template<class T_0_0>
+// CHECK: template<class T_0_0>
+// CHECK: template<class T_0_0>
 // CHECK-NEXT: #ifdef __cpp_concepts
 // CHECK-NEXT: requires swift::isUsableInGenericContext<T_0_0>
 // CHECK-NEXT: #endif
@@ -66,7 +68,8 @@
 // CHECK-NEXT: };
 // CHECK: SWIFT_INLINE_THUNK bool isSome() const;
 // CHECK: SWIFT_INLINE_THUNK bool isNone() const;
-// CHECK: SWIFT_INLINE_THUNK T_0_0 getUnsafelyUnwrapped() const SWIFT_SYMBOL({{.*}});
+// CHECK-DAG: SWIFT_INLINE_THUNK T_0_0 getUnsafelyUnwrapped() const SWIFT_SYMBOL({{.*}});
+// CHECK-DAG: SWIFT_INLINE_THUNK String getDebugDescription() const SWIFT_SYMBOL("s:Sq16debugDescriptionSSvp");
 
 // CHECK: class SWIFT_SYMBOL({{.*}}) String final {
 // CHECK-NEXT: public:

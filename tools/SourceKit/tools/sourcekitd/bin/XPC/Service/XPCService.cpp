@@ -26,6 +26,7 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Threading.h"
 
+#include <csignal>
 #include <xpc/xpc.h>
 
 using namespace SourceKit;
@@ -40,12 +41,12 @@ static void postNotification(sourcekitd_response_t Notification) {
     goto done;
 
   {
-    xpc_object_t contents = xpc_array_create(nullptr, 0);
+    xpc_object_t contents = xpc_array_create_empty();
     xpc_array_set_uint64(contents, XPC_ARRAY_APPEND,
                          (uint64_t)xpc::Message::Notification);
     xpc_array_set_value(contents, XPC_ARRAY_APPEND, Notification);
 
-    xpc_object_t msg = xpc_dictionary_create(nullptr, nullptr, 0);
+    xpc_object_t msg = xpc_dictionary_create_empty();
     xpc_dictionary_set_value(msg, xpc::KeyInternalMsg, contents);
     xpc_release(contents);
 
@@ -84,12 +85,12 @@ static sourcekitd_uid_t xpcSKDUIDFromUIdent(UIdent UID) {
   if (!peer)
     return nullptr;
 
-  xpc_object_t contents = xpc_array_create(nullptr, 0);
+  xpc_object_t contents = xpc_array_create_empty();
   xpc_array_set_uint64(contents, XPC_ARRAY_APPEND,
                        (uint64_t)xpc::Message::UIDSynchronization);
   xpc_array_set_string(contents, XPC_ARRAY_APPEND, UID.c_str());
 
-  xpc_object_t msg = xpc_dictionary_create(nullptr, nullptr,  0);
+  xpc_object_t msg = xpc_dictionary_create_empty();
   xpc_dictionary_set_value(msg, xpc::KeyInternalMsg, contents);
   xpc_release(contents);
 
@@ -121,12 +122,12 @@ static UIdent xpcUIdentFromSKDUID(sourcekitd_uid_t SKDUID) {
   if (!Peer)
     return UIdent();
 
-  xpc_object_t contents = xpc_array_create(nullptr, 0);
+  xpc_object_t contents = xpc_array_create_empty();
   xpc_array_set_uint64(contents, XPC_ARRAY_APPEND,
                        (uint64_t)xpc::Message::UIDSynchronization);
   xpc_array_set_uint64(contents, XPC_ARRAY_APPEND, uintptr_t(SKDUID));
 
-  xpc_object_t msg = xpc_dictionary_create(nullptr, nullptr,  0);
+  xpc_object_t msg = xpc_dictionary_create_empty();
   xpc_dictionary_set_value(msg, xpc::KeyInternalMsg, contents);
   xpc_release(contents);
 
@@ -277,10 +278,10 @@ static void sourcekitdServer_peer_event_handler(xpc_connection_t peer,
         };
 
         if (sourcekitd::requestIsEnableBarriers(req)) {
+          RequestBarriersEnabled = true;
           dispatch_barrier_async(requestQueue, ^{
             auto Responder = std::make_shared<XPCResponder>(event, peer);
             xpc_release(event);
-            RequestBarriersEnabled = true;
             sourcekitd::sendBarriersEnabledResponse([Responder](sourcekitd_response_t response) {
               Responder->sendReply(response);
             });
@@ -307,24 +308,27 @@ static void sourcekitdServer_peer_event_handler(xpc_connection_t peer,
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
           sourcekitd::cancelRequest(/*CancellationToken=*/cancelToken);
         });
+        xpc_release(event);
       } else if (SourceKitCancellationToken cancelToken =
                      reinterpret_cast<SourceKitCancellationToken>(
                          xpc_dictionary_get_uint64(
                              event, xpc::KeyDisposeRequestHandle))) {
         sourcekitd::disposeCancellationToken(/*CancellationToken=*/cancelToken);
+        xpc_release(event);
       } else {
         assert(false && "unexpected message");
+        xpc_release(event);
       }
     });
   }
 }
 
 static void getInitializationInfo(xpc_connection_t peer) {
-  xpc_object_t contents = xpc_array_create(nullptr, 0);
+  xpc_object_t contents = xpc_array_create_empty();
   xpc_array_set_uint64(contents, XPC_ARRAY_APPEND,
                        (uint64_t)xpc::Message::Initialization);
 
-  xpc_object_t msg = xpc_dictionary_create(nullptr, nullptr,  0);
+  xpc_object_t msg = xpc_dictionary_create_empty();
   xpc_dictionary_set_value(msg, xpc::KeyInternalMsg, contents);
   xpc_release(contents);
 
@@ -385,6 +389,7 @@ static void fatal_error_handler(void *user_data, const char *reason,
 }
 
 int main(int argc, const char *argv[]) {
+  std::signal(SIGTERM, SIG_DFL);
   llvm::install_fatal_error_handler(fatal_error_handler, 0);
   sourcekitd::enableLogging("sourcekit-serv");
   sourcekitd_set_uid_handlers(

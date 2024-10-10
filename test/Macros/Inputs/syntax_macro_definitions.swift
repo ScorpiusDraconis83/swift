@@ -105,6 +105,20 @@ public struct StringifyAndTryMacro: ExpressionMacro {
   }
 }
 
+public struct TryCallThrowingFuncMacro: ExpressionMacro {
+  public static func expansion(
+    of macro: some FreestandingMacroExpansionSyntax,
+    in context: some MacroExpansionContext
+  ) -> ExprSyntax {
+    return """
+      try await {
+        print("let's throw")
+        return try await throwingFunc()
+      }()
+      """
+  }
+}
+
 struct SimpleDiagnosticMessage: DiagnosticMessage {
   let message: String
   let diagnosticID: MessageID
@@ -209,6 +223,25 @@ public class NestedDeclInExprMacro: ExpressionMacro {
       return ()
     }
     """
+  }
+}
+
+public class NullaryFunctionCallMacro: ExpressionMacro {
+  public static func expansion(
+    of macro: some FreestandingMacroExpansionSyntax,
+    in context: some MacroExpansionContext
+  ) -> ExprSyntax {
+    let calls = macro.arguments.compactMap(\.expression).map { "\($0)()" }
+    return "(\(raw: calls.joined(separator: ", ")))"
+  }
+}
+
+public class TupleMacro: ExpressionMacro {
+  public static func expansion(
+    of macro: some FreestandingMacroExpansionSyntax,
+    in context: some MacroExpansionContext
+  ) -> ExprSyntax {
+    return "(\(raw: macro.arguments.map { "\($0)" }.joined()))"
   }
 }
 
@@ -854,6 +887,163 @@ public enum LeftHandOperandFinderMacro: ExpressionMacro {
   }
 }
 
+extension SyntaxCollection {
+  mutating func removeLast() {
+    self.remove(at: self.index(before: self.endIndex))
+  }
+}
+
+public struct AddAsyncMacro: PeerMacro {
+  public static func expansion<
+    Context: MacroExpansionContext,
+    Declaration: DeclSyntaxProtocol
+  >(
+    of node: AttributeSyntax,
+    providingPeersOf declaration: Declaration,
+    in context: Context
+  ) throws -> [DeclSyntax] {
+
+    // Only on functions at the moment.
+    guard var funcDecl = declaration.as(FunctionDeclSyntax.self) else {
+      throw CustomError.message("@addAsync only works on functions")
+    }
+
+    // This only makes sense for non async functions.
+    if funcDecl.signature.effectSpecifiers?.asyncSpecifier != nil {
+      throw CustomError.message(
+        "@addAsync requires an non async function"
+      )
+    }
+
+    // This only makes sense void functions
+    if let resultType = funcDecl.signature.returnClause?.type,
+       resultType.as(IdentifierTypeSyntax.self)?.name.text != "Void" {
+      throw CustomError.message(
+        "@addAsync requires an function that returns void"
+      )
+    }
+
+    // Requires a completion handler block as last parameter
+    let completionHandlerParameter = funcDecl
+      .signature
+      .parameterClause
+      .parameters.last?
+      .type.as(AttributedTypeSyntax.self)?
+      .baseType.as(FunctionTypeSyntax.self)
+    guard let completionHandlerParameter else {
+      throw CustomError.message(
+        "@AddAsync requires an function that has a completion handler as last parameter"
+      )
+    }
+
+    // Completion handler needs to return Void
+    if completionHandlerParameter.returnClause.type.as(IdentifierTypeSyntax.self)?.name.text != "Void" {
+      throw CustomError.message(
+        "@AddAsync requires an function that has a completion handler that returns Void"
+      )
+    }
+
+    let returnType = completionHandlerParameter.parameters.first?.type
+
+    let isResultReturn = returnType?.children(viewMode: .all).first?.description == "Result"
+    let successReturnType =
+      if isResultReturn {
+        returnType!.as(IdentifierTypeSyntax.self)!.genericArgumentClause?.arguments.first!.argument
+      } else {
+        returnType
+      }
+
+    // Remove completionHandler and comma from the previous parameter
+    var newParameterList = funcDecl.signature.parameterClause.parameters
+    newParameterList.removeLast()
+    var newParameterListLastParameter = newParameterList.last!
+    newParameterList.removeLast()
+    newParameterListLastParameter.trailingTrivia = []
+    newParameterListLastParameter.trailingComma = nil
+    newParameterList.append(newParameterListLastParameter)
+
+    // Drop the @AddAsync attribute from the new declaration.
+    let newAttributeList = funcDecl.attributes.filter {
+      guard case let .attribute(attribute) = $0,
+        let attributeType = attribute.attributeName.as(IdentifierTypeSyntax.self),
+        let nodeType = node.attributeName.as(IdentifierTypeSyntax.self)
+      else {
+        return true
+      }
+
+      return attributeType.name.text != nodeType.name.text
+    }
+
+    let callArguments: [String] = newParameterList.map { param in
+      let argName = param.secondName ?? param.firstName
+
+      let paramName = param.firstName
+      if paramName.text != "_" {
+        return "\(paramName.text): \(argName.text)"
+      }
+
+      return "\(argName.text)"
+    }
+
+    let switchBody: ExprSyntax =
+      """
+            switch returnValue {
+            case .success(let value):
+              continuation.resume(returning: value)
+            case .failure(let error):
+              continuation.resume(throwing: error)
+            }
+      """
+
+    let newBody: ExprSyntax =
+      """
+
+        \(raw: isResultReturn ? "try await withCheckedThrowingContinuation { continuation in" : "await withCheckedContinuation { continuation in")
+          \(raw: funcDecl.name)(\(raw: callArguments.joined(separator: ", "))) { \(raw: returnType != nil ? "returnValue in" : "")
+
+      \(raw: isResultReturn ? switchBody : "continuation.resume(returning: \(raw: returnType != nil ? "returnValue" : "()"))")
+          }
+        }
+
+      """
+
+    // add async
+    funcDecl.signature.effectSpecifiers = FunctionEffectSpecifiersSyntax(
+      leadingTrivia: .space,
+      asyncSpecifier: .keyword(.async),
+      throwsClause: isResultReturn ? ThrowsClauseSyntax(throwsSpecifier: .keyword(.throws)) : nil
+    )
+
+    // add result type
+    if let successReturnType {
+      funcDecl.signature.returnClause = ReturnClauseSyntax(
+        leadingTrivia: .space,
+        type: successReturnType.with(\.leadingTrivia, .space)
+      )
+    } else {
+      funcDecl.signature.returnClause = nil
+    }
+
+    // drop completion handler
+    funcDecl.signature.parameterClause.parameters = newParameterList
+    funcDecl.signature.parameterClause.trailingTrivia = []
+
+    funcDecl.body = CodeBlockSyntax(
+      leftBrace: .leftBraceToken(leadingTrivia: .space),
+      statements: CodeBlockItemListSyntax(
+        [CodeBlockItemSyntax(item: .expr(newBody))]
+      ),
+      rightBrace: .rightBraceToken(leadingTrivia: .newline)
+    )
+
+    funcDecl.attributes = newAttributeList
+
+    funcDecl.leadingTrivia = .newlines(2)
+
+    return [DeclSyntax(funcDecl)]
+  }
+}
+
 public struct AddCompletionHandler: PeerMacro {
   public static func expansion(
     of node: AttributeSyntax,
@@ -1015,7 +1205,7 @@ public struct WrapInType: PeerMacro {
     }
 
     // Build a new function with the same signature that forwards arguments
-    // to the the original function.
+    // to the original function.
     let parameterList = funcDecl.signature.parameterClause.parameters
     let callArguments: [String] = parameterList.map { param in
       let argName = param.secondName ?? param.firstName
@@ -1772,7 +1962,7 @@ public struct SimpleCodeItemMacro: CodeItemMacro {
       }
       """)),
       .init(item: .stmt("""
-      if false {
+      if 1 == 0 {
         print("impossible")
       }
       """)),
@@ -1816,6 +2006,17 @@ public struct VarValueMacro: DeclarationMacro, PeerMacro {
     return [
       "var value: Int { 1 }"
     ]
+  }
+}
+
+public struct GenericToVoidMacro: ExpressionMacro {
+  public static func expansion(
+    of node: some FreestandingMacroExpansionSyntax,
+    in context: some MacroExpansionContext
+  ) throws -> ExprSyntax {
+    return """
+           ()
+           """
   }
 }
 
@@ -1975,6 +2176,74 @@ public struct NestedMagicLiteralMacro: ExpressionMacro {
   }
 }
 
+public struct NativeFileIDMacro: ExpressionMacro {
+  public static func expansion(
+    of node: some FreestandingMacroExpansionSyntax,
+    in context: some MacroExpansionContext
+  ) -> ExprSyntax {
+    return context.location(
+        of: node, at: .afterLeadingTrivia, filePathMode: .fileID
+    )!.file
+  }
+}
+
+public struct NativeFilePathMacro: ExpressionMacro {
+  public static func expansion(
+    of node: some FreestandingMacroExpansionSyntax,
+    in context: some MacroExpansionContext
+  ) -> ExprSyntax {
+    return context.location(
+        of: node, at: .afterLeadingTrivia, filePathMode: .filePath
+    )!.file
+  }
+}
+
+public struct NativeLineMacro: ExpressionMacro {
+  public static func expansion(
+    of node: some FreestandingMacroExpansionSyntax,
+    in context: some MacroExpansionContext
+  ) -> ExprSyntax {
+    return context.location(of: node)!.line
+  }
+}
+
+public struct NativeColumnMacro: ExpressionMacro {
+  public static func expansion(
+    of node: some FreestandingMacroExpansionSyntax,
+    in context: some MacroExpansionContext
+  ) -> ExprSyntax {
+    return context.location(of: node)!.column
+  }
+}
+
+public struct ClosureCallerMacro: ExpressionMacro {
+    public static func expansion(
+      of node: some FreestandingMacroExpansionSyntax,
+      in context: some MacroExpansionContext
+    ) -> ExprSyntax {
+        let location = context.location(of: node)!
+        return #"""
+        ClosureCaller({ (value, then) in
+            #sourceLocation(file: \#(location.file), line: \#(location.line))
+            print("\(value)@\(\#(location.file))#\(\#(location.line))")
+            then()
+            #sourceLocation()
+        })
+        """#
+    }
+}
+
+public struct PrependHelloToShadowedMacro: ExpressionMacro {
+    public static func expansion(
+      of node: some FreestandingMacroExpansionSyntax,
+      in context: some MacroExpansionContext
+    ) -> ExprSyntax {
+        #"""
+        "hello \(shadowed)"
+        """#
+    }
+}
+
 public struct InvalidIfExprMacro: MemberMacro {
   public static func expansion(
     of node: AttributeSyntax,
@@ -2091,7 +2360,93 @@ public struct SendableMacro: ExtensionMacro {
   }
 }
 
-public struct FakeCodeItemMacro: DeclarationMacro, PeerMacro {
+public struct GenerateStubMemberMacro: MemberMacro {
+  public static func expansion(
+    of node: AttributeSyntax,
+    providingMembersOf declaration: some DeclGroupSyntax,
+    conformingTo protocols: [TypeSyntax],
+    in context: some MacroExpansionContext
+  ) throws -> [DeclSyntax] {
+    return ["#generateMemberStubs"]
+  }
+}
+
+public struct GenerateStubsFreestandingMacro: DeclarationMacro {
+  public static func expansion(
+    of node: some FreestandingMacroExpansionSyntax,
+    in context: some MacroExpansionContext
+  ) throws -> [DeclSyntax] {
+    return ["#generateMember"]
+  }
+}
+
+public struct SingleMemberStubMacro: DeclarationMacro {
+  public static func expansion(
+    of node: some FreestandingMacroExpansionSyntax,
+    in context: some MacroExpansionContext
+  ) throws -> [DeclSyntax] {
+    return ["static func member() {}"]
+  }
+}
+
+public struct DeclMacroWithControlFlow: DeclarationMacro {
+  public static func expansion(
+    of node: some FreestandingMacroExpansionSyntax,
+    in context: some MacroExpansionContext
+  ) throws -> [DeclSyntax] {
+    return ["let _ = .random() ? try throwingFn() : 0"]
+  }
+}
+
+public struct GenerateStubsForProtocolRequirementsMacro: PeerMacro, ExtensionMacro {
+  public static func expansion(
+    of node: AttributeSyntax,
+    attachedTo declaration: some DeclGroupSyntax,
+    providingExtensionsOf type: some TypeSyntaxProtocol,
+    conformingTo protocols: [TypeSyntax],
+    in context: some MacroExpansionContext
+  ) throws -> [ExtensionDeclSyntax] {
+    guard let proto = declaration.as(ProtocolDeclSyntax.self) else {
+      return []
+    }
+
+    let requirements =
+      proto.memberBlock.members.map { member in member.trimmed }
+    let requirementStubs = requirements
+      .map { req in
+        "\(req) { fatalError() }"
+      }
+      .joined(separator: "\n    ")
+
+    let extensionDecl: DeclSyntax =
+      """
+      extension \(proto.name) where Self: _TestStub {
+        \(raw: requirementStubs)
+      }
+      """
+    return [extensionDecl.cast(ExtensionDeclSyntax.self)]
+  }
+
+  public static func expansion(
+    of node: AttributeSyntax,
+    providingPeersOf declaration: some DeclSyntaxProtocol,
+    in context: some MacroExpansionContext
+  ) throws -> [DeclSyntax] {
+    guard let proto = declaration.as(ProtocolDeclSyntax.self) else {
+      return []
+    }
+
+    return [
+      """
+      struct __\(proto.name): \(proto.name), _TestStub {
+        init() {} 
+      }
+      """
+    ]
+  }
+}
+
+  public struct FakeCodeItemMacro: DeclarationMacro, PeerMacro {
   public static func expansion(
     of node: some FreestandingMacroExpansionSyntax,
     in context: some MacroExpansionContext
@@ -2171,6 +2526,20 @@ public struct RemoteBodyMacro: BodyMacro {
       """
       return try await remoteCall(function: \(literal: funcBaseName), arguments: \(passedArgs))
       """
+    ]
+  }
+}
+
+@_spi(ExperimentalLanguageFeature)
+public struct BodyMacroWithControlFlow: BodyMacro {
+  public static func expansion(
+    of node: AttributeSyntax,
+    providingBodyFor declaration: some DeclSyntaxProtocol & WithOptionalCodeBlockSyntax,
+    in context: some MacroExpansionContext
+  ) throws -> [CodeBlockItemSyntax] {
+    [
+      "guard .random() else { return }",
+      "_ = try throwingFn()"
     ]
   }
 }
@@ -2273,4 +2642,65 @@ public struct _AddPeerMacro: PeerMacro {
         }
         return ["static let \(raw: name)_special = 41"]
     }
+}
+
+public struct WrapperMacro: PeerMacro {
+  public static func expansion(
+      of node: SwiftSyntax.AttributeSyntax,
+      providingPeersOf declaration: some SwiftSyntax.DeclSyntaxProtocol,
+      in context: some SwiftSyntaxMacros.MacroExpansionContext
+  ) throws -> [SwiftSyntax.DeclSyntax] {
+    []
+  }
+}
+
+public struct AddDeinit: MemberMacro {
+  public static func expansion(
+    of node: AttributeSyntax,
+    providingMembersOf decl: some DeclGroupSyntax,
+    in context: some MacroExpansionContext
+  ) throws -> [DeclSyntax] {
+    return [
+      """
+      deinit {
+        print("deinit was called")
+      }
+      """
+    ]
+  }
+}
+
+public struct AddSubscript: MemberMacro {
+  public static func expansion(
+    of node: AttributeSyntax,
+    providingMembersOf decl: some DeclGroupSyntax,
+    in context: some MacroExpansionContext
+  ) throws -> [DeclSyntax] {
+    return [
+      """
+      subscript(unchecked index: Int) -> String {
+        return "\\(index)"
+      }
+      """
+    ]
+  }
+}
+
+public struct AllLexicalContextsMacro: DeclarationMacro {
+  public static func expansion(
+    of node: some FreestandingMacroExpansionSyntax,
+    in context: some MacroExpansionContext
+  ) throws -> [DeclSyntax] {
+    context.lexicalContext.compactMap { $0.as(DeclSyntax.self)?.trimmed }
+  }
+}
+
+public struct AddGetterMacro: AccessorMacro {
+  public static func expansion(
+    of node: AttributeSyntax,
+    providingAccessorsOf declaration: some DeclSyntaxProtocol,
+    in context: some MacroExpansionContext
+  ) throws -> [AccessorDeclSyntax] {
+    return ["get { 0 }"]
+  }
 }

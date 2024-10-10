@@ -34,6 +34,7 @@
 
 #include "ImageInspection.h"
 #include "swift/Demangling/Demangle.h"
+#include "swift/Runtime/Atomic.h"
 #include "swift/Runtime/Debug.h"
 #include "swift/Runtime/Portability.h"
 #include "swift/Runtime/Win32.h"
@@ -64,13 +65,14 @@
 #include <inttypes.h>
 
 #ifdef SWIFT_HAVE_CRASHREPORTERCLIENT
-#include <atomic>
 #include <malloc/malloc.h>
-
-#include "swift/Runtime/Atomic.h"
+#else
+static std::atomic<const char *> kFatalErrorMessage;
 #endif // SWIFT_HAVE_CRASHREPORTERCLIENT
 
 #include "BacktracePrivate.h"
+
+#include <atomic>
 
 namespace FatalErrorFlags {
 enum: uint32_t {
@@ -100,25 +102,31 @@ static bool getSymbolNameAddr(llvm::StringRef libraryName,
   // providing failure status instead of just returning the original string like
   // swift demangle.
 #if defined(_WIN32)
-  char szUndName[1024];
-  DWORD dwResult;
-  dwResult = _swift_win32_withDbgHelpLibrary([&] (HANDLE hProcess) -> DWORD {
-    if (!hProcess) {
-      return 0;
-    }
+  const char *szSymbolName = syminfo.getSymbolName();
 
-    DWORD dwFlags = UNDNAME_COMPLETE;
+  // UnDecorateSymbolName() will not fail for Swift symbols, so detect them
+  // up-front and let Swift handle them.
+  if (!Demangle::isMangledName(szSymbolName)) {
+    char szUndName[1024];
+    DWORD dwResult;
+    dwResult = _swift_win32_withDbgHelpLibrary([&] (HANDLE hProcess) -> DWORD {
+      if (!hProcess) {
+        return 0;
+      }
+
+      DWORD dwFlags = UNDNAME_COMPLETE;
 #if !defined(_WIN64)
-    dwFlags |= UNDNAME_32_BIT_DECODE;
+      dwFlags |= UNDNAME_32_BIT_DECODE;
 #endif
 
-    return UnDecorateSymbolName(syminfo.getSymbolName(), szUndName,
-                                sizeof(szUndName), dwFlags);
-  });
+      return UnDecorateSymbolName(szSymbolName, szUndName,
+                                  sizeof(szUndName), dwFlags);
+    });
 
-  if (dwResult) {
-    symbolName += szUndName;
-    return true;
+    if (dwResult) {
+      symbolName += szUndName;
+      return true;
+    }
   }
 #else
   int status;
@@ -149,6 +157,9 @@ void swift::dumpStackTraceEntry(unsigned index, void *framePC,
 #if SWIFT_STDLIB_SUPPORTS_BACKTRACE_REPORTING && SWIFT_STDLIB_HAS_DLADDR
   auto syminfo = SymbolInfo::lookup(framePC);
   if (!syminfo.has_value()) {
+    constexpr const char *format = "%-4u %-34s 0x%0.16tx\n";
+    fprintf(stderr, format, index, "<unknown>",
+            reinterpret_cast<uintptr_t>(framePC));
     return;
   }
 
@@ -157,7 +168,12 @@ void swift::dumpStackTraceEntry(unsigned index, void *framePC,
   // is not provided in the header so that it requires linking with
   // libSupport.a.
   llvm::StringRef libraryName{syminfo->getFilename()};
+
+#ifdef _WIN32
+  libraryName = libraryName.substr(libraryName.rfind('\\')).substr(1);
+#else
   libraryName = libraryName.substr(libraryName.rfind('/')).substr(1);
+#endif
 
   // Next we get the symbol name that we are going to use in our backtrace.
   std::string symbolName;
@@ -177,6 +193,11 @@ void swift::dumpStackTraceEntry(unsigned index, void *framePC,
     symbolName = "<unavailable>";
   }
 
+  const char *libraryNameStr = libraryName.data();
+
+  if (!libraryNameStr)
+    libraryNameStr = "<unknown>";
+
   // We do not use %p here for our pointers since the format is implementation
   // defined. This makes it logically impossible to check the output. Forcing
   // hexadecimal solves this issue.
@@ -185,11 +206,11 @@ void swift::dumpStackTraceEntry(unsigned index, void *framePC,
   // This gives enough info to reconstruct identical debugging target after
   // this process terminates.
   if (shortOutput) {
-    fprintf(stderr, "%s`%s + %td", libraryName.data(), symbolName.c_str(),
+    fprintf(stderr, "%s`%s + %td", libraryNameStr, symbolName.c_str(),
             offset);
   } else {
     constexpr const char *format = "%-4u %-34s 0x%0.16" PRIxPTR " %s + %td\n";
-    fprintf(stderr, format, index, libraryName.data(), symbolAddr,
+    fprintf(stderr, format, index, libraryNameStr, symbolAddr,
             symbolName.c_str(), offset);
   }
 #else
@@ -297,7 +318,24 @@ reportOnCrash(uint32_t flags, const char *message)
              std::memory_order_release,
              SWIFT_MEMORY_ORDER_CONSUME));
 #else
-  // empty
+  const char *previous = nullptr;
+  char *current = nullptr;
+  previous =
+      std::atomic_load_explicit(&kFatalErrorMessage, SWIFT_MEMORY_ORDER_CONSUME);
+
+  do {
+    ::free(current);
+    current = nullptr;
+
+    if (previous)
+      swift_asprintf(&current, "%s%s", current, message);
+    else
+      current = ::strdup(message);
+  } while (!std::atomic_compare_exchange_strong_explicit(&kFatalErrorMessage,
+                                                         &previous,
+                                                         static_cast<const char *>(current),
+                                                         std::memory_order_release,
+                                                         SWIFT_MEMORY_ORDER_CONSUME));
 #endif // SWIFT_HAVE_CRASHREPORTERCLIENT
 }
 
@@ -313,7 +351,10 @@ reportNow(uint32_t flags, const char *message)
   fflush(stderr);
 #endif
 #if SWIFT_STDLIB_HAS_ASL
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
   asl_log(nullptr, nullptr, ASL_LEVEL_ERR, "%s", message);
+#pragma clang diagnostic pop
 #elif defined(__ANDROID__)
   __android_log_print(ANDROID_LOG_FATAL, "SwiftRuntime", "%s", message);
 #endif
@@ -417,6 +458,12 @@ swift::warning(uint32_t flags, const char *format, ...)
 void swift::swift_reportWarning(uint32_t flags, const char *message) {
   warning(flags, "%s", message);
 }
+
+#if !defined(SWIFT_HAVE_CRASHREPORTERCLIENT)
+std::atomic<const char *> *swift::swift_getFatalErrorMessageBuffer() {
+  return &kFatalErrorMessage;
+}
+#endif
 
 // Crash when a deleted method is called by accident.
 SWIFT_RUNTIME_EXPORT SWIFT_NORETURN void swift_deletedMethodError() {

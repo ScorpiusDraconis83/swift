@@ -14,6 +14,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "swift/Runtime/LibPrespecialized.h"
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 // Avoid defining macro max(), min() which conflict with std::max(), std::min()
@@ -24,6 +25,8 @@
 #include "MetadataCache.h"
 #include "BytecodeLayouts.h"
 #include "swift/ABI/TypeIdentity.h"
+#include "swift/Basic/Defer.h"
+#include "swift/Basic/MathUtils.h"
 #include "swift/Basic/Lazy.h"
 #include "swift/Basic/Range.h"
 #include "swift/Basic/STLExtras.h"
@@ -365,6 +368,10 @@ namespace {
 
     AllocationResult allocate(const TypeContextDescriptor *description,
                               const void * const *arguments) {
+      if (auto *prespecialized =
+              getLibPrespecializedMetadata(description, arguments))
+        return {prespecialized, PrivateMetadataState::Complete};
+
       // Find a pattern.  Currently we always use the default pattern.
       auto &generics = description->getFullGenericContextHeader();
       auto pattern = generics.DefaultInstantiationPattern.get();
@@ -811,7 +818,6 @@ swift::swift_allocateGenericValueMetadata(const ValueTypeDescriptor *description
          (extraDataSize == (pattern->getExtraDataPattern()->OffsetInWords +
                             pattern->getExtraDataPattern()->SizeInWords) *
                                sizeof(void *)));
-
   size_t totalSize = sizeof(FullMetadata<ValueMetadata>) + extraDataSize;
 
   auto bytes = (char*) MetadataAllocator(GenericValueMetadataTag)
@@ -2117,10 +2123,6 @@ static constexpr TypeLayout getInitialLayoutForHeapObject() {
           0};
 }
 
-static size_t roundUpToAlignMask(size_t size, size_t alignMask) {
-  return (size + alignMask) & ~alignMask;
-}
-
 /// Perform basic sequential layout given a vector of metadata pointers,
 /// calling a functor with the offset of each field, and returning the
 /// final layout characteristics of the type.
@@ -2140,6 +2142,7 @@ static void performBasicLayout(TypeLayout &layout,
   size_t alignMask = layout.flags.getAlignmentMask();
   bool isPOD = layout.flags.isPOD();
   bool isBitwiseTakable = layout.flags.isBitwiseTakable();
+  bool isBitwiseBorrowable = layout.flags.isBitwiseBorrowable();
   for (unsigned i = 0; i != numElements; ++i) {
     auto &elt = elements[i];
 
@@ -2155,6 +2158,7 @@ static void performBasicLayout(TypeLayout &layout,
     alignMask = std::max(alignMask, eltLayout->flags.getAlignmentMask());
     if (!eltLayout->flags.isPOD()) isPOD = false;
     if (!eltLayout->flags.isBitwiseTakable()) isBitwiseTakable = false;
+    if (!eltLayout->flags.isBitwiseBorrowable()) isBitwiseBorrowable = false;
   }
   bool isInline =
       ValueWitnessTable::isValueInline(isBitwiseTakable, size, alignMask + 1);
@@ -2164,6 +2168,7 @@ static void performBasicLayout(TypeLayout &layout,
                      .withAlignmentMask(alignMask)
                      .withPOD(isPOD)
                      .withBitwiseTakable(isBitwiseTakable)
+                     .withBitwiseBorrowable(isBitwiseBorrowable)
                      .withInlineStorage(isInline);
   layout.extraInhabitantCount = 0;
   layout.stride = std::max(size_t(1), roundUpToAlignMask(size, alignMask));
@@ -2594,8 +2599,9 @@ static constexpr Out pointer_function_cast(In *function) {
   return pointer_function_cast_impl<Out>::perform(function);
 }
 
-static OpaqueValue *pod_indirect_initializeBufferWithCopyOfBuffer(
-                    ValueBuffer *dest, ValueBuffer *src, const Metadata *self) {
+SWIFT_RUNTIME_STDLIB_SPI
+OpaqueValue *_swift_pod_indirect_initializeBufferWithCopyOfBuffer(
+    ValueBuffer *dest, ValueBuffer *src, const Metadata *self) {
   auto wtable = self->getValueWitnesses();
   auto *srcReference = *reinterpret_cast<HeapObject**>(src);
   *reinterpret_cast<HeapObject**>(dest) = srcReference;
@@ -2609,19 +2615,21 @@ static OpaqueValue *pod_indirect_initializeBufferWithCopyOfBuffer(
   return reinterpret_cast<OpaqueValue *>(bytePtr + byteOffset);
 }
 
-static void pod_destroy(OpaqueValue *object, const Metadata *self) {}
+SWIFT_RUNTIME_STDLIB_SPI
+void _swift_pod_destroy(OpaqueValue *object, const Metadata *self) {}
 
-static OpaqueValue *pod_copy(OpaqueValue *dest, OpaqueValue *src,
+SWIFT_RUNTIME_STDLIB_SPI
+OpaqueValue *_swift_pod_copy(OpaqueValue *dest, OpaqueValue *src,
                              const Metadata *self) {
   memcpy(dest, src, self->getValueWitnesses()->size);
   return dest;
 }
 
-static OpaqueValue *pod_direct_initializeBufferWithCopyOfBuffer(
-                    ValueBuffer *dest, ValueBuffer *src, const Metadata *self) {
-  return pod_copy(reinterpret_cast<OpaqueValue*>(dest),
-                  reinterpret_cast<OpaqueValue*>(src),
-                  self);
+SWIFT_RUNTIME_STDLIB_SPI
+OpaqueValue *_swift_pod_direct_initializeBufferWithCopyOfBuffer(
+    ValueBuffer *dest, ValueBuffer *src, const Metadata *self) {
+  return _swift_pod_copy(reinterpret_cast<OpaqueValue *>(dest),
+                         reinterpret_cast<OpaqueValue *>(src), self);
 }
 
 static constexpr uint64_t sizeWithAlignmentMask(uint64_t size,
@@ -2646,16 +2654,16 @@ void swift::installCommonValueWitnesses(const TypeLayout &layout,
       // size and alignment.
       if (flags.isInlineStorage()) {
         vwtable->initializeBufferWithCopyOfBuffer =
-          pod_direct_initializeBufferWithCopyOfBuffer;
+            _swift_pod_direct_initializeBufferWithCopyOfBuffer;
       } else {
         vwtable->initializeBufferWithCopyOfBuffer =
-          pod_indirect_initializeBufferWithCopyOfBuffer;
+            _swift_pod_indirect_initializeBufferWithCopyOfBuffer;
       }
-      vwtable->destroy = pod_destroy;
-      vwtable->initializeWithCopy = pod_copy;
-      vwtable->initializeWithTake = pod_copy;
-      vwtable->assignWithCopy = pod_copy;
-      vwtable->assignWithTake = pod_copy;
+      vwtable->destroy = _swift_pod_destroy;
+      vwtable->initializeWithCopy = _swift_pod_copy;
+      vwtable->initializeWithTake = _swift_pod_copy;
+      vwtable->assignWithCopy = _swift_pod_copy;
+      vwtable->assignWithTake = _swift_pod_copy;
       // getEnumTagSinglePayload and storeEnumTagSinglePayload are not
       // interestingly optimizable based on POD-ness.
       return;
@@ -2694,7 +2702,7 @@ void swift::installCommonValueWitnesses(const TypeLayout &layout,
   
   if (flags.isBitwiseTakable()) {
     // Use POD value witnesses for operations that do an initializeWithTake.
-    vwtable->initializeWithTake = pod_copy;
+    vwtable->initializeWithTake = _swift_pod_copy;
     return;
   }
 
@@ -3045,8 +3053,63 @@ void swift::swift_initRawStructMetadata(StructMetadata *structType,
   vwtable->stride = stride;
   vwtable->flags = ValueWitnessFlags()
                     .withAlignmentMask(alignMask)
-                    .withCopyable(false);
+                    .withCopyable(false)
+                    .withBitwiseTakable(true)
+                    .withBitwiseBorrowable(false);
   vwtable->extraInhabitantCount = extraInhabitantCount;
+}
+
+/// Initialize the value witness table for a @_rawLayout struct.
+SWIFT_RUNTIME_EXPORT
+void swift::swift_initRawStructMetadata2(StructMetadata *structType,
+                                         StructLayoutFlags structLayoutFlags,
+                                         const TypeLayout *likeTypeLayout,
+                                         intptr_t count,
+                                         RawLayoutFlags rawLayoutFlags) {
+  auto vwtable = getMutableVWTableForInit(structType, structLayoutFlags);
+
+  // The existing vwt function entries are all fine to preserve, the only thing
+  // we need to initialize is the actual type layout.
+  auto size = likeTypeLayout->size;
+  auto stride = likeTypeLayout->stride;
+  auto alignMask = likeTypeLayout->flags.getAlignmentMask();
+  auto extraInhabitantCount = likeTypeLayout->extraInhabitantCount;
+
+  if (isRawLayoutArray(rawLayoutFlags)) {
+    // Our count value may be negative, so use 0 if that's the case.
+    stride *= std::max(count, (intptr_t)0);
+    size = stride;
+  }
+
+  vwtable->size = size;
+  vwtable->stride = stride;
+  vwtable->flags = ValueWitnessFlags()
+                    .withAlignmentMask(alignMask)
+                    .withCopyable(false)
+                    .withBitwiseTakable(true); // All raw layouts are assumed
+                                               // to be bitwise takable unless
+                                               // movesAsLike is present.
+  vwtable->extraInhabitantCount = extraInhabitantCount;
+
+  if (shouldRawLayoutMoveAsLike(rawLayoutFlags)) {
+    vwtable->flags = vwtable->flags
+                .withBitwiseTakable(likeTypeLayout->flags.isBitwiseTakable());
+  }
+  
+  vwtable->flags = vwtable->flags
+    .withBitwiseBorrowable(isRawLayoutBitwiseBorrowable(rawLayoutFlags));
+
+  // If the calculated size of this raw layout type is available to be put in
+  // value buffers, then set the inline storage bit if our like type is also
+  // able to be put into inline storage.
+  if (size <= NumWords_ValueBuffer) {
+    vwtable->flags = vwtable->flags
+                .withInlineStorage(likeTypeLayout->flags.isInlineStorage());
+  } else {
+    // Otherwise, we're too big to fit in inline storage regardless of the like
+    // type's ability to be put in inline storage.
+    vwtable->flags = vwtable->flags.withInlineStorage(false);
+  }
 }
 
 /***************************************************************************/
@@ -3191,6 +3254,13 @@ namespace {
     const uint8_t *WeakIvarLayout;
     const void *PropertyList;
   };
+
+  struct ObjCClass {
+    ObjCClass *Isa;
+    ObjCClass *Superclass;
+    void *CacheData[2];
+    uintptr_t RODataAndFlags;
+  };
 } // end anonymous namespace
 
 #if SWIFT_OBJC_INTEROP
@@ -3208,6 +3278,9 @@ static inline ClassROData *getROData(ClassMetadata *theClass) {
   return (ClassROData*)(theClass->Data & ~uintptr_t(SWIFT_CLASS_IS_SWIFT_MASK));
 }
 
+static inline ClassROData *getROData(ObjCClass *theClass) {
+  return (ClassROData*)(theClass->RODataAndFlags & ~uintptr_t(SWIFT_CLASS_IS_SWIFT_MASK));
+}
 // This gets called if we fail during copyGenericClassObjcName().  Its job is
 // to generate a unique name, even though the name won't be very helpful if
 // we end up looking at it in a debugger.
@@ -3245,7 +3318,7 @@ static char *copyGenericClassObjCName(ClassMetadata *theClass) {
   // name. The old and new Swift libraries must be able to coexist in
   // the same process, and this avoids warnings due to the ObjC names
   // colliding.
-  bool addSuffix = string.startswith("_TtGCs");
+  bool addSuffix = string.starts_with("_TtGCs");
 
   size_t allocationSize = string.size() + 1;
   if (addSuffix)
@@ -3498,9 +3571,14 @@ static void initClassFieldOffsetVector(ClassMetadata *self,
   //
   // The rodata may be in read-only memory if the compiler knows that the size
   // it generates is already definitely correct. Don't write to this value
-  // unless it's necessary.
-  if (rodata->InstanceStart != size)
+  // unless it's necessary. We'll grow the space for the superclass if needed,
+  // but not shrink it, as the compiler may write an unaligned size that's less
+  // than our aligned InstanceStart.
+  if (rodata->InstanceStart < size)
     rodata->InstanceStart = size;
+  else
+    size = rodata->InstanceStart;
+
 #endif
 
   // Okay, now do layout.
@@ -3638,10 +3716,10 @@ initGenericObjCClass(ClassMetadata *self, size_t numFields,
       if (numFields <= NumInlineGlobalIvarOffsets) {
         _globalIvarOffsets = _inlineGlobalIvarOffsets;
         // Make sure all the entries start out null.
-        memset(_globalIvarOffsets, 0, sizeof(size_t *) * numFields);
+        memset(_globalIvarOffsets, 0, numFields * sizeof(size_t *));
       } else {
         _globalIvarOffsets =
-            static_cast<size_t **>(calloc(sizeof(size_t *), numFields));
+            static_cast<size_t **>(calloc(numFields, sizeof(size_t *)));
       }
     }
     return _globalIvarOffsets;
@@ -3955,6 +4033,98 @@ swift::swift_updateClassMetadata2(ClassMetadata *self,
                                         /*allowDependency*/ true);
 }
 
+Class
+swift::swift_updatePureObjCClassMetadata(Class cls,
+                                         ClassLayoutFlags flags,
+                                         size_t numFields,
+                                         const TypeLayout * const *fieldTypes) {
+  bool hasRealizeClassFromSwift =
+    SWIFT_RUNTIME_WEAK_CHECK(_objc_realizeClassFromSwift);
+  assert(hasRealizeClassFromSwift);
+  (void)hasRealizeClassFromSwift;
+
+  SWIFT_DEFER {
+    // Realize the class. This causes the runtime to slide the field offsets
+    // stored in the field offset globals.
+    SWIFT_RUNTIME_WEAK_USE(_objc_realizeClassFromSwift(cls, cls));
+  };
+
+  // Update the field offset globals using runtime type information; the layout
+  // of resilient types might be different than the statically-emitted layout.
+  ObjCClass *self = (ObjCClass *)cls;
+  ClassROData *rodata = getROData(self);
+  ClassIvarList *ivars = rodata->IvarList;
+
+  if (!ivars) {
+    assert(numFields == 0);
+    return cls;
+  }
+
+  assert(ivars->Count == numFields);
+  assert(ivars->EntrySize == sizeof(ClassIvarEntry));
+
+  bool copiedIvarList = false;
+
+  // Start layout from our static notion of where the superclass starts.
+  // Objective-C expects us to have generated a correct ivar layout, which it
+  // will simply slide if it needs to.
+  assert(self->Superclass && "Swift cannot implement a root class");
+  size_t size = rodata->InstanceStart;
+  size_t alignMask = 0xF; // malloc alignment guarantee
+
+  // Okay, now do layout.
+  for (unsigned i = 0; i != numFields; ++i) {
+    ClassIvarEntry *ivar = &ivars->getIvars()[i];
+
+    size_t offset = 0;
+    if (ivar->Offset) {
+      offset = *ivar->Offset;
+    }
+
+    auto *eltLayout = fieldTypes[i];
+
+    // Skip empty fields.
+    if (offset != 0 || eltLayout->size != 0) {
+      offset = roundUpToAlignMask(size, eltLayout->flags.getAlignmentMask());
+      size = offset + eltLayout->size;
+      alignMask = std::max(alignMask, eltLayout->flags.getAlignmentMask());
+
+      // Fill in the field offset global, if this ivar has one.
+      if (ivar->Offset) {
+        if (*ivar->Offset != offset)
+          *ivar->Offset = offset;
+      }
+    }
+
+    // If the ivar's size doesn't match the field layout we
+    // computed, overwrite it and give it better type information.
+    if (ivar->Size != eltLayout->size) {
+      // If we're going to modify the ivar list, we need to copy it first.
+      if (!copiedIvarList) {
+        auto ivarListSize = sizeof(ClassIvarList) +
+                            numFields * sizeof(ClassIvarEntry);
+        ivars = (ClassIvarList*) getResilientMetadataAllocator()
+          .Allocate(ivarListSize, alignof(ClassIvarList));
+        memcpy(ivars, rodata->IvarList, ivarListSize);
+        rodata->IvarList = ivars;
+        copiedIvarList = true;
+
+        // Update ivar to point to the newly copied list.
+        ivar = &ivars->getIvars()[i];
+      }
+      ivar->Size = eltLayout->size;
+      ivar->Type = nullptr;
+      ivar->Log2Alignment =
+        getLog2AlignmentFromMask(eltLayout->flags.getAlignmentMask());
+    }
+  }
+
+  // Save the size into the Objective-C metadata.
+  if (rodata->InstanceSize != size)
+    rodata->InstanceSize = size;
+
+  return cls;
+}
 #endif
 
 #ifndef NDEBUG
@@ -4292,27 +4462,44 @@ public:
 
 class OpaqueExistentialValueWitnessTableCacheEntry {
 public:
+  struct Key {
+    unsigned numWitnessTables : 31;
+    unsigned copyable : 1;
+    
+    bool operator==(struct Key k) {
+      return k.numWitnessTables == numWitnessTables
+        && k.copyable == copyable;
+    }
+  };
+
   ValueWitnessTable Data;
 
-  OpaqueExistentialValueWitnessTableCacheEntry(unsigned numTables);
+  OpaqueExistentialValueWitnessTableCacheEntry(Key key);
 
   unsigned getNumWitnessTables() const {
     return (Data.size - sizeof(OpaqueExistentialContainer))
               / sizeof(const WitnessTable *);
+  }
+  
+  bool isCopyable() const {
+    return Data.flags.isCopyable();
   }
 
   intptr_t getKeyIntValueForDump() {
     return getNumWitnessTables();
   }
 
-  bool matchesKey(unsigned key) const { return key == getNumWitnessTables(); }
+  bool matchesKey(Key key) const {
+    return key == Key{getNumWitnessTables(), isCopyable()};
+  }
 
   friend llvm::hash_code
   hash_value(const OpaqueExistentialValueWitnessTableCacheEntry &value) {
-    return llvm::hash_value(value.getNumWitnessTables());
+    return llvm::hash_value(
+      std::make_pair(value.getNumWitnessTables(), value.isCopyable()));
   }
 
-  static size_t getExtraAllocationSize(unsigned numTables) {
+  static size_t getExtraAllocationSize(Key key) {
     return 0;
   }
   size_t getExtraAllocationSize() const {
@@ -4400,19 +4587,24 @@ OpaqueExistentialValueWitnessTables;
 /// Instantiate a value witness table for an opaque existential container with
 /// the given number of witness table pointers.
 static const ValueWitnessTable *
-getOpaqueExistentialValueWitnesses(unsigned numWitnessTables) {
+getOpaqueExistentialValueWitnesses(unsigned numWitnessTables,
+                                   bool copyable) {
   // We pre-allocate a couple of important cases.
-  if (numWitnessTables == 0)
-    return &OpaqueExistentialValueWitnesses_0;
-  if (numWitnessTables == 1)
-    return &OpaqueExistentialValueWitnesses_1;
+  if (copyable) {
+    if (numWitnessTables == 0)
+      return &OpaqueExistentialValueWitnesses_0;
+    if (numWitnessTables == 1)
+      return &OpaqueExistentialValueWitnesses_1;
+  }
 
-  return &OpaqueExistentialValueWitnessTables.getOrInsert(numWitnessTables)
-                                             .first->Data;
+  return &OpaqueExistentialValueWitnessTables
+    .getOrInsert(OpaqueExistentialValueWitnessTableCacheEntry::Key{
+                  numWitnessTables, copyable})
+    .first->Data;
 }
 
 OpaqueExistentialValueWitnessTableCacheEntry::
-OpaqueExistentialValueWitnessTableCacheEntry(unsigned numWitnessTables) {
+OpaqueExistentialValueWitnessTableCacheEntry(Key key) {
   using Box = NonFixedOpaqueExistentialBox;
   using Witnesses = NonFixedValueWitnesses<Box, /*known allocated*/ true>;
 
@@ -4422,16 +4614,24 @@ OpaqueExistentialValueWitnessTableCacheEntry(unsigned numWitnessTables) {
 #define DATA_VALUE_WITNESS(LOWER_ID, UPPER_ID, TYPE)
 #include "swift/ABI/ValueWitness.def"
 
-  Data.size = Box::Container::getSize(numWitnessTables);
+  Data.size = Box::Container::getSize(key.numWitnessTables);
   Data.flags = ValueWitnessFlags()
-    .withAlignment(Box::Container::getAlignment(numWitnessTables))
+    .withAlignment(Box::Container::getAlignment(key.numWitnessTables))
     .withPOD(false)
     .withBitwiseTakable(true)
-    .withInlineStorage(false);
+    .withInlineStorage(false)
+    .withCopyable(key.copyable)
+    // Non-bitwise-takable values are always stored out-of-line in existentials,
+    // so the existential representation itself is always bitwise-takable.
+    // Noncopyable values however can be bitwise-takable without being
+    // bitwise-borrowable, so noncopyable existentials are not bitwise-borrowable
+    // in the general case.
+    .withBitwiseBorrowable(key.copyable);
   Data.extraInhabitantCount = Witnesses::numExtraInhabitants;
-  Data.stride = Box::Container::getStride(numWitnessTables);
+  Data.stride = Box::Container::getStride(key.numWitnessTables);
 
-  assert(getNumWitnessTables() == numWitnessTables);
+  assert(getNumWitnessTables() == key.numWitnessTables);
+  assert(isCopyable() == key.copyable);
 }
 
 static const ValueWitnessTable ClassExistentialValueWitnesses_1 =
@@ -4500,7 +4700,8 @@ static const ValueWitnessTable *
 getExistentialValueWitnesses(ProtocolClassConstraint classConstraint,
                              const Metadata *superclassConstraint,
                              unsigned numWitnessTables,
-                             SpecialProtocol special) {
+                             SpecialProtocol special,
+                             bool copyable) {
   // Use special representation for special protocols.
   switch (special) {
   case SpecialProtocol::Error:
@@ -4523,7 +4724,7 @@ getExistentialValueWitnesses(ProtocolClassConstraint classConstraint,
                                              numWitnessTables);
   case ProtocolClassConstraint::Any:
     assert(superclassConstraint == nullptr);
-    return getOpaqueExistentialValueWitnesses(numWitnessTables);
+    return getOpaqueExistentialValueWitnesses(numWitnessTables, copyable);
   }
 
   swift_unreachable("Unhandled ProtocolClassConstraint in switch.");
@@ -4766,7 +4967,8 @@ ExistentialCacheEntry::ExistentialCacheEntry(Key key) {
   Data.ValueWitnesses = getExistentialValueWitnesses(key.ClassConstraint,
                                                      key.SuperclassConstraint,
                                                      numWitnessTables,
-                                                     special);
+                                                     special,
+                                                     /*copyable*/ true);
   Data.Flags = ExistentialTypeFlags()
     .withNumWitnessTables(numWitnessTables)
     .withClassConstraint(key.ClassConstraint)
@@ -5002,6 +5204,7 @@ public:
 const ValueWitnessTable *
 ExtendedExistentialTypeCacheEntry::getOrCreateVWT(Key key) {
   auto shape = key.Shape;
+  bool copyable = shape->isCopyable();
 
   if (auto witnesses = shape->getSuggestedValueWitnesses())
     return witnesses;
@@ -5040,7 +5243,8 @@ ExtendedExistentialTypeCacheEntry::getOrCreateVWT(Key key) {
     return getExistentialValueWitnesses(ProtocolClassConstraint::Any,
                                         /*superclass*/ nullptr,
                                         wtableStorageSizeInWords,
-                                        SpecialProtocol::None);
+                                        SpecialProtocol::None,
+                                        copyable);
 
   case SpecialKind::ExplicitLayout:
     swift_unreachable("shape with explicit layout but no suggested VWT");
@@ -5052,7 +5256,8 @@ ExtendedExistentialTypeCacheEntry::getOrCreateVWT(Key key) {
     return getExistentialValueWitnesses(ProtocolClassConstraint::Class,
                                         /*superclass*/ nullptr,
                                         wtableStorageSizeInWords,
-                                        SpecialProtocol::None);
+                                        SpecialProtocol::None,
+                                        /*copyable*/ true);
 
   case SpecialKind::Metatype:
     // Existential metatypes don't store type metadata.
@@ -5657,9 +5862,9 @@ static const unsigned swift_ptrauth_key_associated_type =
 
 /// Given an unsigned pointer to an associated-type protocol witness,
 /// fill in the appropriate slot in the witness table we're building.
-static void initAssociatedTypeProtocolWitness(const Metadata **slot,
-                                              const Metadata *witness,
-                                              const ProtocolRequirement &reqt) {
+static void initAssociatedConformanceWitness(const Metadata **slot,
+                                             const Metadata *witness,
+                                             const ProtocolRequirement &reqt) {
   assert(reqt.Flags.getKind() ==
            ProtocolRequirementFlags::Kind::AssociatedTypeAccessFunction);
   // FIXME: this should use ptrauth_key_process_independent_data
@@ -5700,7 +5905,9 @@ static void initProtocolWitness(void **slot, void *witness,
   case ProtocolRequirementFlags::Kind::Getter:
   case ProtocolRequirementFlags::Kind::Setter:
   case ProtocolRequirementFlags::Kind::ReadCoroutine:
+  case ProtocolRequirementFlags::Kind::Read2Coroutine:
   case ProtocolRequirementFlags::Kind::ModifyCoroutine:
+  case ProtocolRequirementFlags::Kind::Modify2Coroutine:
     swift_ptrauth_init_code_or_data(slot, witness,
                                     reqt.Flags.getExtraDiscriminator(),
                                     !reqt.Flags.isAsync());
@@ -5711,11 +5918,11 @@ static void initProtocolWitness(void **slot, void *witness,
     return;
 
   case ProtocolRequirementFlags::Kind::AssociatedTypeAccessFunction:
-    initAssociatedTypeProtocolWitness(reinterpret_cast<const Metadata **>(
+    initAssociatedConformanceWitness(reinterpret_cast<const Metadata **>(
                                         const_cast<const void**>(slot)),
-                                      reinterpret_cast<const Metadata *>(
+                                     reinterpret_cast<const Metadata *>(
                                         witness),
-                                      reqt);
+                                     reqt);
     return;
   }
   swift_unreachable("bad witness kind");
@@ -5741,7 +5948,9 @@ static void copyProtocolWitness(void **dest, void * const *src,
   case ProtocolRequirementFlags::Kind::Getter:
   case ProtocolRequirementFlags::Kind::Setter:
   case ProtocolRequirementFlags::Kind::ReadCoroutine:
+  case ProtocolRequirementFlags::Kind::Read2Coroutine:
   case ProtocolRequirementFlags::Kind::ModifyCoroutine:
+  case ProtocolRequirementFlags::Kind::Modify2Coroutine:
     swift_ptrauth_copy_code_or_data(
         dest, src, reqt.Flags.getExtraDiscriminator(), !reqt.Flags.isAsync(),
         /*allowNull*/ true); // NULL allowed for VFE (methods in the vtable
@@ -6089,7 +6298,7 @@ public:
        if (req.Flags.getKind() ==
            ProtocolRequirementFlags::Kind::BaseProtocol) {
          ++result;
-         // We currently assume that base protocol requirements preceed other
+         // We currently assume that base protocol requirements precede other
          // requirements i.e we store the base protocol pointers sequentially in
          // instantiateRelativeWitnessTable starting at index 1.
          assert(currIdx == result &&
@@ -6158,7 +6367,7 @@ using RelativeBaseWitness = RelativeDirectPointer<void, true /*nullable*/>;
 //
 // The layout of a dynamically allocated relative witness table is:
 //             [ conditional conformance n] ... private area
-//             [ conditional conformance 0]     (negatively adressed)
+//             [ conditional conformance 0]     (negatively addressed)
 // pointer ->  [ pointer to relative witness table (pattern) ]
 //             [ base protocol witness table pointer 0 ] ... base protocol
 //             [ base protocol witness table pointer n ]     pointers
@@ -7073,6 +7282,10 @@ static bool findAnyTransitiveMetadata(const Metadata *type, T &&predicate) {
         break;
       }
 
+      case GenericParamKind::Value: {
+        break;
+      }
+
       default:
         llvm_unreachable("Unsupported generic parameter kind");
       }
@@ -7411,6 +7624,10 @@ static swift::atomic<PoolRange>
 AllocationPool{PoolRange{InitialAllocationPool.Pool,
                          sizeof(InitialAllocationPool.Pool)}};
 
+std::tuple<const void *, size_t> MetadataAllocator::InitialPoolLocation() {
+  return {InitialAllocationPool.Pool, sizeof(InitialAllocationPool.Pool)};
+}
+
 bool swift::_swift_debug_metadataAllocationIterationEnabled = false;
 const void * const swift::_swift_debug_allocationPoolPointer = &AllocationPool;
 std::atomic<const void *> swift::_swift_debug_metadataAllocationBacktraceList;
@@ -7659,6 +7876,14 @@ void swift::verifyMangledNameRoundtrip(const Metadata *metadata) {
 
   Demangle::StackAllocatedDemangler<1024> Dem;
   auto node = _swift_buildDemanglingForMetadata(metadata, Dem);
+  if (!node) {
+    swift::warning(
+        RuntimeErrorFlagNone,
+        "Failed to build demangling to verify roundtrip for metadata %p\n",
+        metadata);
+    return;
+  }
+
   // If the mangled node involves types in an AnonymousContext, then by design,
   // it cannot be looked up by name.
   if (referencesAnonymousContext(node))
@@ -7700,7 +7925,7 @@ const HeapObject *swift_getKeyPathImpl(const void *pattern,
 
 #define OVERRIDE_KEYPATH COMPATIBILITY_OVERRIDE
 #define OVERRIDE_WITNESSTABLE COMPATIBILITY_OVERRIDE
-#include COMPATIBILITY_OVERRIDE_INCLUDE_PATH
+#include "../CompatibilityOverride/CompatibilityOverrideIncludePath.h"
 
 // Autolink with libc++, for cases where libswiftCore is linked statically.
 #if defined(__MACH__)

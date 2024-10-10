@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "sil-memory-lifetime-verifier"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/MemoryLocations.h"
 #include "swift/SIL/BitDataflow.h"
 #include "swift/SIL/CalleeCache.h"
@@ -228,6 +229,13 @@ bool MemoryLifetimeVerifier::isTrivialEnumSuccessor(SILBasicBlock *block,
   } else if (auto *switchEnumAddr = dyn_cast<SwitchEnumAddrInst>(term)) {
     elem = switchEnumAddr->getUniqueCaseForDestination(succ);
     enumTy = switchEnumAddr->getOperand()->getType();
+  } else if (auto *switchValue = dyn_cast<SwitchValueInst>(term)) {
+    auto destCase = switchValue->getUniqueCaseForDestination(succ);
+    assert(destCase.has_value());
+    auto caseValue =
+        cast<IntegerLiteralInst>(switchValue->getCase(*destCase).first);
+    auto testValue = dyn_cast<IntegerLiteralInst>(switchValue->getOperand());
+    return testValue ? testValue->getValue() != caseValue->getValue() : true;
   } else {
     return false;
   }
@@ -558,6 +566,7 @@ void MemoryLifetimeVerifier::setFuncOperandBits(BlockState &state, Operand &op,
                                         SILArgumentConvention convention,
                                         bool isTryApply) {
   switch (convention) {
+    case SILArgumentConvention::Indirect_In_CXX:
     case SILArgumentConvention::Indirect_In:
       killBits(state, op.get());
       break;
@@ -749,19 +758,23 @@ void MemoryLifetimeVerifier::checkBlock(SILBasicBlock *block, Bits &bits) {
         // an alloc_stack), which don't have any `op_deref` in its
         // di-expression, because that memory doesn't need to be initialized
         // when `debug_value` is referencing it.
-        if (cast<DebugValueInst>(&I)->hasAddrVal() &&
-            cast<DebugValueInst>(&I)->exprStartsWithDeref())
+        if (!DebugValueInst::hasAddrVal(&I))
           requireBitsSet(bits, I.getOperand(0), &I);
         break;
       case SILInstructionKind::UncheckedTakeEnumDataAddrInst: {
         // Note that despite the name, unchecked_take_enum_data_addr does _not_
         // "take" the payload of the Swift.Optional enum. This is a terrible
         // hack in SIL.
-        SILValue enumAddr = cast<UncheckedTakeEnumDataAddrInst>(&I)->getOperand();
-        int enumIdx = locations.getLocationIdx(enumAddr);
-        if (enumIdx >= 0)
-          requireBitsSet(bits, enumAddr, &I);
-        requireNoStoreBorrowLocation(enumAddr, &I);
+        auto enumInst = cast<UncheckedTakeEnumDataAddrInst>(&I);
+        // For some enums, projecting the enum data requires masking out
+        // embedded tag bits, which invalidates the value as an enum.
+        if (enumInst->isDestructive()) {
+          SILValue enumAddr = enumInst->getOperand();
+          int enumIdx = locations.getLocationIdx(enumAddr);
+          if (enumIdx >= 0)
+            requireBitsSet(bits, enumAddr, &I);
+          requireNoStoreBorrowLocation(enumAddr, &I);
+        }
         break;
       }
       case SILInstructionKind::DestroyAddrInst: {
@@ -777,7 +790,9 @@ void MemoryLifetimeVerifier::checkBlock(SILBasicBlock *block, Bits &bits) {
           requireBitsSet(bits, sbi->getDest(), &I);
           locations.clearBits(bits, sbi->getDest());
         } else if (auto *lbi = dyn_cast<LoadBorrowInst>(ebi->getOperand())) {
-          requireBitsSet(bits, lbi->getOperand(), &I);
+          if (!lbi->isUnchecked()) {
+            requireBitsSet(bits, lbi->getOperand(), &I);
+          }
         }
         break;
       }
@@ -838,10 +853,10 @@ void MemoryLifetimeVerifier::checkBlock(SILBasicBlock *block, Bits &bits) {
               fnType->getYields()[index].getConvention());
           if (argConv.isIndirectConvention()) {
             if (argConv.isInoutConvention() ||
-                argConv.isGuaranteedConvention()) {
+                argConv.isGuaranteedConventionInCaller()) {
               requireBitsSet(bits | ~nonTrivialLocations, yieldedValues[index],
                              &I);
-            } else if (argConv.isOwnedConvention()) {
+            } else if (argConv.isOwnedConventionInCaller()) {
               requireBitsClear(bits & nonTrivialLocations, yieldedValues[index],
                                &I);
             }
@@ -879,6 +894,7 @@ void MemoryLifetimeVerifier::checkFuncArgument(Bits &bits, Operand &argumentOp,
     requireNoStoreBorrowLocation(argumentOp.get(), applyInst);
   
   switch (argumentConvention) {
+    case SILArgumentConvention::Indirect_In_CXX:
     case SILArgumentConvention::Indirect_In:
       requireBitsSetForArgument(bits, &argumentOp);
       locations.clearBits(bits, argumentOp.get());

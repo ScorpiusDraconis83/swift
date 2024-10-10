@@ -17,6 +17,7 @@
 #ifndef JUMPDEST_H
 #define JUMPDEST_H
 
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/SILLocation.h"
 #include "llvm/Support/Compiler.h"
 #include "Cleanup.h"
@@ -46,17 +47,14 @@ class LLVM_LIBRARY_VISIBILITY JumpDest {
   SILBasicBlock *Block = nullptr;
   CleanupsDepth Depth = CleanupsDepth::invalid();
   CleanupLocation CleanupLoc;
-  llvm::Optional<ThrownErrorInfo> ThrownError;
+  std::optional<ThrownErrorInfo> ThrownError;
 
 public:
   JumpDest(CleanupLocation L) : CleanupLoc(L) {}
-  
-  JumpDest(SILBasicBlock *block,
-           CleanupsDepth depth,
-           CleanupLocation l,
-           llvm::Optional<ThrownErrorInfo> ThrownError = llvm::None)
-    : Block(block), Depth(depth), CleanupLoc(l),
-      ThrownError(ThrownError) {}
+
+  JumpDest(SILBasicBlock *block, CleanupsDepth depth, CleanupLocation l,
+           std::optional<ThrownErrorInfo> ThrownError = std::nullopt)
+      : Block(block), Depth(depth), CleanupLoc(l), ThrownError(ThrownError) {}
 
   SILBasicBlock *getBlock() const { return Block; }
   SILBasicBlock *takeBlock() {

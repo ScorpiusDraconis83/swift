@@ -60,7 +60,7 @@ set TMPDIR=%BuildRoot%\tmp
 set NINJA_STATUS=[%%f/%%t][%%p][%%es] 
 
 :: Build the -Test argument, if any, by subtracting skipped tests
-set TestArg=-Test swift,dispatch,foundation,xctest,
+set TestArg=-Test lld,swift,dispatch,foundation,xctest,
 for %%I in (%SKIP_TESTS%) do (call set TestArg=%%TestArg:%%I,=%%)
 if "%TestArg:~-1%"=="," (set TestArg=%TestArg:~0,-1%) else (set TestArg= )
 
@@ -77,7 +77,8 @@ powershell.exe -ExecutionPolicy RemoteSigned -File %~dp0build.ps1 ^
   -ImageRoot %BuildRoot% ^
   %SkipPackagingArg% ^
   %TestArg% ^
-  -Stage %PackageRoot% || (exit /b 1)
+  -Stage %PackageRoot% ^
+  -Summary || (exit /b 1)
 
 :: Clean up the module cache
 rd /s /q %LocalAppData%\clang\ModuleCache

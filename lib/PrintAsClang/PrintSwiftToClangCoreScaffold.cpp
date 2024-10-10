@@ -17,6 +17,7 @@
 #include "swift/ABI/MetadataValues.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/Type.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/IRGen/IRABIDetailsProvider.h"
 #include "swift/IRGen/Linking.h"
 #include "clang/Basic/AddressSpaces.h"
@@ -170,7 +171,7 @@ void printPrimitiveGenericTypeTraits(raw_ostream &os, ASTContext &astContext,
 
       astContext.getIntType(), astContext.getUIntType()};
 
-  auto primTypesArray = llvm::makeArrayRef(supportedPrimitiveTypes);
+  auto primTypesArray = llvm::ArrayRef(supportedPrimitiveTypes);
 
   // Ensure that `long` and `unsigned long` are treated as valid
   // generic Swift types (`Int` and `UInt`) on platforms
@@ -185,9 +186,26 @@ void printPrimitiveGenericTypeTraits(raw_ostream &os, ASTContext &astContext,
   if (!(isSwiftIntLong && !isInt64Long))
     primTypesArray = primTypesArray.drop_back(2);
 
+  // We do not have metadata for primitive types in Embedded Swift.
+  // As a result, the following features are not supported with primitive types in this mode:
+  // - Dynamic casts
+  // - Static self
+  // - Generic requirement parameters
+  // - Metadata source parameter
+  bool embedded = astContext.LangOpts.hasFeature(Feature::Embedded);
+
   for (Type type : primTypesArray) {
     auto typeInfo = *typeMapping.getKnownCxxTypeInfo(
         type->getNominalOrBoundGenericNominal());
+
+    if (!isCForwardDefinition) {
+      os << "template<>\n";
+      os << "inline const constexpr bool isUsableInGenericContext<"
+         << typeInfo.name << "> = true;\n\n";
+    }
+
+    if (embedded)
+      continue;
 
     auto typeMetadataFunc = irgen::LinkEntity::forTypeMetadata(
         type->getCanonicalType(), irgen::TypeMetadataAddress::AddressPoint);
@@ -199,10 +217,6 @@ void printPrimitiveGenericTypeTraits(raw_ostream &os, ASTContext &astContext,
          << ";\n";
       continue;
     }
-
-    os << "template<>\n";
-    os << "static inline const constexpr bool isUsableInGenericContext<"
-       << typeInfo.name << "> = true;\n\n";
 
     os << "template<>\nstruct TypeMetadataTrait<" << typeInfo.name << "> {\n"
        << "  static ";

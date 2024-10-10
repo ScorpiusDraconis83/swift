@@ -33,30 +33,31 @@ private func devirtualize(destroy: some DevirtualizableDestroy, _ context: some 
   if !type.isMoveOnly {
     return true
   }
-  precondition(type.isNominal, "non-copyable non-nominal types not supported, yet")
 
-  let result: Bool
-  if type.nominal.hasValueDeinit && !destroy.shouldDropDeinit {
-    guard let deinitFunc = context.lookupDeinit(ofNominal: type.nominal) else {
+  guard let nominal = type.nominal else {
+    // E.g. a non-copyable generic function parameter
+    return true
+  }
+
+  if nominal.valueTypeDestructor != nil && !destroy.shouldDropDeinit {
+    guard let deinitFunc = context.lookupDeinit(ofNominal: nominal) else {
       return false
     }
     destroy.createDeinitCall(to: deinitFunc, context)
-    result = true
-  } else {
-    // If there is no deinit to be called for the original type we have to recursively visit
-    // the struct fields or enum cases.
-    if type.isStruct {
-      result = destroy.devirtualizeStructFields(context)
-    } else if type.isEnum {
-      result = destroy.devirtualizeEnumPayloads(context)
-    } else {
-      precondition(type.isClass, "unknown non-copyable type")
-      // A class reference cannot be further de-composed.
-      return true
-    }
+    context.erase(instruction: destroy)
+    return true
   }
-  context.erase(instruction: destroy)
-  return result
+  // If there is no deinit to be called for the original type we have to recursively visit
+  // the struct fields or enum cases.
+  if type.isStruct {
+    return destroy.devirtualizeStructFields(context)
+  }
+  if type.isEnum {
+    return destroy.devirtualizeEnumPayloads(context)
+  }
+  precondition(type.isClass, "unknown non-copyable type")
+  // A class reference cannot be further de-composed.
+  return true
 }
 
 // Used to dispatch devirtualization tasks to `destroy_value` and `destroy_addr`.
@@ -75,6 +76,10 @@ private extension DevirtualizableDestroy {
     guard let cases = type.getEnumCases(in: parentFunction) else {
       return false
     }
+    defer {
+      context.erase(instruction: self)
+    }
+
     if cases.allPayloadsAreTrivial(in: parentFunction) {
       let builder = Builder(before: self, context)
       builder.createEndLifetime(of: operand.value)
@@ -107,7 +112,7 @@ extension DestroyValueInst : DevirtualizableDestroy {
     let builder = Builder(before: self, context)
     let subs = context.getContextSubstitutionMap(for: type)
     let deinitRef = builder.createFunctionRef(deinitializer)
-    if deinitializer.getArgumentConvention(for: deinitializer.selfArgumentIndex).isIndirect {
+    if deinitializer.argumentConventions[deinitializer.selfArgumentIndex].isIndirect {
       let allocStack = builder.createAllocStack(type)
       builder.createStore(source: destroyedValue, destination: allocStack, ownership: .initialize)
       builder.createApply(function: deinitRef, subs, arguments: [allocStack])
@@ -118,11 +123,15 @@ extension DestroyValueInst : DevirtualizableDestroy {
   }
 
   fileprivate func devirtualizeStructFields(_ context: some MutatingContext) -> Bool {
-    let builder = Builder(before: self, context)
-
     guard let fields = type.getNominalFields(in: parentFunction) else {
       return false
     }
+
+    defer {
+      context.erase(instruction: self)
+    }
+
+    let builder = Builder(before: self, context)
     if fields.allFieldsAreTrivial(in: parentFunction) {
       builder.createEndLifetime(of: operand.value)
       return true
@@ -175,7 +184,7 @@ extension DestroyAddrInst : DevirtualizableDestroy {
     let builder = Builder(before: self, context)
     let subs = context.getContextSubstitutionMap(for: destroyedAddress.type)
     let deinitRef = builder.createFunctionRef(deinitializer)
-    if !deinitializer.getArgumentConvention(for: deinitializer.selfArgumentIndex).isIndirect {
+    if !deinitializer.argumentConventions[deinitializer.selfArgumentIndex].isIndirect {
       let value = builder.createLoad(fromAddress: destroyedAddress, ownership: .take)
       builder.createApply(function: deinitRef, subs, arguments: [value])
     } else {
@@ -188,6 +197,9 @@ extension DestroyAddrInst : DevirtualizableDestroy {
 
     guard let fields = type.getNominalFields(in: parentFunction) else {
       return false
+    }
+    defer {
+      context.erase(instruction: self)
     }
     if fields.allFieldsAreTrivial(in: parentFunction) {
       builder.createEndLifetime(of: operand.value)

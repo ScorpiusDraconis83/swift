@@ -26,6 +26,7 @@
 #include "swift/AST/Module.h"
 #include "swift/AST/SILGenRequests.h"
 #include "swift/AST/TBDGenRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/IRGen/IRGenPublic.h"
@@ -89,8 +90,10 @@ void *swift::immediate::loadSwiftRuntime(ArrayRef<std::string>
                                          runtimeLibPaths) {
 #if defined(_WIN32)
   return loadRuntimeLib("swiftCore" LTDL_SHLIB_EXT, runtimeLibPaths);
-#else
+#elif (defined(__linux__) || defined(_WIN64) || defined(__FreeBSD__))
   return loadRuntimeLib("libswiftCore" LTDL_SHLIB_EXT, runtimeLibPaths);
+#else
+  return loadRuntimeLib("libswiftCore" LTDL_SHLIB_EXT, {"/usr/lib/swift"});
 #endif
 }
 

@@ -1,3 +1,5 @@
+// RUN: %target-swift-ide-test -print-module -module-to-print=MemberInline -I %S/Inputs -source-filename=x -cxx-interoperability-mode=swift-5.9 | %FileCheck %s
+// RUN: %target-swift-ide-test -print-module -module-to-print=MemberInline -I %S/Inputs -source-filename=x -cxx-interoperability-mode=swift-6 | %FileCheck %s
 // RUN: %target-swift-ide-test -print-module -module-to-print=MemberInline -I %S/Inputs -source-filename=x -cxx-interoperability-mode=upcoming-swift | %FileCheck %s
 
 // CHECK: struct LoadableIntWrapper {
@@ -209,6 +211,13 @@
 // CHECK:   mutating func __operatorSubscriptConst(_ x: Int32) -> NonTrivial
 // CHECK: }
 
+// CHECK: struct SubscriptUnnamedParameter {
+// CHECK:   subscript(__index: Int32) -> Int32 { get }
+// CHECK: }
+// CHECK: struct SubscriptUnnamedParameterReadWrite {
+// CHECK:   subscript(__index: Int32) -> Int32
+// CHECK: }
+
 // CHECK: struct Iterator {
 // CHECK:   var pointee: Int32 { mutating get set }
 // CHECK:   @available(*, unavailable, message: "use .pointee property")
@@ -280,4 +289,25 @@
 // CHECK-NEXT:   mutating func __operatorPlusEqual(_ rhs: LoadableIntWrapper)
 // CHECK-NEXT:   func getValue() -> Int32
 // CHECK-NEXT:   mutating func setValue(_ v: Int32)
+// CHECK-NEXT: }
+
+// CHECK: struct HasOperatorCallWithDefaultArg {
+// CHECK:   func callAsFunction(_ x: Int32 = cxxDefaultArg) -> Int32
+// CHECK: }
+
+// CHECK: struct HasStaticOperatorCallBase {
+// CHECK:   func callAsFunction(_ x: Int32) -> Int32
+// CHECK: }
+
+// CHECK: struct HasStaticOperatorCallDerived {
+// CHECK:   func callAsFunction(_ x: Int32) -> Int32
+// CHECK: }
+
+// CHECK: struct HasStaticOperatorCallWithConstOperator {
+// CHECK:   func callAsFunction(_ x: Int32, _ y: Int32) -> Int32
+// CHECK:   func callAsFunction(_ x: Int32) -> Int32
+// CHECK: }
+
+// CHECK: struct HasStaticOperatorCallWithUnimportableCxxType {
+// CHECK-NEXT:  init()
 // CHECK-NEXT: }

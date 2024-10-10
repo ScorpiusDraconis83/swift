@@ -65,6 +65,9 @@ internal struct _NativeSet<Element: Hashable> {
 #endif
 }
 
+@available(*, unavailable)
+extension _NativeSet: Sendable {}
+
 extension _NativeSet { // Primitive fields
   @usableFromInline
   internal typealias Bucket = _HashTable.Bucket
@@ -351,6 +354,7 @@ extension _NativeSet: _SetBuffer {
 // This function has a highly visible name to make it stand out in stack traces.
 @usableFromInline
 @inline(never)
+@_unavailableInEmbedded
 internal func ELEMENT_TYPE_OF_SET_VIOLATES_HASHABLE_REQUIREMENTS(
   _ elementType: Any.Type
 ) -> Never {
@@ -379,7 +383,11 @@ extension _NativeSet { // Insertions
       // because we'll need to compare elements in case of hash collisions.
       let (bucket, found) = find(element, hashValue: hashValue)
       guard !found else {
+        #if !$Embedded
         ELEMENT_TYPE_OF_SET_VIOLATES_HASHABLE_REQUIREMENTS(Element.self)
+        #else
+        fatalError("duplicate elements in a Set")
+        #endif
       }
       hashTable.insert(bucket)
       uncheckedInitialize(at: bucket, to: element)
@@ -418,7 +426,11 @@ extension _NativeSet { // Insertions
     if rehashed {
       let (b, f) = find(element)
       if f {
+        #if !$Embedded
         ELEMENT_TYPE_OF_SET_VIOLATES_HASHABLE_REQUIREMENTS(Element.self)
+        #else
+        fatalError("duplicate elements in a Set")
+        #endif
       }
       bucket = b
     }
@@ -437,7 +449,11 @@ extension _NativeSet { // Insertions
     if rehashed {
       let (b, f) = find(element)
       if f != found {
+        #if !$Embedded
         ELEMENT_TYPE_OF_SET_VIOLATES_HASHABLE_REQUIREMENTS(Element.self)
+        #else
+        fatalError("duplicate elements in a Set")
+        #endif
       }
       bucket = b
     }
@@ -577,6 +593,9 @@ extension _NativeSet: Sequence {
     return Iterator(self)
   }
 }
+
+@available(*, unavailable)
+extension _NativeSet.Iterator: Sendable {}
 
 extension _NativeSet.Iterator: IteratorProtocol {
   @inlinable

@@ -153,13 +153,13 @@ public:
   /// Get the error string from the error value. The value must be passed to
   /// `freeErrorString` when done. (Unless you're just calling a `fatalError`
   /// in which case there's no point.)
-  char *copyErrorString() {
+  char *copyErrorString() const {
     return reinterpret_cast<char *>(
         Fn(Context, Command::CopyErrorString, nullptr));
   }
 
   /// Free an error string previously obtained from `copyErrorString`.
-  void freeErrorString(char *str) {
+  void freeErrorString(char *str) const {
     Fn(Context, Command::DestroyErrorString, str);
   }
 };
@@ -172,8 +172,8 @@ template <typename T> class TypeLookupErrorOr {
 public:
   TypeLookupErrorOr() : Value(TypeLookupError("freshly constructed error")) {}
 
-  TypeLookupErrorOr(const T &t) : Value(t) {
-    if (!t)
+  TypeLookupErrorOr(const T &t, bool ignoreValueCheck = false) : Value(t) {
+    if (!t && !ignoreValueCheck)
       Value = TypeLookupError("unknown error");
   }
 

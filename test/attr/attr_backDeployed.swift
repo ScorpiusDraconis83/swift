@@ -367,7 +367,11 @@ public func incorrectPlatformCaseFunc() {}
 public func incorrectPlatformSimilarFunc() {}
 
 @backDeployed(before: macOS 12.0, unknownOS 1.0) // expected-warning {{unknown platform 'unknownOS' for attribute '@backDeployed'}}
-public func unknownOSFunc() {}
+public func unknownOSFunc1() {}
+
+@backDeployed(before: macOS 12.0)
+@backDeployed(before: unknownOS 1.0) // expected-warning {{unknown platform 'unknownOS' for attribute '@backDeployed'}}
+public func unknownOSFunc2() {}
 
 @backDeployed(before: @) // expected-error {{expected platform in '@backDeployed' attribute}}
 public func badPlatformFunc1() {}
@@ -383,6 +387,9 @@ public func missingVersionFunc2() {}
 
 @backDeployed(before: macOS, iOS) // expected-error 2{{expected version number in '@backDeployed' attribute}}
 public func missingVersionFunc3() {}
+
+@backDeployed(before: macOS 0) // expected-warning {{expected version number in '@backDeployed' attribute; this is an error in the Swift 6 language mode}}
+public func missingVersionFunc4() {}
 
 @backDeployed(before: macOS 12.0, iOS 15.0,) // expected-error {{unexpected ',' separator}}
 public func unexpectedSeparatorFunc() {}
@@ -411,7 +418,6 @@ public func missingMacroVersion() {}
 public func unknownMacroMissingVersion() {}
 
 @backDeployed(before: _unknownMacro 1.0) // expected-warning {{unknown platform '_unknownMacro' for attribute '@backDeployed'}}
-// expected-error@-1 {{expected at least one platform version in '@backDeployed' attribute}}
 public func unknownMacroVersioned() {}
 
 @backDeployed(before: _unknownMacro 1.0, _myProject 2.0) // expected-warning {{unknown platform '_unknownMacro' for attribute '@backDeployed'}}

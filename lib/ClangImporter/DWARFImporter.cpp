@@ -13,6 +13,7 @@
 #include "ImporterImpl.h"
 #include "swift/AST/ImportCache.h"
 #include "swift/AST/Module.h"
+#include "swift/Basic/Assertions.h"
 
 using namespace swift;
 
@@ -80,6 +81,10 @@ public:
   Identifier
   getDiscriminatorForPrivateDecl(const Decl *D) const override {
     llvm_unreachable("no private decls in Clang modules");
+  }
+
+  virtual version::Version getLanguageVersionBuiltWith() const override {
+    return version::Version();
   }
 
   virtual StringRef getFilename() const override { return ""; }
@@ -151,7 +156,7 @@ void ClangImporter::Implementation::lookupValueDWARF(
     return;
 
   SmallVector<clang::Decl *, 4> decls;
-  DWARFImporter->lookupValue(name.getBaseName().userFacingName(), llvm::None,
+  DWARFImporter->lookupValue(name.getBaseName().userFacingName(), std::nullopt,
                              inModule.str(), decls);
   for (auto *clangDecl : decls) {
     auto *namedDecl = dyn_cast<clang::NamedDecl>(clangDecl);

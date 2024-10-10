@@ -39,7 +39,8 @@ using llvm::BCVBR;
 
 /// Every .moddepcache file begins with these 4 bytes, for easy identification.
 const unsigned char MODULE_DEPENDENCY_CACHE_FORMAT_SIGNATURE[] = {'I', 'M', 'D','C'};
-const unsigned MODULE_DEPENDENCY_CACHE_FORMAT_VERSION_MAJOR = 5; // optionalModuleImports
+const unsigned MODULE_DEPENDENCY_CACHE_FORMAT_VERSION_MAJOR =
+    7; // isSystem
 /// Increment this on every change.
 const unsigned MODULE_DEPENDENCY_CACHE_FORMAT_VERSION_MINOR = 1;
 
@@ -52,6 +53,10 @@ using ContextHashIDField = IdentifierIDField;
 
 /// A bit that indicates whether or not a module is a framework
 using IsFrameworkField = BCFixed<1>;
+/// A bit that indicates whether or not a module is a system module
+using IsSystemField = BCFixed<1>;
+/// A bit that indicates whether or not a module is that of a static archive
+using IsStaticField = BCFixed<1>;
 
 /// Arrays of various identifiers, distinguished for readability
 using IdentifierIDArryField = llvm::BCArray<IdentifierIDField>;
@@ -137,14 +142,16 @@ using SwiftInterfaceModuleDetailsLayout =
                    FlagIDArrayIDField,                  // extraPCMArgs
                    ContextHashIDField,                  // contextHash
                    IsFrameworkField,                    // isFramework
+                   IsStaticField,                       // isStatic
                    FileIDField,                         // bridgingHeaderFile
                    FileIDArrayIDField,                  // sourceFiles
                    FileIDArrayIDField,                  // bridgingSourceFiles
-                   FileIDArrayIDField,                  // bridgingModuleDependencies
+                   IdentifierIDField,                   // bridgingModuleDependencies
                    DependencyIDArrayIDField,            // swiftOverlayDependencies
                    IdentifierIDField,                   // CASFileSystemRootID
                    IdentifierIDField,                   // bridgingHeaderIncludeTree
-                   IdentifierIDField                    // moduleCacheKey
+                   IdentifierIDField,                   // moduleCacheKey
+                   IdentifierIDField                    // UserModuleVersion
                    >;
 
 using SwiftSourceModuleDetailsLayout =
@@ -167,9 +174,13 @@ using SwiftBinaryModuleDetailsLayout =
                    FileIDField,                      // moduleDocPath
                    FileIDField,                      // moduleSourceInfoPath
                    DependencyIDArrayIDField,         // swiftOverlayDependencies
-                   ImportArrayIDField,               // headerImports
+                   FileIDField,                      // headerImport
+                   IdentifierIDField,                // headerModuleDependencies
+                   FileIDArrayIDField,               // headerSourceFiles
                    IsFrameworkField,                 // isFramework
-                   IdentifierIDField                 // moduleCacheKey
+                   IsStaticField,                    // isStatic
+                   IdentifierIDField,                // moduleCacheKey
+                   IdentifierIDField                 // UserModuleVersion
                    >;
 
 using SwiftPlaceholderModuleDetailsLayout =
@@ -182,6 +193,7 @@ using SwiftPlaceholderModuleDetailsLayout =
 using ClangModuleDetailsLayout =
     BCRecordLayout<CLANG_MODULE_DETAILS_NODE, // ID
                    FileIDField,               // pcmOutputPath
+                   FileIDField,               // mappedPCMPath
                    FileIDField,               // moduleMapPath
                    ContextHashIDField,        // contextHash
                    FlagIDArrayIDField,        // commandLine
@@ -189,7 +201,8 @@ using ClangModuleDetailsLayout =
                    FlagIDArrayIDField,        // capturedPCMArgs
                    IdentifierIDField,         // CASFileSystemRootID
                    IdentifierIDField,         // clangIncludeTreeRoot
-                   IdentifierIDField          // moduleCacheKey
+                   IdentifierIDField,         // moduleCacheKey
+                   IsSystemField              // isSystem
                    >;
 } // namespace graph_block
 

@@ -91,3 +91,90 @@ func testUnaryExprs() async throws {
 func testRepeatEach<each T>(_ t: repeat each T) -> (repeat each T) {
   return (repeat each t)
 }
+
+func acceptClosures(x: () -> Void) {}
+func acceptClosures(x: () -> Void, y: () -> Int) {}
+func acceptClosures(x: () -> Void, y: () -> Int, _ z: () -> Void) {}
+func testTrailingClsure() {
+  acceptClosures {}
+  acceptClosures() {}
+  acceptClosures(x: {}) { 42 }
+  acceptClosures(x: {}) { 12 } _: {}
+  acceptClosures {} y: { 42 }
+  acceptClosures(x: {}, y: { 12 }) {}
+}
+
+func testInOut() {
+  func acceptInOut(arg: inout Int) { arg += 1 }
+  var value = 42
+  acceptInOut(arg: &value)
+}
+
+func testStringLiteral(arg: Int) {
+  _ = "test"
+  _ = "foo\(arg)bar"
+  _ = "\(arg)"
+  _ = """
+    foo
+    bar\
+    baz
+    """
+  _ = """
+    foo\(arg)
+    \(arg)bar
+    """
+  _ = "\n\r\u{1234}"
+  _ = """
+    foo
+    \(
+      ("bar", """
+         \tbaz\u{0d}
+         """
+      )
+    )
+    baz
+    """
+}
+
+func testNumberLiteral() {
+  _ = 12
+  _ = 1_2
+  _ = 0xab
+  _ = 0xab_p2
+  _ = 12.42
+  _ = 0b0000_1100_1000
+  _ = 1_
+  _ = 1_000
+  _ = 0b1111_0000_
+  _ = 0b1111_0000
+  _  = 0o127_777_
+  _ = 0o127_777
+  _ = 0x12FF_FFFF
+  _ = 0x12FF_FFFF_
+  _ = 1.0e42
+  _ = 0x1.0p0
+  _ = 0x1.fffffep+2
+  _ = 1_000.200_001e1_000
+  _ =  0x1_0000.0FFF_ABCDp10_001
+}
+
+class BaseCls {
+  init(base: Int) {}
+}
+class DerivedCls: BaseCls {
+  init(testSuperRef arg: Int) { super.init(base: arg) }
+}
+
+struct HasSubscript {
+  subscript(label label: Int, args: Int) -> Int { return 1 }
+}
+func testSubscript(intArry: [Int], val: HasSubscript) {
+  _ = intArry[12]
+  _ = val[label: 42, 14]
+}
+
+struct Generic<T: Comparable> {}
+func testSpecializeExpr() {
+  _ = Generic<Int>.self
+  _ = Generic<Int>()
+}

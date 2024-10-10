@@ -6,10 +6,10 @@
 // RUN: %target-swift-frontend -swift-version 5 -enable-library-evolution -target %target-cpu-apple-ios14.4-macabi -typecheck -dump-type-refinement-contexts -target-min-inlining-version min %s > %t.dump 2>&1
 // RUN: %FileCheck --strict-whitespace %s < %t.dump
 
-// REQUIRES: maccatalyst_support
+// REQUIRES: OS=macosx || OS=maccatalyst
 
 // Verify that -target-min-inlining-version min implies 13.1 on macCatalyst.
 
-// CHECK: {{^}}(root versions=[13.1,+Inf)
-// CHECK-NEXT: {{^}}  (decl_implicit versions=[14.4,+Inf) decl=foo()
+// CHECK: {{^}}(root version=13.1
+// CHECK-NEXT: {{^}}  (decl_implicit version=14.4 decl=foo()
 func foo() {}

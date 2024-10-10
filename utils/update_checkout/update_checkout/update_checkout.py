@@ -148,7 +148,7 @@ def get_branch_for_repo(config, repo_name, scheme_name, scheme_map,
 
 def update_single_repository(pool_args):
     source_root, config, repo_name, scheme_name, scheme_map, tag, timestamp, \
-        reset_to_remote, should_clean, cross_repos_pr = pool_args
+        reset_to_remote, should_clean, should_stash, cross_repos_pr = pool_args
     repo_path = os.path.join(source_root, repo_name)
     if not os.path.isdir(repo_path) or os.path.islink(repo_path):
         return
@@ -170,18 +170,34 @@ def update_single_repository(pool_args):
                                                             repo_name,
                                                             checkout_target)
 
-            # The clean option restores a repository to pristine condition.
-            if should_clean:
-                shell.run(['git', 'clean', '-fdx'],
-                          echo=True, prefix=prefix)
-                shell.run(['git', 'submodule', 'foreach', '--recursive',
-                           'git', 'clean', '-fdx'],
-                          echo=True, prefix=prefix)
-                shell.run(['git', 'submodule', 'foreach', '--recursive',
-                           'git', 'reset', '--hard', 'HEAD'],
-                          echo=True, prefix=prefix)
-                shell.run(['git', 'reset', '--hard', 'HEAD'],
-                          echo=True, prefix=prefix)
+            # The '--clean' and '--stash' options
+            # 1. clear the index and working tree ('--stash' stashes those
+            #   changes rather than discarding them)
+            # 2. delete ignored files
+            # 3. abort an ongoing rebase
+            if should_clean or should_stash:
+
+                def run_for_repo_and_each_submodule_rec(cmd):
+                    shell.run(cmd, echo=True, prefix=prefix)
+                    shell.run(
+                        ["git", "submodule", "foreach", "--recursive"] + cmd,
+                        echo=True,
+                        prefix=prefix,
+                    )
+
+                if should_stash:
+                    # Stash tracked and untracked changes.
+                    run_for_repo_and_each_submodule_rec(["git", "stash", "-u"])
+                elif should_clean:
+                    # Delete tracked changes.
+                    run_for_repo_and_each_submodule_rec(
+                        ["git", "reset", "--hard", "HEAD"]
+                    )
+
+                # Delete untracked changes and ignored files.
+                run_for_repo_and_each_submodule_rec(["git", "clean", "-fdx"])
+                del run_for_repo_and_each_submodule_rec
+
                 # It is possible to reset --hard and still be mid-rebase.
                 try:
                     shell.run(['git', 'rebase', '--abort'],
@@ -343,6 +359,7 @@ def update_all_repositories(args, config, scheme_name, scheme_map, cross_repos_p
                    timestamp,
                    args.reset_to_remote,
                    args.clean,
+                   args.stash,
                    cross_repos_pr]
         pool_args.append(my_args)
 
@@ -527,7 +544,7 @@ def full_target_name(repository, target):
 
 def skip_list_for_platform(config, all_repos):
     """Computes a list of repositories to skip when updating or cloning, if not
-    overriden by `--all-repositories` CLI argument.
+    overridden by `--all-repositories` CLI argument.
 
     Args:
         config (Dict[str, Any]): deserialized `update-checkout-config.json`
@@ -604,9 +621,17 @@ repositories.
         help='Reset each branch to the remote state.',
         action='store_true')
     parser.add_argument(
-        '--clean',
-        help='Clean unrelated files from each repository.',
-        action='store_true')
+        "--clean",
+        help="""Delete tracked and untracked changes, ignored files, and abort
+        an ongoing rebase, if any, before updating a repository.""",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--stash",
+        help="""Stash tracked and untracked changes, delete ignored files, and
+        abort an ongoing rebase, if any, before updating a repository.""",
+        action="store_true",
+    )
     parser.add_argument(
         "--config",
         default=os.path.join(SCRIPT_DIR, os.pardir,
@@ -675,7 +700,10 @@ repositories.
 
     cross_repos_pr = {}
     if github_comment:
-        regex_pr = r'(apple/[-a-zA-Z0-9_]+/pull/\d+|apple/[-a-zA-Z0-9_]+#\d+)'
+        regex_pr = r'(apple/[-a-zA-Z0-9_]+/pull/\d+'\
+            r'|apple/[-a-zA-Z0-9_]+#\d+'\
+            r'|swiftlang/[-a-zA-Z0-9_]+/pull/\d+'\
+            r'|swiftlang/[-a-zA-Z0-9_]+#\d+)'
         repos_with_pr = re.findall(regex_pr, github_comment)
         print("Found related pull requests:", str(repos_with_pr))
         repos_with_pr = [pr.replace('/pull/', '#') for pr in repos_with_pr]

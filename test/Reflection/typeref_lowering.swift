@@ -1,12 +1,16 @@
 // REQUIRES: no_asan
+//
+// LC_DYLD_CHAINED_FIXUPS decode not currently supported (default on visionOS)
+// UNSUPPORTED: OS=xros
+//
 // XFAIL: OS=windows-msvc
 // RUN: %empty-directory(%t)
 
 // rdar://100558042
 // UNSUPPORTED: CPU=arm64e
 
-// RUN: %target-build-swift -Xfrontend -disable-availability-checking %S/Inputs/TypeLowering.swift -parse-as-library -emit-module -emit-library -module-name TypeLowering -o %t/%target-library-name(TypesToReflect)
-// RUN: %target-build-swift -Xfrontend -disable-availability-checking %S/Inputs/TypeLowering.swift %S/Inputs/main.swift -emit-module -emit-executable -module-name TypeLowering -o %t/TypesToReflect
+// RUN: %target-build-swift -target %target-swift-abi-5.2-triple -Xfrontend -disable-availability-checking %S/Inputs/TypeLowering.swift -parse-as-library -emit-module -emit-library -module-name TypeLowering -o %t/%target-library-name(TypesToReflect)
+// RUN: %target-build-swift -target %target-swift-abi-5.2-triple -Xfrontend -disable-availability-checking %S/Inputs/TypeLowering.swift %S/Inputs/main.swift -emit-module -emit-executable -module-name TypeLowering -o %t/TypesToReflect
 
 // RUN: %target-swift-reflection-dump %t/%target-library-name(TypesToReflect) %platform-module-dir/%target-library-name(swiftCore) -dump-type-lowering < %s | %FileCheck %s --check-prefix=CHECK-%target-ptrsize
 // RUN: %target-swift-reflection-dump %t/TypesToReflect %platform-module-dir/%target-library-name(swiftCore) -dump-type-lowering < %s | %FileCheck %s --check-prefix=CHECK-%target-ptrsize
@@ -1258,3 +1262,10 @@ BO
 // CHECK-32-NEXT:     (struct size=4 alignment=4 stride=4 num_extra_inhabitants=0 bitwise_takable=1
 // CHECK-32-NEXT:       (field name=_value offset=0
 // CHECK-32-NEXT:         (builtin size=4 alignment=4 stride=4 num_extra_inhabitants=0 bitwise_takable=1)))))
+
+BD
+// CHECK-64:      (builtin Builtin.DefaultActorStorage)
+// CHECK-64-NEXT:    (builtin size=96 alignment=16 stride=96 num_extra_inhabitants=0 bitwise_takable=1)
+
+// CHECK-32:      (builtin Builtin.DefaultActorStorage)
+// CHECK-32-NEXT:    (builtin size=48 alignment=8 stride=48 num_extra_inhabitants=0 bitwise_takable=1)

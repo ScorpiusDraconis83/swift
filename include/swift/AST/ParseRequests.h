@@ -33,7 +33,7 @@ void reportEvaluatedRequest(UnifiedStatsReporter &stats,
                             const Request &request);
 
 struct FingerprintAndMembers {
-  llvm::Optional<Fingerprint> fingerprint = llvm::None;
+  std::optional<Fingerprint> fingerprint = std::nullopt;
   ArrayRef<Decl *> members = {};
   bool operator==(const FingerprintAndMembers &x) const {
     return fingerprint == x.fingerprint && members == x.members;
@@ -81,14 +81,14 @@ private:
 public:
   // Caching
   bool isCached() const { return true; }
-  llvm::Optional<BodyAndFingerprint> getCachedResult() const;
+  std::optional<BodyAndFingerprint> getCachedResult() const;
   void cacheResult(BodyAndFingerprint value) const;
 };
 
 struct SourceFileParsingResult {
   ArrayRef<ASTNode> TopLevelItems;
-  llvm::Optional<ArrayRef<Token>> CollectedTokens;
-  llvm::Optional<StableHasher> InterfaceHasher;
+  std::optional<ArrayRef<Token>> CollectedTokens;
+  std::optional<StableHasher> InterfaceHasher;
 };
 
 /// Parse the top-level items of a SourceFile.
@@ -108,7 +108,7 @@ private:
 public:
   // Caching.
   bool isCached() const { return true; }
-  llvm::Optional<SourceFileParsingResult> getCachedResult() const;
+  std::optional<SourceFileParsingResult> getCachedResult() const;
   void cacheResult(SourceFileParsingResult result) const;
 
 public:
@@ -173,6 +173,23 @@ private:
 public:
   evaluator::DependencySource
   readDependencySource(const evaluator::DependencyRecorder &) const;
+};
+
+class EvaluateIfConditionRequest
+    : public SimpleRequest<EvaluateIfConditionRequest,
+          std::pair<bool, bool>(SourceFile *, SourceRange conditionRange,
+                                bool shouldEvaluate),
+                           RequestFlags::Uncached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  std::pair<bool, bool> evaluate(
+      Evaluator &evaluator, SourceFile *SF, SourceRange conditionRange,
+      bool shouldEvaluate) const;
 };
 
 /// The zone number for the parser.

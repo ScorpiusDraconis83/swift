@@ -16,6 +16,7 @@
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/RawComment.h"
 #include "swift/AST/USRGeneration.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/PrimitiveParsing.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Basic/Unicode.h"
@@ -212,7 +213,7 @@ void Symbol::serializeRange(size_t InitialIndentation,
 const ValueDecl *Symbol::getDeclInheritingDocs() const {
   // get the decl that would provide docs for this symbol
   const auto *DocCommentProvidingDecl =
-      dyn_cast_or_null<ValueDecl>(getDocCommentProvidingDecl(D));
+      dyn_cast_or_null<ValueDecl>(D->getDocCommentProvidingDecl());
 
   // if the decl is the same as the one for this symbol, we're not
   // inheriting docs, so return null. however, if this symbol is
@@ -358,7 +359,7 @@ void Symbol::serializeDocComment(llvm::json::OStream &OS) const {
   const auto *DocCommentProvidingDecl = D;
   if (!Graph->Walker.Options.SkipInheritedDocs) {
     DocCommentProvidingDecl =
-        dyn_cast_or_null<ValueDecl>(getDocCommentProvidingDecl(D));
+        dyn_cast_or_null<ValueDecl>(D->getDocCommentProvidingDecl());
     if (!DocCommentProvidingDecl) {
       DocCommentProvidingDecl = D;
     }
@@ -484,9 +485,8 @@ static SubstitutionMap getSubMapForDecl(const ValueDecl *D, Type BaseType) {
   else
     DC = D->getInnermostDeclContext()->getInnermostTypeContext();
 
-  swift::ModuleDecl *M = DC->getParentModule();
   if (isa<swift::NominalTypeDecl>(D) || isa<swift::ExtensionDecl>(D)) {
-    return BaseType->getContextSubstitutionMap(M, DC);
+    return BaseType->getContextSubstitutionMap(DC);
   }
 
   const swift::ValueDecl *SubTarget = D;
@@ -495,7 +495,7 @@ static SubstitutionMap getSubMapForDecl(const ValueDecl *D, Type BaseType) {
     if (auto *FD = dyn_cast<swift::AbstractFunctionDecl>(DC))
       SubTarget = FD;
   }
-  return BaseType->getMemberSubstitutionMap(M, SubTarget);
+  return BaseType->getMemberSubstitutionMap(SubTarget);
 }
 
 void Symbol::serializeSwiftGenericMixin(llvm::json::OStream &OS) const {
@@ -516,12 +516,18 @@ void Symbol::serializeSwiftGenericMixin(llvm::json::OStream &OS) const {
       filterGenericParams(Generics.getGenericParams(), FilteredParams,
                           SubMap);
 
-      const auto *Self = dyn_cast<NominalTypeDecl>(D);
+      const auto *Self = dyn_cast<ProtocolDecl>(D);
       if (!Self) {
-        Self = D->getDeclContext()->getSelfNominalTypeDecl();
+        Self = D->getDeclContext()->getSelfProtocolDecl();
       }
 
-      filterGenericRequirements(Generics.getRequirements(), Self,
+      SmallVector<Requirement, 2> Reqs;
+      SmallVector<InverseRequirement, 2> InverseReqs;
+      Generics->getRequirementsWithInverses(Reqs, InverseReqs);
+      // FIXME(noncopyable_generics): Do something with InverseReqs, or just use
+      // getRequirements() above and update the tests.
+
+      filterGenericRequirements(Reqs, Self,
                                 FilteredRequirements, SubMap, FilteredParams);
 
       if (FilteredParams.empty() && FilteredRequirements.empty()) {

@@ -27,8 +27,8 @@
 #include "swift/Demangling/NamespaceMacros.h"
 #include "swift/Demangling/TypeDecoder.h"
 #include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/StringRef.h"
+#include <optional>
 
 namespace swift {
  
@@ -83,6 +83,7 @@ public:
   using BuiltProtocolDecl = swift::ProtocolDecl *;
   using BuiltGenericSignature = swift::GenericSignature;
   using BuiltRequirement = swift::Requirement;
+  using BuiltInverseRequirement = swift::InverseRequirement;
   using BuiltSubstitutionMap = swift::SubstitutionMap;
 
   static constexpr bool needsToPrecomputeParentGenericContextShapes = false;
@@ -143,15 +144,17 @@ public:
 
   Type createFunctionType(
       ArrayRef<Demangle::FunctionParam<Type>> params,
-      Type output, FunctionTypeFlags flags,
+      Type output, FunctionTypeFlags flags, ExtendedFunctionTypeFlags extFlags,
       FunctionMetadataDifferentiabilityKind diffKind, Type globalActor,
       Type thrownError);
 
   Type createImplFunctionType(
       Demangle::ImplParameterConvention calleeConvention,
+      Demangle::ImplCoroutineKind coroutineKind,
       ArrayRef<Demangle::ImplFunctionParam<Type>> params,
+      ArrayRef<Demangle::ImplFunctionYield<Type>> yields,
       ArrayRef<Demangle::ImplFunctionResult<Type>> results,
-      llvm::Optional<Demangle::ImplFunctionResult<Type>> errorResult,
+      std::optional<Demangle::ImplFunctionResult<Type>> errorResult,
       ImplFunctionTypeFlags flags);
 
   Type createProtocolCompositionType(ArrayRef<ProtocolDecl *> protocols,
@@ -161,19 +164,21 @@ public:
 
   Type createProtocolTypeFromDecl(ProtocolDecl *protocol);
 
-  Type createConstrainedExistentialType(Type base,
-                                        ArrayRef<BuiltRequirement> constraints);
+  Type createConstrainedExistentialType(
+      Type base,
+      ArrayRef<BuiltRequirement> constraints,
+      ArrayRef<BuiltInverseRequirement> inverseRequirements);
 
   Type createSymbolicExtendedExistentialType(NodePointer shapeNode,
                                              ArrayRef<Type> genArgs);
 
   Type createExistentialMetatypeType(
       Type instance,
-      llvm::Optional<Demangle::ImplMetatypeRepresentation> repr = llvm::None);
+      std::optional<Demangle::ImplMetatypeRepresentation> repr = std::nullopt);
 
   Type createMetatypeType(
       Type instance,
-      llvm::Optional<Demangle::ImplMetatypeRepresentation> repr = llvm::None);
+      std::optional<Demangle::ImplMetatypeRepresentation> repr = std::nullopt);
 
   void pushGenericParams(ArrayRef<std::pair<unsigned, unsigned>> parameterPacks);
   void popGenericParams();
@@ -193,9 +198,11 @@ public:
   using BuiltSILBoxField = llvm::PointerIntPair<Type, 1>;
   using BuiltSubstitution = std::pair<Type, Type>;
   using BuiltLayoutConstraint = swift::LayoutConstraint;
-  Type createSILBoxTypeWithLayout(ArrayRef<BuiltSILBoxField> Fields,
-                                  ArrayRef<BuiltSubstitution> Substitutions,
-                                  ArrayRef<BuiltRequirement> Requirements);
+  Type createSILBoxTypeWithLayout(
+      ArrayRef<BuiltSILBoxField> Fields,
+      ArrayRef<BuiltSubstitution> Substitutions,
+      ArrayRef<BuiltRequirement> Requirements,
+      ArrayRef<BuiltInverseRequirement> inverseRequirements);
 
   bool isExistential(Type type) {
     return type->isExistentialType();
@@ -224,6 +231,10 @@ public:
 
   Type createParenType(Type base);
 
+  Type createIntegerType(intptr_t value);
+
+  Type createNegativeIntegerType(intptr_t value);
+
   BuiltGenericSignature
   createGenericSignature(ArrayRef<BuiltType> params,
                          ArrayRef<BuiltRequirement> requirements);
@@ -238,13 +249,22 @@ public:
                                                     unsigned size,
                                                     unsigned alignment);
 
+  InverseRequirement createInverseRequirement(
+      Type subject, InvertibleProtocolKind kind);
+
 private:
   bool validateParentType(TypeDecl *decl, Type parent);
   CanGenericSignature demangleGenericSignature(
       NominalTypeDecl *nominalDecl,
       NodePointer node);
   DeclContext *findDeclContext(NodePointer node);
-  ModuleDecl *findModule(NodePointer node);
+
+  /// Find all the ModuleDecls that correspond to a module node's identifier.
+  /// The module name encoded in the node is either the module's real or ABI
+  /// name. Multiple modules can share the same name. This function returns
+  /// all modules that contain that name.
+  llvm::ArrayRef<ModuleDecl *> findPotentialModules(NodePointer node);
+
   Demangle::NodePointer findModuleNode(NodePointer node);
 
   enum class ForeignModuleKind {
@@ -252,7 +272,7 @@ private:
     SynthesizedByImporter
   };
 
-  llvm::Optional<ForeignModuleKind> getForeignModuleKind(NodePointer node);
+  std::optional<ForeignModuleKind> getForeignModuleKind(NodePointer node);
 
   GenericTypeDecl *findTypeDecl(DeclContext *dc,
                                 Identifier name,

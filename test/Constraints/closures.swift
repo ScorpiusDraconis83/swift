@@ -96,9 +96,12 @@ do {
   }  
   inSubcall = false
 
-  // This is a problem, but isn't clear what was intended.
-  var somethingElse = true { // expected-error {{unexpected '{' in declaration}}
-  }  
+  // These are a problems, but it's not clear what was intended.
+  var somethingElse = true {
+  // expected-error@-1 {{computed property must have an explicit type}}
+  // expected-error@-2 {{variable with getter/setter cannot have an initial value}}
+  }
+  var somethingElseWithTypeAnno: Bool = true {} // expected-error {{variable with getter/setter cannot have an initial value}}
   inSubcall = false
 
   var v2 : Bool = false
@@ -353,7 +356,7 @@ var afterMessageCount : Int?
 func uintFunc() -> UInt {}
 func takeVoidVoidFn(_ a : () -> ()) {}
 takeVoidVoidFn { () -> Void in
-  afterMessageCount = uintFunc()  // expected-error {{cannot assign value of type 'UInt' to type 'Int?'}} {{23-23=Int(}} {{33-33=)}}
+  afterMessageCount = uintFunc()  // expected-error {{cannot assign value of type 'UInt' to type 'Int'}} {{23-23=Int(}} {{33-33=)}}
 }
 
 // <rdar://problem/19997471> Swift: Incorrect compile error when calling a function inside a closure
@@ -379,14 +382,14 @@ let _ = [0].map {
 func rdar21078316() {
   var foo : [String : String]?
   var bar : [(String, String)]?
-  bar = foo.map { ($0, $1) }  // expected-error {{contextual closure type '([String : String]) throws -> [(String, String)]' expects 1 argument, but 2 were used in closure body}}
+  bar = foo.map { ($0, $1) }  // expected-error {{contextual closure type '([String : String]) -> [(String, String)]' expects 1 argument, but 2 were used in closure body}}
   // expected-error@-1{{cannot convert value of type '(Dictionary<String, String>, _)' to closure result type '[(String, String)]'}}
 }
 
 
 // <rdar://problem/20978044> QoI: Poor diagnostic when using an incorrect tuple element in a closure
 var numbers = [1, 2, 3]
-zip(numbers, numbers).filter { $0.2 > 1 }  // expected-error {{value of tuple type '(Int, Int)' has no member '2'}}
+zip(numbers, numbers).filter { $0.2 > 1 }  // expected-error {{value of tuple type 'Zip2Sequence<[Int], [Int]>.Element' (aka '(Int, Int)') has no member '2'}}
 
 
 
@@ -1026,7 +1029,7 @@ func rdar_59741308() {
 func r60074136() {
   func takesClosure(_ closure: ((Int) -> Void) -> Void) {}
 
-  takesClosure { ((Int) -> Void) -> Void in // expected-error {{unnamed parameters must be written with the empty name '_'}}
+  takesClosure { ((Int) -> Void) -> Void in // expected-warning {{unnamed parameters must be written with the empty name '_'; this is an error in the Swift 6 language mode}}
   }
 }
 
@@ -1143,18 +1146,20 @@ struct R_76250381<Result, Failure: Error> {
 
 // https://github.com/apple/swift/issues/55926
 (0..<10).map { x, y in } 
-// expected-error@-1 {{contextual closure type '(Range<Int>.Element) throws -> ()' (aka '(Int) throws -> ()') expects 1 argument, but 2 were used in closure body}}
+// expected-error@-1 {{contextual closure type '(Range<Int>.Element) -> ()' (aka '(Int) -> ()') expects 1 argument, but 2 were used in closure body}}
 (0..<10).map { x, y, z in } 
-// expected-error@-1 {{contextual closure type '(Range<Int>.Element) throws -> ()' (aka '(Int) throws -> ()') expects 1 argument, but 3 were used in closure body}}
+// expected-error@-1 {{contextual closure type '(Range<Int>.Element) -> ()' (aka '(Int) -> ()') expects 1 argument, but 3 were used in closure body}}
 (0..<10).map { x, y, z, w in } 
-// expected-error@-1 {{contextual closure type '(Range<Int>.Element) throws -> ()' (aka '(Int) throws -> ()') expects 1 argument, but 4 were used in closure body}}
+// expected-error@-1 {{contextual closure type '(Range<Int>.Element) -> ()' (aka '(Int) -> ()') expects 1 argument, but 4 were used in closure body}}
 
 // rdar://77022842 - crash due to a missing argument to a ternary operator
 func rdar77022842(argA: Bool? = nil, argB: Bool? = nil) {
   if let a = argA ?? false, if let b = argB ?? {
     // expected-error@-1 {{initializer for conditional binding must have Optional type, not 'Bool'}}
-    // expected-error@-2 {{cannot convert value of type '() -> ()' to expected argument type 'Bool?'}}
+    // expected-error@-2 {{closure passed to parameter of type 'Bool?' that does not accept a closure}}
     // expected-error@-3 {{cannot convert value of type 'Void' to expected condition type 'Bool'}}
+    // expected-error@-4 {{'if' may only be used as expression in return, throw, or as the source of an assignment}}
+    // expected-error@-5 {{'if' must have an unconditional 'else' to be used as expression}}
   } // expected-error {{expected '{' after 'if' condition}}
 }
 
@@ -1171,6 +1176,7 @@ func rdar76058892() {
     test { // expected-error {{contextual closure type '() -> String' expects 0 arguments, but 1 was used in closure body}}
       if let arr = arr {
         arr.map($0.test) // expected-note {{anonymous closure parameter '$0' is used here}} // expected-error {{generic parameter 'T' could not be inferred}}
+        // expected-error@-1 {{generic parameter 'E' could not be inferred}}
       }
     }
   }
@@ -1247,3 +1253,17 @@ do {
 
 
 }
+
+do {
+  func test(_: Int, _: Int) {}
+  // expected-note@-1 {{closure passed to parameter of type 'Int' that does not accept a closure}}
+  func test(_: Int, _: String) {}
+  // expected-note@-1 {{closure passed to parameter of type 'String' that does not accept a closure}}
+
+  test(42) { // expected-error {{no exact matches in call to local function 'test'}}
+    print($0)
+  }
+}
+
+// Currently legal.
+let _: () -> Int = { return fatalError() }

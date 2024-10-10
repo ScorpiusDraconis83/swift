@@ -35,6 +35,7 @@
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/Type.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/STLExtras.h"
 #include "swift/Basic/Statistic.h"
@@ -220,10 +221,7 @@ bool TypeChecker::typeCheckForCodeCompletion(
   if (needsPrecheck) {
     // First, pre-check the expression, validating any types that occur in the
     // expression and folding sequence expressions.
-    auto failedPreCheck =
-        ConstraintSystem::preCheckTarget(target,
-                                         /*replaceInvalidRefsWithErrors=*/true);
-
+    auto failedPreCheck = ConstraintSystem::preCheckTarget(target);
     if (failedPreCheck)
       return false;
   }
@@ -298,14 +296,16 @@ bool TypeChecker::typeCheckForCodeCompletion(
   return true;
 }
 
-static llvm::Optional<Type>
+static std::optional<Type>
 getTypeOfCompletionContextExpr(DeclContext *DC, CompletionTypeCheckKind kind,
                                Expr *&parsedExpr,
                                ConcreteDeclRef &referencedDecl) {
-  if (constraints::ConstraintSystem::preCheckExpression(
-          parsedExpr, DC,
-          /*replaceInvalidRefsWithErrors=*/true))
-    return llvm::None;
+  auto target = SyntacticElementTarget(parsedExpr, DC, CTP_Unused, Type(),
+                                       /*isDiscarded*/ true);
+  if (constraints::ConstraintSystem::preCheckTarget(target))
+    return std::nullopt;
+
+  parsedExpr = target.getAsExpr();
 
   switch (kind) {
   case CompletionTypeCheckKind::Normal:
@@ -330,7 +330,7 @@ getTypeOfCompletionContextExpr(DeclContext *DC, CompletionTypeCheckKind kind,
       }
     }
 
-    return llvm::None;
+    return std::nullopt;
   }
 
   Type originalType = parsedExpr->getType();
@@ -348,12 +348,12 @@ getTypeOfCompletionContextExpr(DeclContext *DC, CompletionTypeCheckKind kind,
     return parsedExpr->getType();
   }
 
-  return llvm::None;
+  return std::nullopt;
 }
 
 /// Return the type of an expression parsed during code completion, or
 /// a null \c Type on error.
-llvm::Optional<Type> swift::getTypeOfCompletionContextExpr(
+std::optional<Type> swift::getTypeOfCompletionContextExpr(
     ASTContext &Ctx, DeclContext *DC, CompletionTypeCheckKind kind,
     Expr *&parsedExpr, ConcreteDeclRef &referencedDecl) {
   DiagnosticSuppression suppression(Ctx.Diags);
@@ -366,6 +366,6 @@ llvm::Optional<Type> swift::getTypeOfCompletionContextExpr(
 LookupResult
 swift::lookupSemanticMember(DeclContext *DC, Type ty, DeclName name) {
   return TypeChecker::lookupMember(DC, ty, DeclNameRef(name), SourceLoc(),
-                                   llvm::None);
+                                   std::nullopt);
 }
 

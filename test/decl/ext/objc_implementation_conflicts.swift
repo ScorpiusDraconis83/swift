@@ -1,5 +1,5 @@
-// RUN: %target-typecheck-verify-swift -import-objc-header %S/Inputs/objc_implementation.h
-// RUN: %target-typecheck-verify-swift -DPRIVATE_MODULE -Xcc -fmodule-map-file=%S/Inputs/objc_implementation_private.modulemap
+// RUN: %target-typecheck-verify-swift -import-objc-header %S/Inputs/objc_implementation.h -target %target-stable-abi-triple
+// RUN: %target-typecheck-verify-swift -DPRIVATE_MODULE -Xcc -fmodule-map-file=%S/Inputs/objc_implementation_private.modulemap -target %target-stable-abi-triple
 
 // REQUIRES: objc_interop
 
@@ -11,7 +11,7 @@
 import objc_implementation_private
 #endif
 
-@_objcImplementation extension ObjCClass {
+@objc @implementation extension ObjCClass {
   @objc func method(fromHeader1: CInt) {
     // OK, provides an implementation for the header's method.
   }
@@ -170,9 +170,16 @@ import objc_implementation_private
 
   func instanceMethod1(_: CInt) {}
   func instanceMethod2(_: CInt) {}
+
+  @objc func extensionMethod(fromHeader1: CInt) {}
+  @objc func extensionMethod(fromHeader2: CInt) {}
+
+  @objc(copyWithZone:) func copy(with zone: NSZone?) -> Any { self }
+
+  let rdar122280735: (@escaping () -> ()) -> Void = { _ in }
 }
 
-@_objcImplementation(PresentAdditions) extension ObjCClass {
+@objc(PresentAdditions) @implementation extension ObjCClass {
   @objc func categoryMethod(fromHeader3: CInt) {
     // OK
   }

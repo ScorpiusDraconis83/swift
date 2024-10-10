@@ -78,7 +78,7 @@ protocol P {
 }
 
 // CHECK-LABEL: sil hidden [ossa] @$s9copy_expr25testCopyAddressOnlyRValueyyxmAA1PRzlF : $@convention(thin) <T where T : P> (@thick T.Type) -> () {
-// CHECK:   [[BOX:%.*]] = alloc_stack [lexical] $T, let, name "x"
+// CHECK:   [[BOX:%.*]] = alloc_stack [lexical] [var_decl] $T, let, name "x"
 // CHECK:   [[TMP:%.*]] = alloc_stack $T
 // CHECK:   explicit_copy_addr [[BOX]] to [init] [[TMP]]
 // CHECK: } // end sil function '$s9copy_expr25testCopyAddressOnlyRValueyyxmAA1PRzlF'
@@ -316,7 +316,7 @@ func testCallMethodOnLoadableGlobal() {
 }
 
 // CHECK-LABEL: sil hidden [ossa] @$s9copy_expr34testCallMethodOnAddressOnlyLetCopyyyxmAA1PRzlF : $@convention(thin) <T where T : P> (@thick T.Type) -> () {
-// CHECK: [[X:%.*]] = alloc_stack [lexical] $T, let, name "x"
+// CHECK: [[X:%.*]] = alloc_stack [lexical] [var_decl] $T, let, name "x"
 //
 // Calling consumeFunc.
 // CHECK: [[TEMP:%.*]] = alloc_stack $T
@@ -333,10 +333,8 @@ func testCallMethodOnLoadableGlobal() {
 // Calling computedK. It is borrowed.
 // CHECK: [[TEMP:%.*]] = alloc_stack $T
 // CHECK: explicit_copy_addr [[X]] to [init] [[TEMP]]
-// CHECK: [[TEMP2:%.*]] = alloc_stack $T
-// CHECK: copy_addr [[TEMP]] to [init] [[TEMP2]]
 // CHECK: [[FUNC:%.*]] = witness_method $T, #P.computedK!getter : <Self where Self : P> (Self) -> () -> Klass : $@convention(witness_method: P) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> @owned Klass
-// CHECK: apply [[FUNC]]<(T)>([[TEMP2]])
+// CHECK: apply [[FUNC]]<(T)>([[TEMP]])
 //
 // Calling computed consuming getter.
 // CHECK: [[TEMP:%.*]] = alloc_stack $T
@@ -378,10 +376,8 @@ func testCallMethodOnAddressOnlyLetCopy<T : P>(_ t: T.Type) {
 // CHECK:   [[ACCESS:%.*]] = begin_access [read] [unknown] [[PROJECT]]
 // CHECK:   [[TEMP:%.*]] = alloc_stack $
 // CHECK:   explicit_copy_addr [[ACCESS]] to [init] [[TEMP]]
-// CHECK:   [[TEMP2:%.*]] = alloc_stack $
-// CHECK:   copy_addr [[TEMP]] to [init] [[TEMP2]]
 // CHECK:   [[FUNC:%.*]] = witness_method $T, #P.computedK!getter : <Self where Self : P> (Self) -> () -> Klass : $@convention(witness_method: P) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> @owned Klass
-// CHECK:   apply [[FUNC]]<(T)>([[TEMP2]])
+// CHECK:   apply [[FUNC]]<(T)>([[TEMP]])
 //
 // Consuming computed getter.
 // CHECK:   [[ACCESS:%.*]] = begin_access [read] [unknown] [[PROJECT]]
@@ -423,10 +419,8 @@ func testCallMethodOnAddressOnlyVarCopy<T : P>(_ t: T.Type) {
 // CHECK:   [[ACCESS:%.*]] = begin_access [read] [unknown] [[ARG]]
 // CHECK:   [[TEMP:%.*]] = alloc_stack $
 // CHECK:   explicit_copy_addr [[ACCESS]] to [init] [[TEMP]]
-// CHECK:   [[TEMP2:%.*]] = alloc_stack $
-// CHECK:   copy_addr [[TEMP]] to [init] [[TEMP2]]
 // CHECK:   [[FUNC:%.*]] = witness_method $T, #P.computedK!getter : <Self where Self : P> (Self) -> () -> Klass : $@convention(witness_method: P) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> @owned Klass
-// CHECK:   apply [[FUNC]]<(T)>([[TEMP2]])
+// CHECK:   apply [[FUNC]]<(T)>([[TEMP]])
 //
 // Consuming computed getter.
 // CHECK:   [[ACCESS:%.*]] = begin_access [read] [unknown] [[ARG]]

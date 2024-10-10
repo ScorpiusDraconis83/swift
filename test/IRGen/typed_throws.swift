@@ -1,28 +1,36 @@
-// RUN: %target-swift-frontend -primary-file %s -emit-ir -enable-experimental-feature TypedThrows -disable-availability-checking -runtime-compatibility-version none -target %module-target-future | %FileCheck %s --check-prefix=CHECK-MANGLE
+// RUN: %target-swift-frontend -primary-file %s -emit-ir -disable-availability-checking -runtime-compatibility-version none -target %module-target-future | %FileCheck %s --check-prefix=CHECK-MANGLE
 
-// RUN: %target-swift-frontend -primary-file %s -emit-ir -enable-experimental-feature TypedThrows -disable-availability-checking -runtime-compatibility-version 5.8 -disable-concrete-type-metadata-mangled-name-accessors | %FileCheck %s --check-prefix=CHECK-NOMANGLE
+// RUN: %target-swift-frontend -primary-file %s -emit-ir -disable-availability-checking -runtime-compatibility-version 5.8 -disable-concrete-type-metadata-mangled-name-accessors | %FileCheck %s --check-prefix=CHECK-NOMANGLE
 
-// RUN: %target-swift-frontend -primary-file %s -emit-ir -enable-experimental-feature TypedThrows  | %FileCheck %s --check-prefix=CHECK
+// RUN: %target-swift-frontend -primary-file %s -emit-ir  | %FileCheck %s --check-prefix=CHECK
 
 // XFAIL: CPU=arm64e
 // REQUIRES: PTRSIZE=64
 
-enum MyBigError: Error {
+public enum MyBigError: Error {
   case epicFail
 }
 
 
 // CHECK-MANGLE: @"$s12typed_throws1XVAA1PAAWP" = hidden global [2 x ptr] [ptr @"$s12typed_throws1XVAA1PAAMc", ptr getelementptr inbounds (i8, ptr @"symbolic ySi_____YKc 12typed_throws10MyBigErrorO", {{i32|i64}} 1)]
+@available(SwiftStdlib 6.0, *)
 struct X: P {
   typealias A = (Int) throws(MyBigError) -> Void
 }
 
 func requiresP<T: P>(_: T.Type) { }
+
+@available(SwiftStdlib 6.0, *)
 func createsP() {
   requiresP(X.self)
 }
 
+// This is for TypeH.method
+// CHECK-NOMANGLE: @"$s12typed_throws5TypeHV6methodySSSiAA10MyBigErrorOYKcvpMV" =
+
+
 // CHECK-LABEL: define {{.*}}hidden swiftcc ptr @"$s12typed_throws13buildMetatypeypXpyF"()
+@available(SwiftStdlib 6.0, *)
 func buildMetatype() -> Any.Type {
   typealias Fn = (Int) throws(MyBigError) -> Void
 
@@ -77,4 +85,9 @@ func callee() throws (S) {
 // This used to crash at compile time.
 func testit() throws (S) {
   try callee()
+}
+
+// Used to crash in abstract pattern creation.
+public struct TypeH {
+  public var method: (Int) throws(MyBigError) -> String
 }

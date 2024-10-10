@@ -28,6 +28,7 @@
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/Stmt.h"
 #include "swift/AST/TypeRepr.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/STLExtras.h"
 #include "llvm/Support/Compiler.h"
 #include <algorithm>
@@ -42,13 +43,8 @@ void ASTScopeImpl::dump() const { print(llvm::errs(), 0, false); }
 void ASTScopeImpl::dumpOneScopeMapLocation(
     std::pair<unsigned, unsigned> lineColumn) {
   auto bufferID = getSourceFile()->getBufferID();
-  if (!bufferID) {
-    llvm::errs() << "***No buffer, dumping all scopes***";
-    print(llvm::errs());
-    return;
-  }
   SourceLoc loc = getSourceManager().getLocForLineCol(
-      *bufferID, lineColumn.first, lineColumn.second);
+      bufferID, lineColumn.first, lineColumn.second);
   if (loc.isInvalid())
     return;
 

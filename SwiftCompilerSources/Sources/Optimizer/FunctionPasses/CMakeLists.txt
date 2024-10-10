@@ -10,13 +10,18 @@ swift_compiler_sources(Optimizer
   AllocVectorLowering.swift
   AssumeSingleThreaded.swift
   AsyncDemotion.swift
+  BooleanLiteralFolding.swift
   CleanupDebugSteps.swift
+  ClosureSpecialization.swift
   ComputeEscapeEffects.swift
   ComputeSideEffects.swift
   DeadStoreElimination.swift
   DeinitDevirtualizer.swift
   InitializeStaticGlobals.swift
   LetPropertyLowering.swift
+  LifetimeDependenceDiagnostics.swift
+  LifetimeDependenceInsertion.swift
+  LifetimeDependenceScopeFixup.swift
   ObjectOutliner.swift
   ObjCBridgingOptimization.swift
   MergeCondFails.swift

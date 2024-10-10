@@ -3,10 +3,10 @@
 // RUN: %host-build-swift -swift-version 5 -emit-library -o %t/%target-library-name(MacroDefinition) -module-name=MacroDefinition %S/Inputs/syntax_macro_definitions.swift -g -no-toolchain-stdlib-rpath -swift-version 5
 
 // Diagnostics testing
-// RUN: %target-typecheck-verify-swift -swift-version 5 -enable-experimental-feature BodyMacros -load-plugin-library %t/%target-library-name(MacroDefinition) -module-name MacroUser -DTEST_DIAGNOSTICS
+// RUN: %target-typecheck-verify-swift -swift-version 5 -enable-experimental-feature PreambleMacros -load-plugin-library %t/%target-library-name(MacroDefinition) -module-name MacroUser -DTEST_DIAGNOSTICS
 
 // Execution testing
-// RUN: %target-build-swift -swift-version 5 -g -enable-experimental-feature BodyMacros -load-plugin-library %t/%target-library-name(MacroDefinition) %s -o %t/main -module-name MacroUser
+// RUN: %target-build-swift -swift-version 5 -g -enable-experimental-feature PreambleMacros -load-plugin-library %t/%target-library-name(MacroDefinition) %s -o %t/main -module-name MacroUser
 // RUN: %target-codesign %t/main
 // RUN: %target-run %t/main | %FileCheck %s
 
@@ -78,7 +78,7 @@ func g(a: Int, b: String) async throws -> String {
   doesNotTypeCheck()
 }
 
-#if compiler(>=5.11) && TEST_DIAGNOSTICS
+#if compiler(>=6.0) && TEST_DIAGNOSTICS
 @available(SwiftStdlib 5.1, *)
 @Remote
 func h(a: Int, b: String) async throws -> String {

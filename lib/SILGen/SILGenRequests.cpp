@@ -15,6 +15,7 @@
 #include "swift/AST/Module.h"
 #include "swift/AST/FileUnit.h"
 #include "swift/AST/SourceFile.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/SILModule.h"
 #include "swift/Subsystems.h"
 
@@ -70,7 +71,7 @@ ArrayRef<FileUnit *> ASTLoweringDescriptor::getFilesToEmit() const {
 
   // For a single file, we can form an ArrayRef that points at its storage in
   // the union.
-  return llvm::makeArrayRef(*context.getAddrOfPtr1());
+  return llvm::ArrayRef(*context.getAddrOfPtr1());
 }
 
 SourceFile *ASTLoweringDescriptor::getSourceFileToParse() const {

@@ -260,13 +260,13 @@ private struct StackProtectionOptimization {
       
         for functionRefUse in fri.uses {
           guard let apply = functionRefUse.instruction as? ApplySite,
-                let callerArgIdx = apply.callerArgIndex(calleeArgIndex: arg.index) else {
+                let callerArgOp = apply.operand(forCalleeArgumentIndex: arg.index) else {
             if enableMoveInout {
               return NeedInsertMoves.yes
             }
             continue
           }
-          let callerArg = apply.arguments[callerArgIdx]
+          let callerArg = callerArgOp.value
           if callerArg.type.isAddress {
             // It's an indirect argument.
             switch callerArg.accessBase.isStackAllocated {
@@ -355,7 +355,7 @@ private struct StackProtectionOptimization {
   /// Moves the value of a `beginAccess` to a temporary stack location, if possible.
   private func moveToTemporary(scope beginAccess: BeginAccessInst, mustFixStackNesting: inout Bool,
                                _ context: FunctionPassContext) {
-    if beginAccess.accessKind != .Modify {
+    if beginAccess.accessKind != .modify {
       // We can only move from a `modify` access.
       // Also, read-only accesses shouldn't be subject to buffer overflows (because
       // no one should ever write to such a storage).
@@ -455,7 +455,7 @@ private extension AccessBase {
 
   var isStackAllocated: IsStackAllocatedResult {
     switch self {
-      case .stack:
+      case .stack, .storeBorrow:
         return .yes
       case .box, .global:
         return .no

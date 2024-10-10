@@ -588,8 +588,8 @@ func testInsideFunctionCall11(_ x: inout FooStruct) {
 // INSIDE_FUNCTION_CALL_11B: Decl[InstanceMethod]/CurrNominal/Flair[ArgLabels]: ['(']{#Int#}, {#b: &Double#}[')'][#Void#];
 }
 func testInsideFunctionCall12(_ x: inout FooStruct) {
-  x.instanceFunc2(#^INSIDE_FUNCTION_CALL_12?check=INSIDE_FUNCTION_CALL_4^#<#placeholder#>
-// INSIDE_FUNCTION_CALL_12-NOT: Decl[InstanceMethod]/{{.*}}:{{.*}}({{.*}}{#Int#}
+  x.instanceFunc2(#^INSIDE_FUNCTION_CALL_12^#<#placeholder#>
+// INSIDE_FUNCTION_CALL_12: Literal[Integer]/None/TypeRelation[Convertible]: 0[#Int#]; name=0
 }
 
 func testInsideVarargFunctionCall1() {
@@ -1523,8 +1523,8 @@ func testUnusableProtExt(_ x: PWithT) {
   x.#^PROTOCOL_EXT_UNUSABLE_EXISTENTIAL^#
 }
 // FIXME(https://github.com/apple/swift/issues/65696): We should not be showing these because (1) they cannot be accessed on the existential (2) we don't have the syntax and features to represent the projected type sigs anyway.
-// PROTOCOL_EXT_UNUSABLE_EXISTENTIAL: Decl[InstanceMethod]/CurrNominal:   foo({#(x): any PWithT.T#})[#any PWithT.T#]{{; name=.+}}
-// PROTOCOL_EXT_UNUSABLE_EXISTENTIAL: Decl[InstanceMethod]/CurrNominal:   bar({#(x): any PWithT.T#})[#any PWithT.T#]{{; name=.+}}
+// PROTOCOL_EXT_UNUSABLE_EXISTENTIAL: Decl[InstanceMethod]/CurrNominal:   foo({#(x): PWithT.T#})[#PWithT.T#]{{; name=.+}}
+// PROTOCOL_EXT_UNUSABLE_EXISTENTIAL: Decl[InstanceMethod]/CurrNominal:   bar({#(x): PWithT.T#})[#PWithT.T#]{{; name=.+}}
 
 protocol dedupP {
   associatedtype T
@@ -1559,10 +1559,10 @@ func testDeDuped(_ x: dedupS) {
 func testDeDuped2(_ x: dedupP) {
   x#^PROTOCOL_EXT_DEDUP_2^#
 // PROTOCOL_EXT_DEDUP_2: Begin completions, 5 items
-// PROTOCOL_EXT_DEDUP_2-DAG: Decl[InstanceMethod]/CurrNominal:   .foo()[#any dedupP.T#]; name=foo()
-// PROTOCOL_EXT_DEDUP_2-DAG: Decl[InstanceVar]/CurrNominal:      .bar[#any dedupP.T#]; name=bar
+// PROTOCOL_EXT_DEDUP_2-DAG: Decl[InstanceMethod]/CurrNominal:   .foo()[#dedupP.T#]; name=foo()
+// PROTOCOL_EXT_DEDUP_2-DAG: Decl[InstanceVar]/CurrNominal:      .bar[#dedupP.T#]; name=bar
 // FIXME(https://github.com/apple/swift/issues/65696): We should not be showing this because (1) it cannot be accessed on the existential (2) we don't have the syntax and features to represent the projected type sig anyway.
-// PROTOCOL_EXT_DEDUP_2-DAG: Decl[Subscript]/CurrNominal:        [{#(x): any dedupP.T#}][#any dedupP.T#]; name=[:]
+// PROTOCOL_EXT_DEDUP_2-DAG: Decl[Subscript]/CurrNominal:        [{#(x): dedupP.T#}][#dedupP.T#]; name=[:]
 // PROTOCOL_EXT_DEDUP_2-DAG: Keyword[self]/CurrNominal:          .self[#any dedupP#]; name=self
 }
 func testDeDuped3<T : dedupP where T.T == Int>(_ x: T) {
@@ -1616,7 +1616,7 @@ func testThrows006() {
 
 
 // rdar://21346928
-// Just sample some String API to sanity check.
+// Just sample some String API to soundness check.
 // AUTOCLOSURE_STRING: Decl[InstanceVar]/CurrNominal{{.*}}:      {{.*}}unicodeScalars[#String.UnicodeScalarView#]
 // AUTOCLOSURE_STRING: Decl[InstanceVar]/CurrNominal{{.*}}:      {{.*}}utf16[#String.UTF16View#]
 func testWithAutoClosure1(_ x: String?) {
@@ -1826,13 +1826,13 @@ protocol MetaProto {
   static func staticFunc() -> Int
   static var staticVar: Int { get }
   func instanceFunc() -> Int
-  var intanceVar: Int { get }
+  var instanceVar: Int { get }
 }
 extension MetaProto {
   static func staticFuncExtension() -> Int { 1 }
   static var staticVarExtension: Int { 1 }
   func instanceFuncExtension() -> Int { 1 }
-  var intanceVarExtension: Int { 1 }
+  var instanceVarExtension: Int { 1 }
 }
 func testProtocolMetatype(protoProto: MetaProto.Protocol, protoType: MetaProto.Type) {
     let _ = BrokenConformanceP.#^PROTOCOLMETA_1^#

@@ -14,9 +14,9 @@
 ///
 /// C++ standard library types such as `std::map` and `std::unordered_map`
 /// conform to this protocol.
-public protocol CxxDictionary<Key, Value> {
-  associatedtype Key
-  associatedtype Value
+public protocol CxxDictionary<Key, Value>: ExpressibleByDictionaryLiteral {
+  override associatedtype Key
+  override associatedtype Value
   associatedtype Element: CxxPair<Key, Value>
   associatedtype RawIterator: UnsafeCxxInputIterator
     where RawIterator.Pointee == Element
@@ -51,6 +51,28 @@ public protocol CxxDictionary<Key, Value> {
 }
 
 extension CxxDictionary {
+  /// Creates a C++ map containing the elements of a Swift Dictionary.
+  ///
+  /// This initializes the map by copying every key and value of the dictionary.
+  ///
+  /// - Complexity: O(*n*), where *n* is the number of entries in the Swift
+  ///   dictionary
+  @inlinable
+  public init(_ dictionary: Dictionary<Key, Value>) where Key: Hashable {
+    self.init()
+    for (key, value) in dictionary {
+      self[key] = value
+    }
+  }
+
+  @inlinable
+  public init(dictionaryLiteral elements: (Key, Value)...) {
+    self.init()
+    for (key, value) in elements {
+      self[key] = value
+    }
+  }
+
   @inlinable
   public subscript(key: Key) -> Value? {
     get {

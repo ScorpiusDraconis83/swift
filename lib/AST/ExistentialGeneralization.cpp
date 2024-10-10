@@ -20,6 +20,7 @@
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/Requirement.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "llvm/ADT/DenseMap.h"
 
 using namespace swift;
@@ -56,7 +57,8 @@ public:
     // Finish the signature.
     auto sig = buildGenericSignature(ctx, GenericSignature(),
                                      addedParameters,
-                                     addedRequirements);
+                                     addedRequirements,
+                                     /*allowInverses=*/false);
 
     // TODO: minimize the signature by removing redundant generic
     // parameters.
@@ -79,7 +81,6 @@ public:
 private:
   Type visitProtocolType(CanProtocolType type) {
     // Simple protocol types have no sub-structure.
-    assert(!type.getParent());
     return type;
   }
 
@@ -107,6 +108,7 @@ private:
       newMembers.push_back(generalizeStructure(origMember));
     }
     return ProtocolCompositionType::get(ctx, newMembers,
+                                        origType->getInverses(),
                                         origType->hasExplicitAnyObject());
   }
 
@@ -159,6 +161,7 @@ private:
   NO_PRESERVABLE_STRUCTURE(Pack)
   NO_PRESERVABLE_STRUCTURE(PackExpansion)
   NO_PRESERVABLE_STRUCTURE(PackElement)
+  NO_PRESERVABLE_STRUCTURE(Integer)
 #undef NO_PRESERVABLE_STRUCTURE
 
   // These types simply shouldn't appear in types that we generalize at all.
@@ -183,8 +186,7 @@ private:
   /// Generalize the generic arguments of the given generic type.s
   Type generalizeGenericArguments(NominalTypeDecl *decl, CanType type) {
     assert(decl->isGenericContext());
-    auto origSubs = type->getContextSubstitutionMap(decl->getModuleContext(),
-                                                    decl);
+    auto origSubs = type->getContextSubstitutionMap(decl);
 
     // Generalize all of the arguments.
     auto origArgs = origSubs.getReplacementTypes();
@@ -232,10 +234,10 @@ private:
   /// but generalizing its component types.
   Type generalizeComponentTypes(CanType type) {
     return type.transformRec(
-        [&](TypeBase *componentType) -> llvm::Optional<Type> {
+        [&](TypeBase *componentType) -> std::optional<Type> {
           // Ignore the top level.
           if (componentType == type.getPointer())
-            return llvm::None;
+            return std::nullopt;
 
           return generalizeComponentType(CanType(componentType));
         });
@@ -252,10 +254,9 @@ private:
 
     // Create a new generalization type parameter and record the
     // substitution.
-    auto newParam = GenericTypeParamType::get(/*sequence*/ false,
-                                              /*depth*/ 0,
-                                              /*index*/ substTypes.size(),
-                                              ctx);
+    auto newParam = GenericTypeParamType::getType(/*depth*/ 0,
+                                                  /*index*/ substTypes.size(),
+                                                  ctx);
     addedParameters.push_back(newParam);
 
     substTypes.insert({CanType(newParam), origArg});

@@ -1,5 +1,5 @@
 // RUN: %empty-directory(%t)
-// RUN: %target-swift-frontend -lto=llvm-full %s -enable-experimental-feature Embedded -emit-bc -o %t/a.o
+// RUN: %target-swift-frontend -enable-experimental-feature Extern -lto=llvm-full %s -enable-experimental-feature Embedded -emit-bc -o %t/a.o
 // RUN: %target-clang %t/a.o -o %t/a.out
 // RUN: %target-run %t/a.out | %FileCheck %s
 
@@ -12,18 +12,19 @@
 // loaded too late").
 // REQUIRES: no_asan
 
-@_silgen_name("putchar")
-func putchar(_: UInt8)
+@_extern(c, "putchar")
+@discardableResult
+func putchar(_: CInt) -> CInt
 
 public func print(_ s: StaticString, terminator: StaticString = "\n") {
   var p = s.utf8Start
   while p.pointee != 0 {
-    putchar(p.pointee)
+    putchar(CInt(p.pointee))
     p += 1
   }
   p = terminator.utf8Start
   while p.pointee != 0 {
-    putchar(p.pointee)
+    putchar(CInt(p.pointee))
     p += 1
   }
 }

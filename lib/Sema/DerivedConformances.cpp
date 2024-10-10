@@ -13,6 +13,7 @@
 #include "TypeChecker.h"
 #include "TypeCheckConcurrency.h"
 #include "swift/AST/ASTPrinter.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/Stmt.h"
 #include "swift/AST/Expr.h"
@@ -21,6 +22,7 @@
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "DerivedConformances.h"
 
@@ -28,20 +30,23 @@ using namespace swift;
 
 enum NonconformingMemberKind { AssociatedValue, StoredProperty };
 
-DerivedConformance::DerivedConformance(ASTContext &ctx, Decl *conformanceDecl,
-                                       NominalTypeDecl *nominal,
-                                       ProtocolDecl *protocol)
-    : Context(ctx), ConformanceDecl(conformanceDecl), Nominal(nominal),
-      Protocol(protocol) {
-  assert(getConformanceContext()->getSelfNominalTypeDecl() == nominal);
+DerivedConformance::DerivedConformance(
+    const NormalProtocolConformance *conformance, NominalTypeDecl *nominal,
+    ProtocolDecl *protocol)
+    : Context(nominal->getASTContext()), Conformance(conformance),
+      Nominal(nominal), Protocol(protocol) {
+  auto *DC = Conformance->getDeclContext();
+  ConformanceDecl = DC->getInnermostDeclarationDeclContext();
+  assert(ConformanceDecl);
+  assert(DC->getSelfNominalTypeDecl() == nominal);
 }
 
 DeclContext *DerivedConformance::getConformanceContext() const {
-  return cast<DeclContext>(ConformanceDecl);
+  return Conformance->getDeclContext();
 }
 
 ModuleDecl *DerivedConformance::getParentModule() const {
-  return cast<DeclContext>(ConformanceDecl)->getParentModule();
+  return getConformanceContext()->getParentModule();
 }
 
 void DerivedConformance::addMembersToConformanceContext(
@@ -184,8 +189,7 @@ DerivedConformance::storedPropertiesNotConformingToProtocol(
     if (!type)
       nonconformingProperties.push_back(propertyDecl);
 
-    if (!TypeChecker::conformsToProtocol(DC->mapTypeIntoContext(type), protocol,
-                                         DC->getParentModule())) {
+    if (!checkConformance(DC->mapTypeIntoContext(type), protocol)) {
       nonconformingProperties.push_back(propertyDecl);
     }
   }
@@ -279,7 +283,7 @@ void DerivedConformance::diagnoseIfSynthesisUnsupportedForDecl(
 ValueDecl *DerivedConformance::getDerivableRequirement(NominalTypeDecl *nominal,
                                                        ValueDecl *requirement) {
   // Note: whenever you update this function, also update
-  // TypeChecker::deriveProtocolRequirement.
+  // deriveProtocolRequirement.
   ASTContext &ctx = nominal->getASTContext();
   const auto name = requirement->getName();
 
@@ -290,7 +294,7 @@ ValueDecl *DerivedConformance::getDerivableRequirement(NominalTypeDecl *nominal,
     auto proto = ctx.getProtocol(kind);
     if (!proto) return nullptr;
 
-    auto conformance = nominal->getParentModule()->lookupConformance(
+    auto conformance = lookupConformance(
         nominal->getDeclaredInterfaceType(), proto);
     if (conformance) {
       auto DC = conformance.getConcrete()->getDeclContext();
@@ -462,8 +466,6 @@ CallExpr *
 DerivedConformance::createBuiltinCall(ASTContext &ctx,
                                       BuiltinValueKind builtin,
                                       ArrayRef<Type> typeArgs,
-                                      ArrayRef<ProtocolConformanceRef>
-                                        conformances,
                                       ArrayRef<Expr *> args) {
   auto name = ctx.getIdentifier(getBuiltinName(builtin));
   auto decl = getBuiltinValueDecl(ctx, name);
@@ -473,7 +475,8 @@ DerivedConformance::createBuiltinCall(ASTContext &ctx,
   auto fnType = decl->getInterfaceType();
   if (auto genericFnType = fnType->getAs<GenericFunctionType>()) {
     auto generics = genericFnType->getGenericSignature();
-    auto subs = SubstitutionMap::get(generics, typeArgs, conformances);
+    auto subs = SubstitutionMap::get(generics, typeArgs,
+                                     LookUpConformanceInModule{});
     declRef = ConcreteDeclRef(decl, subs);
     fnType = genericFnType->substGenericArgs(subs);
   } else {
@@ -495,7 +498,8 @@ DerivedConformance::createBuiltinCall(ASTContext &ctx,
 
 CallExpr *DerivedConformance::createDiagnoseUnavailableCodeReachedCallExpr(
     ASTContext &ctx) {
-  FuncDecl *diagnoseDecl = ctx.getDiagnoseUnavailableCodeReachedDecl();
+  FuncDecl *diagnoseDecl = ctx.getDiagnoseUnavailableCodeReached();
+  assert(diagnoseDecl);
   auto diagnoseDeclRefExpr =
       new (ctx) DeclRefExpr(diagnoseDecl, DeclNameLoc(), true);
   diagnoseDeclRefExpr->setType(diagnoseDecl->getInterfaceType());
@@ -506,11 +510,9 @@ CallExpr *DerivedConformance::createDiagnoseUnavailableCodeReachedCallExpr(
   return callExpr;
 }
 
-AccessorDecl *DerivedConformance::
-addGetterToReadOnlyDerivedProperty(VarDecl *property,
-                                   Type propertyContextType) {
-  auto getter =
-    declareDerivedPropertyGetter(property, propertyContextType);
+AccessorDecl *
+DerivedConformance::addGetterToReadOnlyDerivedProperty(VarDecl *property) {
+  auto getter = declareDerivedPropertyGetter(property);
 
   property->setImplInfo(StorageImplInfo::getImmutableComputed());
   property->setAccessors(SourceLoc(), {getter}, SourceLoc());
@@ -519,8 +521,7 @@ addGetterToReadOnlyDerivedProperty(VarDecl *property,
 }
 
 AccessorDecl *
-DerivedConformance::declareDerivedPropertyGetter(VarDecl *property,
-                                                 Type propertyContextType) {
+DerivedConformance::declareDerivedPropertyGetter(VarDecl *property) {
   auto &C = property->getASTContext();
   auto parentDC = property->getDeclContext();
   ParameterList *params = ParameterList::createEmpty(C);
@@ -554,7 +555,6 @@ std::pair<VarDecl *, PatternBindingDecl *>
 DerivedConformance::declareDerivedProperty(SynthesizedIntroducer intro,
                                            Identifier name,
                                            Type propertyInterfaceType,
-                                           Type propertyContextType,
                                            bool isStatic, bool isFinal) {
   auto parentDC = getConformanceContext();
 
@@ -565,11 +565,13 @@ DerivedConformance::declareDerivedProperty(SynthesizedIntroducer intro,
   propDecl->copyFormalAccessFrom(Nominal, /*sourceIsParentContext*/ true);
   propDecl->setInterfaceType(propertyInterfaceType);
 
+  auto propertyContextType =
+      getConformanceContext()->mapTypeIntoContext(propertyInterfaceType);
+
   Pattern *propPat =
       NamedPattern::createImplicit(Context, propDecl, propertyContextType);
 
   propPat = TypedPattern::createImplicit(Context, propPat, propertyContextType);
-  propPat->setType(propertyContextType);
 
   auto *pbDecl = PatternBindingDecl::createImplicit(
       Context, StaticSpellingKind::None, propPat, /*InitExpr*/ nullptr,
@@ -597,20 +599,18 @@ bool DerivedConformance::checkAndDiagnoseDisallowedContext(
                               getProtocolType());
     Nominal->diagnose(diag::kind_declared_here, DescriptiveDeclKind::Type);
 
-    // In editor mode, try to insert a stub.
-    if (Context.LangOpts.DiagnosticsEditorMode) {
-      auto Extension = cast<ExtensionDecl>(getConformanceContext());
-      auto FixitLocation = Extension->getBraces().Start;
-      llvm::SmallString<128> Text;
-      {
-        llvm::raw_svector_ostream SS(Text);
-        swift::printRequirementStub(synthesizing, Nominal,
-                                    Nominal->getDeclaredType(),
-                                    Extension->getStartLoc(), SS);
-        if (!Text.empty()) {
-          ConformanceDecl->diagnose(diag::missing_witnesses_general)
-            .fixItInsertAfter(FixitLocation, Text.str());
-        }
+    // Try to insert a stub.
+    auto Extension = cast<ExtensionDecl>(getConformanceContext());
+    auto FixitLocation = Extension->getBraces().Start;
+    llvm::SmallString<128> Text;
+    {
+      llvm::raw_svector_ostream SS(Text);
+      swift::printRequirementStub(synthesizing, Nominal,
+                                  Nominal->getDeclaredType(),
+                                  Extension->getStartLoc(), SS);
+      if (!Text.empty()) {
+        ConformanceDecl->diagnose(diag::missing_witnesses_general)
+          .fixItInsertAfter(FixitLocation, Text.str());
       }
     }
     return true;
@@ -654,8 +654,8 @@ GuardStmt *DerivedConformance::returnIfNotEqualGuard(ASTContext &C,
                                         Expr *guardReturnValue) {
   SmallVector<StmtConditionElement, 1> conditions;
   SmallVector<ASTNode, 1> statements;
-  
-  auto returnStmt = new (C) ReturnStmt(SourceLoc(), guardReturnValue);
+
+  auto *returnStmt = ReturnStmt::createImplicit(C, guardReturnValue);
   statements.push_back(returnStmt);
 
   // Next, generate the condition being checked.
@@ -699,7 +699,7 @@ GuardStmt *DerivedConformance::returnNilIfFalseGuardTypeChecked(ASTContext &C,
   SmallVector<StmtConditionElement, 1> conditions;
   SmallVector<ASTNode, 1> statements;
 
-  auto returnStmt = new (C) ReturnStmt(SourceLoc(), nilExpr);
+  auto *returnStmt = ReturnStmt::createImplicit(C, nilExpr);
   statements.push_back(returnStmt);
 
   // Next, generate the condition being checked.
@@ -766,7 +766,7 @@ DeclRefExpr *DerivedConformance::convertEnumToIndex(SmallVectorImpl<ASTNode> &st
   // generate: var indexVar
   Pattern *indexPat = NamedPattern::createImplicit(C, indexVar, intType);
   indexPat = TypedPattern::createImplicit(C, indexPat, intType);
-  indexPat->setType(intType);
+
   auto *indexBind = PatternBindingDecl::createImplicit(
       C, StaticSpellingKind::None, indexPat, /*InitExpr*/ nullptr, funcDecl);
 
@@ -781,12 +781,8 @@ DeclRefExpr *DerivedConformance::convertEnumToIndex(SmallVectorImpl<ASTNode> &st
     }
 
     // generate: case .<Case>:
-    auto pat = new (C)
-        EnumElementPattern(TypeExpr::createImplicit(enumType, C), SourceLoc(),
-                           DeclNameLoc(), DeclNameRef(), elt, nullptr,
-                           /*DC*/ funcDecl);
-    pat->setImplicit();
-    pat->setType(enumType);
+    auto *pat = EnumElementPattern::createImplicit(
+        enumType, elt, /*subPattern*/ nullptr, /*DC*/ funcDecl);
 
     auto labelItem = CaseLabelItem(pat);
 
@@ -804,7 +800,7 @@ DeclRefExpr *DerivedConformance::convertEnumToIndex(SmallVectorImpl<ASTNode> &st
                                   SourceLoc());
     cases.push_back(CaseStmt::create(C, CaseParentKind::Switch, SourceLoc(),
                                      labelItem, SourceLoc(), SourceLoc(), body,
-                                     /*case body vardecls*/ llvm::None));
+                                     /*case body vardecls*/ std::nullopt));
   }
 
   // generate: switch enumVar { }
@@ -838,9 +834,7 @@ DerivedConformance::associatedValuesNotConformingToProtocol(
 
     for (auto param : *PL) {
       auto type = param->getInterfaceType();
-      if (TypeChecker::conformsToProtocol(DC->mapTypeIntoContext(type),
-                                          protocol, DC->getParentModule())
-              .isInvalid()) {
+      if (checkConformance(DC->mapTypeIntoContext(type), protocol).isInvalid()) {
         nonconformingAssociatedValues.push_back(param);
       }
     }
@@ -877,8 +871,8 @@ Pattern *DerivedConformance::enumElementPayloadSubpattern(
   if (!enumElementDecl->hasAssociatedValues())
     return nullptr;
 
-  auto argumentType = enumElementDecl->getArgumentInterfaceType();
-  if (auto tupleType = argumentType->getAs<TupleType>()) {
+  auto payloadType = enumElementDecl->getPayloadInterfaceType();
+  if (auto tupleType = payloadType->getAs<TupleType>()) {
     // Either multiple (labeled or unlabeled) arguments, or one labeled
     // argument. Return a tuple pattern that matches the enum element in arity,
     // types, and labels. For example:
@@ -915,7 +909,7 @@ Pattern *DerivedConformance::enumElementPayloadSubpattern(
   // Otherwise, a one-argument unlabeled payload. Return a paren pattern whose
   // underlying type is the same as the payload. For example:
   // case a(Int) => (let a0)
-  auto underlyingType = argumentType->getWithoutParens();
+  auto underlyingType = payloadType->getWithoutParens();
   auto payloadVar = indexedVarDecl(varPrefix, 0, underlyingType, varContext);
   boundVars.push_back(payloadVar);
 
@@ -932,21 +926,20 @@ CaseStmt *DerivedConformance::unavailableEnumElementCaseStmt(
   assert(subPatternCount > 0);
 
   ASTContext &C = parentDC->getASTContext();
-  auto availableAttr = elt->getAttrs().getUnavailable(C);
-  if (!availableAttr)
+  if (!elt->isUnreachableAtRuntime() ||
+      elt->getParentEnum()->isUnreachableAtRuntime())
     return nullptr;
 
-  if (!availableAttr->isUnconditionallyUnavailable())
+  // If the stdlib isn't new enough to contain the helper function for
+  // diagnosing execution of unavailable code then just synthesize this case
+  // normally.
+  if (!C.getDiagnoseUnavailableCodeReached())
     return nullptr;
 
   auto createElementPattern = [&]() -> EnumElementPattern * {
     // .<elt>
-    EnumElementPattern *eltPattern = new (C) EnumElementPattern(
-        TypeExpr::createImplicit(enumType, C), SourceLoc(), DeclNameLoc(),
-        DeclNameRef(elt->getBaseIdentifier()), elt, nullptr, /*DC*/ parentDC);
-    eltPattern->setImplicit();
-    eltPattern->setType(enumType);
-    return eltPattern;
+    return EnumElementPattern::createImplicit(
+        enumType, elt, /*subPattern*/ nullptr, /*DC*/ parentDC);
   };
 
   Pattern *labelItemPattern;

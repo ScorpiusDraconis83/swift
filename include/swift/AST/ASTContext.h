@@ -18,8 +18,8 @@
 #define SWIFT_AST_ASTCONTEXT_H
 
 #include "swift/AST/ASTAllocated.h"
+#include "swift/AST/Availability.h"
 #include "swift/AST/Evaluator.h"
-#include "swift/AST/GenericSignature.h"
 #include "swift/AST/Identifier.h"
 #include "swift/AST/Import.h"
 #include "swift/AST/SILOptions.h"
@@ -27,12 +27,14 @@
 #include "swift/AST/Type.h"
 #include "swift/AST/TypeAlignments.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/CASOptions.h"
 #include "swift/Basic/LangOptions.h"
 #include "swift/Basic/Located.h"
 #include "swift/Basic/Malloc.h"
 #include "swift/Basic/BlockList.h"
 #include "swift/SymbolGraphGen/SymbolGraphOptions.h"
 #include "clang/AST/DeclTemplate.h"
+#include "clang/Basic/DarwinSDKInfo.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
@@ -45,6 +47,7 @@
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/DataTypes.h"
+#include "llvm/Support/VersionTuple.h"
 #include "llvm/Support/VirtualOutputBackend.h"
 #include <functional>
 #include <memory>
@@ -66,7 +69,8 @@ namespace swift {
   class AbstractFunctionDecl;
   class ASTContext;
   enum class Associativity : unsigned char;
-  class AvailabilityContext;
+  class AvailabilityMacroMap;
+  class AvailabilityRange;
   class BoundGenericType;
   class BuiltinTupleDecl;
   class ClangModuleLoader;
@@ -81,11 +85,10 @@ namespace swift {
   class DifferentiableAttr;
   class ExtensionDecl;
   struct ExternalSourceLocs;
-  class LoadedExecutablePlugin;
-  class LoadedLibraryPlugin;
   class ForeignRepresentationInfo;
   class FuncDecl;
   class GenericContext;
+  class GenericSignature;
   class InFlightDiagnostic;
   class IterableDeclContext;
   class LazyContextData;
@@ -123,6 +126,7 @@ namespace swift {
   class Pattern;
   enum PointerTypeKind : unsigned;
   class PrecedenceGroupDecl;
+  struct RequirementMatch;
   class TupleTypeElt;
   class EnumElementDecl;
   class ProtocolDecl;
@@ -169,7 +173,7 @@ enum class KnownFoundationEntity {
 
 /// Retrieve the Foundation entity kind for the given Objective-C
 /// entity name.
-llvm::Optional<KnownFoundationEntity> getKnownFoundationEntity(StringRef name);
+std::optional<KnownFoundationEntity> getKnownFoundationEntity(StringRef name);
 
 /// Retrieve the Swift name for the given Foundation entity, where
 /// "NS" prefix stripping will apply under omit-needless-words.
@@ -217,6 +221,30 @@ public:
   virtual ~MissingWitnessesBase();
 };
 
+/// Return value of ASTContext::getOpenedExistentialSignature().
+struct OpenedExistentialSignature {
+  /// The generalized existential type.
+  ///
+  /// The actual generic arguments of superclass and parameterized protocol
+  /// types become fresh generic parameters in the generalization signature.
+  CanType Shape;
+
+  /// A substitution map sending each generic parameter of the generalization
+  /// signature to the corresponding generic argument in the original
+  /// existential type. May contain type variables.
+  SubstitutionMap Generalization;
+
+  /// The opened existential signature derived from the generalization signature.
+  ///
+  /// This is the generalization signature with one more generic parameter
+  /// `Self` at the next highest depth, subject to the requirement
+  /// `Self: Shape`, where `Shape` is above.
+  CanGenericSignature OpenedSig;
+
+  /// The `Self` parameter in the opened existential signature.
+  CanType SelfType;
+};
+
 /// ASTContext - This object creates and owns the AST objects.
 /// However, this class does more than just maintain context within an AST.
 /// It is the closest thing to thread-local or compile-local storage in this
@@ -237,10 +265,9 @@ class ASTContext final {
       LangOptions &langOpts, TypeCheckerOptions &typecheckOpts,
       SILOptions &silOpts, SearchPathOptions &SearchPathOpts,
       ClangImporterOptions &ClangImporterOpts,
-      symbolgraphgen::SymbolGraphOptions &SymbolGraphOpts,
+      symbolgraphgen::SymbolGraphOptions &SymbolGraphOpts, CASOptions &casOpts,
       SourceManager &SourceMgr, DiagnosticEngine &Diags,
-      llvm::IntrusiveRefCntPtr<llvm::vfs::OutputBackend> OutBackend = nullptr
-      );
+      llvm::IntrusiveRefCntPtr<llvm::vfs::OutputBackend> OutBackend = nullptr);
 
 public:
   // Members that should only be used by ASTContext.cpp.
@@ -255,10 +282,9 @@ public:
   get(LangOptions &langOpts, TypeCheckerOptions &typecheckOpts,
       SILOptions &silOpts, SearchPathOptions &SearchPathOpts,
       ClangImporterOptions &ClangImporterOpts,
-      symbolgraphgen::SymbolGraphOptions &SymbolGraphOpts,
+      symbolgraphgen::SymbolGraphOptions &SymbolGraphOpts, CASOptions &casOpts,
       SourceManager &SourceMgr, DiagnosticEngine &Diags,
-      llvm::IntrusiveRefCntPtr<llvm::vfs::OutputBackend> OutBackend = nullptr
-      );
+      llvm::IntrusiveRefCntPtr<llvm::vfs::OutputBackend> OutBackend = nullptr);
   ~ASTContext();
 
   /// Optional table of counters to report, nullptr when not collecting.
@@ -285,6 +311,9 @@ public:
   /// The symbol graph generation options used by this AST context.
   symbolgraphgen::SymbolGraphOptions &SymbolGraphOpts;
 
+  /// The CAS options used by this AST context.
+  const CASOptions &CASOpts;
+
   /// The source manager object.
   SourceManager &SourceMgr;
 
@@ -294,10 +323,19 @@ public:
   /// OutputBackend for writing outputs.
   llvm::IntrusiveRefCntPtr<llvm::vfs::OutputBackend> OutputBackend;
 
+  enum ModuleImportKind {
+    Module = 0,
+    Overlay,
+    BridgingHeader
+  };
+  using PreModuleImportCallbackPtr =
+      std::function<void(StringRef ModuleName, ModuleImportKind Kind)>;
   /// Set the callback function that is invoked before Swift module importing is
-  /// performed
-  void SetPreModuleImportCallback(
-      std::function<void(llvm::StringRef ModuleName, bool IsOverlay)> callback);
+  /// performed.
+  void SetPreModuleImportCallback(PreModuleImportCallbackPtr callback);
+
+  /// Call the PreModuleImportCallback. Used by ClangImporter.
+  void PreModuleImportHook(StringRef ModuleName, ModuleImportKind Kind) const;
 
   /// If the shared pointer is not a \c nullptr and the pointee is \c true,
   /// all operations working on this ASTContext should be aborted at the next
@@ -349,7 +387,7 @@ public:
   unsigned NumTypoCorrections = 0;
 
   /// Cached mapping from types to their associated tangent spaces.
-  llvm::DenseMap<Type, llvm::Optional<TangentSpace>> AutoDiffTangentSpaces;
+  llvm::DenseMap<Type, std::optional<TangentSpace>> AutoDiffTangentSpaces;
 
   /// A cache of derivative function types per configuration.
   llvm::DenseMap<SILAutoDiffDerivativeFunctionKey, CanSILFunctionType>
@@ -395,6 +433,18 @@ private:
   /// Cache of module names that fail the 'canImport' test in this context.
   mutable llvm::StringSet<> FailedModuleImportNames;
 
+  /// Versions of the modules found during versioned canImport checks. 
+  struct ImportedModuleVersionInfo {
+    llvm::VersionTuple Version;
+    llvm::VersionTuple UnderlyingVersion;
+  };
+
+  /// Cache of module names that passed the 'canImport' test. This cannot be
+  /// mutable since it needs to be queried for dependency discovery. Keep sorted
+  /// so caller of `forEachCanImportVersionCheck` can expect deterministic
+  /// ordering.
+  std::map<std::string, ImportedModuleVersionInfo> CanImportModuleVersions;
+
   /// Set if a `-module-alias` was passed. Used to store mapping between module aliases and
   /// their corresponding real names, and vice versa for a reverse lookup, which is needed to check
   /// if the module names appearing in source files are aliases or real names.
@@ -409,8 +459,7 @@ private:
   getAllocator(AllocationArena arena = AllocationArena::Permanent) const;
 
   /// An optional generic callback function invoked prior to importing a module.
-  mutable std::function<void(llvm::StringRef ModuleName, bool IsOverlay)>
-      PreModuleImportCallback;
+  mutable PreModuleImportCallbackPtr PreModuleImportCallback;
 
 public:
   /// Allocate - Allocate memory from the ASTContext bump pointer.
@@ -507,7 +556,7 @@ public:
   StringRef AllocateCopy(StringRef Str,
                     AllocationArena arena = AllocationArena::Permanent) const {
     ArrayRef<char> Result =
-        AllocateCopy(llvm::makeArrayRef(Str.data(), Str.size()), arena);
+        AllocateCopy(llvm::ArrayRef(Str.data(), Str.size()), arena);
     return StringRef(Result.data(), Result.size());
   }
 
@@ -645,6 +694,9 @@ public:
   /// Get AsyncIteratorProtocol.next().
   FuncDecl *getAsyncIteratorNext() const;
 
+  /// Get AsyncIteratorProtocol.next(actor).
+  FuncDecl *getAsyncIteratorNextIsolated() const;
+
   /// Check whether the standard library provides all the correct
   /// intrinsic support for Optional<T>.
   ///
@@ -707,70 +759,12 @@ public:
   // Retrieve the declaration of Swift._stdlib_isOSVersionAtLeast.
   FuncDecl *getIsOSVersionAtLeastDecl() const;
 
-  /// Retrieve the declaration of DistributedActorSystem.remoteCall(Void)(...).
-  ///
-  /// \param actorOrSystem distributed actor or actor system to get the
-  /// remoteCall function for. Since the method we're looking for is an ad-hoc
-  /// requirement, a specific type MUST be passed here as it is not possible
-  /// to obtain the decl from just the `DistributedActorSystem` protocol type.
-  /// \param isVoidReturn true if the call will be returning `Void`.
-  AbstractFunctionDecl *getRemoteCallOnDistributedActorSystem(
-      NominalTypeDecl *actorOrSystem,
-      bool isVoidReturn) const;
-
-  /// Retrieve the declaration of DistributedActorSystem.make().
-  ///
-  /// \param thunk the function from which we'll be invoking things on the obtained
-  /// actor system; This way we'll always get the right type, taking care of any
-  /// where clauses etc.
-  FuncDecl *getMakeInvocationEncoderOnDistributedActorSystem(
-      AbstractFunctionDecl *thunk) const;
-
-  /// Indicates whether move-only / noncopyable types are supported.
-  bool supportsMoveOnlyTypes() const;
+  // Retrieve the declaration of Swift._stdlib_isVariantOSVersionAtLeast.
+  FuncDecl *getIsVariantOSVersionAtLeastDecl() const;
 
   // Retrieve the declaration of
-  // DistributedInvocationEncoder.recordGenericSubstitution(_:).
-  //
-  // \param nominal optionally provide a 'NominalTypeDecl' from which the
-  // function decl shall be extracted. This is useful to avoid witness calls
-  // through the protocol which is looked up when nominal is null.
-  FuncDecl *getRecordGenericSubstitutionOnDistributedInvocationEncoder(
-      NominalTypeDecl *nominal) const;
-
-  // Retrieve the declaration of DistributedTargetInvocationEncoder.recordArgument(_:).
-  //
-  // \param nominal optionally provide a 'NominalTypeDecl' from which the
-  // function decl shall be extracted. This is useful to avoid witness calls
-  // through the protocol which is looked up when nominal is null.
-  AbstractFunctionDecl *getRecordArgumentOnDistributedInvocationEncoder(
-      NominalTypeDecl *nominal) const;
-
-  // Retrieve the declaration of DistributedTargetInvocationEncoder.recordReturnType(_:).
-  AbstractFunctionDecl *getRecordReturnTypeOnDistributedInvocationEncoder(
-      NominalTypeDecl *nominal) const;
-
-  // Retrieve the declaration of DistributedTargetInvocationEncoder.recordErrorType(_:).
-  AbstractFunctionDecl *getRecordErrorTypeOnDistributedInvocationEncoder(
-      NominalTypeDecl *nominal) const;
-
-  // Retrieve the declaration of
-  // DistributedTargetInvocationDecoder.getDecodeNextArgumentOnDistributedInvocationDecoder(_:).
-  AbstractFunctionDecl *getDecodeNextArgumentOnDistributedInvocationDecoder(
-      NominalTypeDecl *nominal) const;
-
-  // Retrieve the declaration of
-  // getOnReturnOnDistributedTargetInvocationResultHandler.onReturn(_:).
-  AbstractFunctionDecl *getOnReturnOnDistributedTargetInvocationResultHandler(
-      NominalTypeDecl *nominal) const;
-
-  // Retrieve the declaration of DistributedInvocationEncoder.doneRecording().
-  //
-  // \param nominal optionally provide a 'NominalTypeDecl' from which the
-  // function decl shall be extracted. This is useful to avoid witness calls
-  // through the protocol which is looked up when nominal is null.
-  FuncDecl *getDoneRecordingOnDistributedInvocationEncoder(
-      NominalTypeDecl *nominal) const;
+  // Swift._stdlib_isOSVersionAtLeastOrVariantVersionAtLeast.
+  FuncDecl *getIsOSVersionAtLeastOrVariantVersionAtLeast() const;
 
   /// Look for the declaration with the given name within the
   /// passed in module.
@@ -784,6 +778,13 @@ public:
 
   /// Retrieve a specific, known protocol.
   ProtocolDecl *getProtocol(KnownProtocolKind kind) const;
+
+  /// Synthesizes the given invertible protocol decl into the stdlib (preferred)
+  /// or, if the stdlib is not available, the Builtin module.
+  ///
+  /// Does *not* perform any name lookup to check whether, the module already
+  /// contains a decl with the same name, only does synthesis.
+  ProtocolDecl *synthesizeInvertibleProtocolDecl(InvertibleProtocolKind ip) const;
   
   /// Determine whether the given nominal type is one of the standard
   /// library or Cocoa framework types that is known to be bridged by another
@@ -822,7 +823,7 @@ public:
   /// SIL analog of \c ASTContext::getClangFunctionType .
   const clang::Type *
   getCanonicalClangFunctionType(ArrayRef<SILParameterInfo> params,
-                                llvm::Optional<SILResultInfo> result,
+                                std::optional<SILResultInfo> result,
                                 SILFunctionType::Representation trueRep);
 
   /// Instantiates "Impl.Converter" if needed, then translate Swift generic
@@ -868,159 +869,136 @@ public:
     addCleanup([&object]{ object.~T(); });
   }
 
-  /// Get the runtime availability of the class metadata update callback
-  /// mechanism for the target platform.
-  AvailabilityContext getObjCMetadataUpdateCallbackAvailability();
+  /// Get the availability of features introduced in the specified version
+  /// of the Swift compiler for the target platform.
+  AvailabilityRange getSwiftAvailability(unsigned major, unsigned minor) const;
 
-  /// Get the runtime availability of the objc_getClass() hook for the target
-  /// platform.
-  AvailabilityContext getObjCGetClassHookAvailability();
-  
-  /// Get the runtime availability of features introduced in the Swift 5.0
-  /// compiler for the target platform.
-  AvailabilityContext getSwift50Availability();
+  // For each feature defined in FeatureAvailability, define two functions;
+  // the latter, with the suffix RuntimeAvailabilty, is for use with
+  // AvailabilityRange::forRuntimeTarget(), and only looks at the Swift
+  // runtime version.
+#define FEATURE(N, V)                                                          \
+  inline AvailabilityRange get##N##Availability() const {                      \
+    return getSwiftAvailability V;                                             \
+  }                                                                            \
+  inline AvailabilityRange get##N##RuntimeAvailability() const {               \
+    return AvailabilityRange(VersionRange::allGTE(llvm::VersionTuple V));      \
+  }
 
-  /// Get the runtime availability of the opaque types language feature for the
-  /// target platform.
-  AvailabilityContext getOpaqueTypeAvailability();
-
-  /// Get the runtime availability of the objc_loadClassref() entry point for
-  /// the target platform.
-  AvailabilityContext getObjCClassStubsAvailability();
-
-  /// Get the runtime availability of features introduced in the Swift 5.1
-  /// compiler for the target platform.
-  AvailabilityContext getSwift51Availability();
-
-  /// Get the runtime availability of
-  /// swift_getTypeByMangledNameInContextInMetadataState.
-  AvailabilityContext getTypesInAbstractMetadataStateAvailability();
-
-  /// Get the runtime availability of support for prespecialized generic 
-  /// metadata.
-  AvailabilityContext getPrespecializedGenericMetadataAvailability();
-
-  /// Get the runtime availability of the swift_compareTypeContextDescriptors
-  /// for the target platform.
-  AvailabilityContext getCompareTypeContextDescriptorsAvailability();
-
-  /// Get the runtime availability of the
-  /// swift_compareProtocolConformanceDescriptors entry point for the target
-  /// platform.
-  AvailabilityContext getCompareProtocolConformanceDescriptorsAvailability();
-
-  /// Get the runtime availability of support for inter-module prespecialized
-  /// generic metadata.
-  AvailabilityContext getIntermodulePrespecializedGenericMetadataAvailability();
-
-  /// Get the runtime availability of support for concurrency.
-  AvailabilityContext getConcurrencyAvailability();
-
-  /// Get the runtime availability of task executors.
-  AvailabilityContext getTaskExecutorAvailability();
-
-  /// Get the runtime availability of the `DiscardingTaskGroup`,
-  /// and supporting runtime functions function
-  AvailabilityContext getConcurrencyDiscardingTaskGroupAvailability();
-
-  /// Get the back-deployed availability for concurrency.
-  AvailabilityContext getBackDeployedConcurrencyAvailability();
-
-  /// The the availability since when distributed actors are able to have custom
-  /// executors.
-  AvailabilityContext
-  getConcurrencyDistributedActorWithCustomExecutorAvailability();
-
-  /// Get the runtime availability of support for differentiation.
-  AvailabilityContext getDifferentiationAvailability();
-
-  /// Get the runtime availability of support for typed throws.
-  AvailabilityContext getTypedThrowsAvailability();
-
-  /// Get the runtime availability of getters and setters of multi payload enum
-  /// tag single payloads.
-  AvailabilityContext getMultiPayloadEnumTagSinglePayload();
-
-  /// Get the runtime availability of the Objective-C enabled
-  /// swift_isUniquelyReferenced functions.
-  AvailabilityContext getObjCIsUniquelyReferencedAvailability();
-
-  /// Get the runtime availability of metadata manipulation runtime functions
-  /// for extended existential types.
-  AvailabilityContext getParameterizedExistentialRuntimeAvailability();
-
-  /// Get the runtime availability of array buffers placed in constant data
-  /// sections.
-  AvailabilityContext getStaticReadOnlyArraysAvailability();
-
-  /// Get the runtime availability of runtime functions for
-  /// variadic generic types.
-  AvailabilityContext getVariadicGenericTypeAvailability();
-
-  /// Get the runtime availability of the conformsToProtocol runtime entrypoint
-  /// that takes a signed protocol descriptor pointer.
-  AvailabilityContext getSignedConformsToProtocolAvailability();
-
-  /// Get the runtime availability of runtime entrypoints that take signed type
-  /// descriptors.
-  AvailabilityContext getSignedDescriptorAvailability();
-
-  /// Get the runtime availability of the swift_initRawStructMetadata entrypoint
-  /// that fixes up the value witness table of @_rawLayout dependent types.
-  AvailabilityContext getInitRawStructMetadataAvailability();
-
-  /// Get the runtime availability of being able to use symbolic references to
-  /// objective c protocols.
-  AvailabilityContext getObjCSymbolicReferencesAvailability();
-
-  /// Get the runtime availability of features introduced in the Swift 5.2
-  /// compiler for the target platform.
-  AvailabilityContext getSwift52Availability();
-
-  /// Get the runtime availability of features introduced in the Swift 5.3
-  /// compiler for the target platform.
-  AvailabilityContext getSwift53Availability();
-
-  /// Get the runtime availability of features introduced in the Swift 5.4
-  /// compiler for the target platform.
-  AvailabilityContext getSwift54Availability();
-
-  /// Get the runtime availability of features introduced in the Swift 5.5
-  /// compiler for the target platform.
-  AvailabilityContext getSwift55Availability();
-
-  /// Get the runtime availability of features introduced in the Swift 5.6
-  /// compiler for the target platform.
-  AvailabilityContext getSwift56Availability();
-
-  /// Get the runtime availability of features introduced in the Swift 5.7
-  /// compiler for the target platform.
-  AvailabilityContext getSwift57Availability();
-
-  /// Get the runtime availability of features introduced in the Swift 5.8
-  /// compiler for the target platform.
-  AvailabilityContext getSwift58Availability();
-
-  /// Get the runtime availability of features introduced in the Swift 5.9
-  /// compiler for the target platform.
-  AvailabilityContext getSwift59Availability();
-
-  /// Get the runtime availability of features introduced in the Swift 5.9
-  /// compiler for the target platform.
-  AvailabilityContext getSwift511Availability();
-  
-  // Note: Update this function if you add a new getSwiftXYAvailability above.
-  /// Get the runtime availability for a particular version of Swift (5.0+).
-  AvailabilityContext
-  getSwift5PlusAvailability(llvm::VersionTuple swiftVersion);
+#include "swift/AST/FeatureAvailability.def"
 
   /// Get the runtime availability of features that have been introduced in the
   /// Swift compiler for future versions of the target platform.
-  AvailabilityContext getSwiftFutureAvailability();
+  AvailabilityRange getSwiftFutureAvailability() const;
 
   /// Returns `true` if versioned availability annotations are supported for the
   /// target triple.
   bool supportsVersionedAvailability() const;
+
+  //===--------------------------------------------------------------------===//
+  // Compatibility availability functions
+  //===--------------------------------------------------------------------===//
+
+  // Note: Don't add more of these version-specific availability functions;
+  // just use getSwiftAvailability() instead.
+
+  /// Get the runtime availability of features introduced in the Swift 5.0
+  /// compiler for the target platform.
+  inline AvailabilityRange getSwift50Availability() const {
+    return getSwiftAvailability(5, 0);
+  }
+
+  /// Get the runtime availability of features introduced in the Swift 5.1
+  /// compiler for the target platform.
+  inline AvailabilityRange getSwift51Availability() const {
+    return getSwiftAvailability(5, 1);
+  }
+
+  /// Get the runtime availability of features introduced in the Swift 5.2
+  /// compiler for the target platform.
+  inline AvailabilityRange getSwift52Availability() const {
+    return getSwiftAvailability(5, 2);
+  }
+
+  /// Get the runtime availability of features introduced in the Swift 5.3
+  /// compiler for the target platform.
+  inline AvailabilityRange getSwift53Availability() const {
+    return getSwiftAvailability(5, 3);
+  }
+
+  /// Get the runtime availability of features introduced in the Swift 5.4
+  /// compiler for the target platform.
+  inline AvailabilityRange getSwift54Availability() const {
+    return getSwiftAvailability(5, 4);
+  }
+
+  /// Get the runtime availability of features introduced in the Swift 5.5
+  /// compiler for the target platform.
+  inline AvailabilityRange getSwift55Availability() const {
+    return getSwiftAvailability(5, 5);
+  }
+
+  /// Get the runtime availability of features introduced in the Swift 5.6
+  /// compiler for the target platform.
+  inline AvailabilityRange getSwift56Availability() const {
+    return getSwiftAvailability(5, 6);
+  }
+
+  /// Get the runtime availability of features introduced in the Swift 5.7
+  /// compiler for the target platform.
+  inline AvailabilityRange getSwift57Availability() const {
+    return getSwiftAvailability(5, 7);
+  }
+
+  /// Get the runtime availability of features introduced in the Swift 5.8
+  /// compiler for the target platform.
+  inline AvailabilityRange getSwift58Availability() const {
+    return getSwiftAvailability(5, 8);
+  }
+
+  /// Get the runtime availability of features introduced in the Swift 5.9
+  /// compiler for the target platform.
+  inline AvailabilityRange getSwift59Availability() const {
+    return getSwiftAvailability(5, 9);
+  }
+
+  /// Get the runtime availability of features introduced in the Swift 5.10
+  /// compiler for the target platform.
+  inline AvailabilityRange getSwift510Availability() const {
+    return getSwiftAvailability(5, 10);
+  }
+
+  /// Get the runtime availability of features introduced in the Swift 6.0
+  /// compiler for the target platform.
+  inline AvailabilityRange getSwift60Availability() const {
+    return getSwiftAvailability(6, 0);
+  }
+
+  /// Get the runtime availability for a particular version of Swift (5.0+).
+  inline AvailabilityRange
+  getSwift5PlusAvailability(llvm::VersionTuple swiftVersion) const {
+    return getSwiftAvailability(swiftVersion.getMajor(),
+                                *swiftVersion.getMinor());
+  }
+
+  /// Get the runtime availability of getters and setters of multi payload enum
+  /// tag single payloads.
+  inline AvailabilityRange getMultiPayloadEnumTagSinglePayload() const {
+    // This didn't fit the pattern, so needed renaming
+    return getMultiPayloadEnumTagSinglePayloadAvailability();
+  }
+
+  /// Cache of the availability macros parsed from the command line arguments.
+  ///
+  /// This is an implementation detail, access via
+  /// \c Parser::parseAllAvailabilityMacroArguments.
+  AvailabilityMacroMap &getAvailabilityMacroCache() const;
+
+  /// Test support utility for loading a platform remap file
+  /// in case an SDK is not specified to the compilation.
+  const clang::DarwinSDKInfo::RelatedTargetVersionMapping *
+  getAuxiliaryDarwinPlatformRemapInfo(
+      clang::DarwinSDKInfo::OSEnvPair Kind) const;
 
   //===--------------------------------------------------------------------===//
   // Diagnostics Helper functions
@@ -1167,9 +1145,14 @@ public:
   ///
   /// Note that even if this check succeeds, errors may still occur if the
   /// module is loaded in full.
-  bool canImportModuleImpl(ImportPath::Module ModulePath,
+  bool canImportModuleImpl(ImportPath::Module ModulePath, SourceLoc loc,
                            llvm::VersionTuple version, bool underlyingVersion,
-                           bool updateFailingList) const;
+                           bool updateFailingList,
+                           llvm::VersionTuple &foundVersion) const;
+
+  /// Add successful canImport modules.
+  void addSucceededCanImportModule(StringRef moduleName, bool underlyingVersion,
+                                   const llvm::VersionTuple &versionInfo);
 
 public:
   namelookup::ImportCache &getImportCache() const;
@@ -1199,12 +1182,22 @@ public:
   ///
   /// Note that even if this check succeeds, errors may still occur if the
   /// module is loaded in full.
-  bool canImportModule(ImportPath::Module ModulePath,
+  bool canImportModule(ImportPath::Module ModulePath, SourceLoc loc,
                        llvm::VersionTuple version = llvm::VersionTuple(),
                        bool underlyingVersion = false);
-  bool canImportModule(ImportPath::Module ModulePath,
-                       llvm::VersionTuple version = llvm::VersionTuple(),
-                       bool underlyingVersion = false) const;
+
+  /// Check whether the module with a given name can be imported without
+  /// importing it. This is a const method that won't remember the outcome so
+  /// repeated check of the same module will induce full cost and won't count
+  /// as the dependency for current module.
+  bool testImportModule(ImportPath::Module ModulePath,
+                        llvm::VersionTuple version = llvm::VersionTuple(),
+                        bool underlyingVersion = false) const;
+
+  /// Callback on each successful imported.
+  void forEachCanImportVersionCheck(
+      std::function<void(StringRef, const llvm::VersionTuple &,
+                         const llvm::VersionTuple &)>) const;
 
   /// \returns a module with a given name that was already loaded.  If the
   /// module was not loaded, returns nullptr.
@@ -1238,6 +1231,16 @@ public:
 
   ModuleDecl *getModuleByIdentifier(Identifier ModuleID);
 
+  /// Looks up all modules whose real name or ABI name match ModuleName.
+  ///
+  /// Modules that are being looked up by ABI name are only found if they are a
+  /// dependency of a module that has that same name as its real name, as there
+  /// is no efficient way to lazily load a module by ABI name.
+  llvm::ArrayRef<ModuleDecl *> getModulesByRealOrABIName(StringRef ModuleName);
+
+  /// Notifies the AST context that a loaded module's ABI name will change.
+  void moduleABINameWillChange(ModuleDecl *module, Identifier newName);
+
   /// Returns the standard library module, or null if the library isn't present.
   ///
   /// If \p loadIfAbsent is true, the ASTContext will attempt to load the module
@@ -1251,6 +1254,13 @@ public:
   /// Insert an externally-sourced module into the set of known loaded modules
   /// in this context.
   void addLoadedModule(ModuleDecl *M);
+
+  /// Remove an externally-sourced module from the set of known loaded modules
+  /// in this context. Modules are added to the cache before being loaded to
+  /// avoid loading a module twice when there is a cyclic dependency between an
+  /// overlay and its Clang module. If a module import fails, the non-imported
+  /// module should be removed from the cache again.
+  void removeLoadedModule(Identifier RealName);
 
   /// Change the behavior of all loaders to ignore swiftmodules next to
   /// swiftinterfaces.
@@ -1282,7 +1292,9 @@ public:
                        SourceLoc loc,
                        DeclContext *dc,
                        ProtocolConformanceState state,
-                       bool isUnchecked);
+                       bool isUnchecked,
+                       bool isPreconcurrency,
+                       SourceLoc preconcurrencyLoc = SourceLoc());
 
   /// Produce a self-conformance for the given protocol.
   SelfProtocolConformance *
@@ -1298,9 +1310,21 @@ public:
   /// conformance itself, along with a bit indicating whether this diagnostic
   /// produces an error.
   struct DelayedConformanceDiag {
-    const ValueDecl *Requirement;
-    std::function<void()> Callback;
     bool IsError;
+    std::function<void(NormalProtocolConformance *)> Callback;
+  };
+
+  /// Describes a missing witness during conformance checking.
+  class MissingWitness {
+  public:
+    /// The requirement that is missing a witness.
+    ValueDecl *requirement;
+
+    /// The set of potential matching witnesses.
+    std::vector<RequirementMatch> matches;
+
+    MissingWitness(ValueDecl *requirement,
+                   ArrayRef<RequirementMatch> matches);
   };
 
   /// Check whether current context has any errors associated with
@@ -1315,8 +1339,9 @@ public:
 
   /// Add a delayed diagnostic produced while type-checking a
   /// particular protocol conformance.
-  void addDelayedConformanceDiag(NormalProtocolConformance *conformance,
-                                 DelayedConformanceDiag fn);
+  void addDelayedConformanceDiag(
+      NormalProtocolConformance *conformance, bool isError,
+      std::function<void(NormalProtocolConformance *)> callback);
 
   /// Retrieve the delayed-conformance diagnostic callbacks for the
   /// given normal protocol conformance.
@@ -1324,13 +1349,13 @@ public:
   takeDelayedConformanceDiags(NormalProtocolConformance const* conformance);
 
   /// Add delayed missing witnesses for the given normal protocol conformance.
-  void addDelayedMissingWitnesses(
+  void addDelayedMissingWitness(
       NormalProtocolConformance *conformance,
-      std::unique_ptr<MissingWitnessesBase> missingWitnesses);
+      MissingWitness missingWitness);
 
   /// Retrieve the delayed missing witnesses for the given normal protocol
   /// conformance.
-  std::unique_ptr<MissingWitnessesBase>
+  std::vector<MissingWitness>
   takeDelayedMissingWitnesses(NormalProtocolConformance *conformance);
 
   /// Produce a specialized conformance, which takes a generic
@@ -1345,15 +1370,17 @@ public:
   /// specialized conformance from the generic conformance.
   ProtocolConformance *
   getSpecializedConformance(Type type,
-                            RootProtocolConformance *generic,
+                            NormalProtocolConformance *generic,
                             SubstitutionMap substitutions);
 
-  /// Produce an inherited conformance, for subclasses of a type
-  /// that already conforms to a protocol.
+  /// Produce an inherited conformance, which forwards all operations to a
+  /// base conformance, except for getType(), which must return some subclass
+  /// of the base conformance's conforming type. This models the case where a
+  /// subclass conforms to a protocol because its superclass already conforms.
   ///
   /// \param type The type for which we are retrieving the conformance.
   ///
-  /// \param inherited The inherited conformance.
+  /// \param inherited A normal or specialized conformance.
   ProtocolConformance *
   getInheritedConformance(Type type, ProtocolConformance *inherited);
 
@@ -1441,8 +1468,7 @@ public:
   /// particular, the opened archetype signature does not have requirements for
   /// conformances inherited from superclass constraints while existential
   /// values do.
-  CanGenericSignature getOpenedExistentialSignature(Type type,
-                                                    GenericSignature parentSig);
+  OpenedExistentialSignature getOpenedExistentialSignature(Type type);
 
   /// Get a generic signature where the generic parameter τ_d_i represents
   /// the element of the pack generic parameter τ_d_i… in \p baseGenericSig.
@@ -1508,27 +1534,12 @@ public:
   /// alternative specified via the -entry-point-function-name frontend flag.
   std::string getEntryPointFunctionName() const;
 
-  Type getAssociatedTypeOfDistributedSystemOfActor(NominalTypeDecl *actor,
-                                            Identifier member);
-
-  /// Find the concrete invocation decoder associated with the given actor.
-  NominalTypeDecl *
-  getDistributedActorInvocationDecoder(NominalTypeDecl *);
-
-  /// Find `decodeNextArgument<T>(type: T.Type) -> T` method associated with
-  /// invocation decoder of the given distributed actor.
-  FuncDecl *getDistributedActorArgumentDecodingMethod(NominalTypeDecl *);
-
   /// The special Builtin.TheTupleType, which parents tuple extensions and
   /// conformances.
   BuiltinTupleDecl *getBuiltinTupleDecl();
 
   /// The declared interface type of Builtin.TheTupleType.
   BuiltinTupleType *getBuiltinTupleType();
-
-  /// The declaration for the `_diagnoseUnavailableCodeReached()` declaration
-  /// that ought to be used for the configured deployment target.
-  FuncDecl *getDiagnoseUnavailableCodeReachedDecl();
 
   Type getNamedSwiftType(ModuleDecl *module, StringRef name);
 
@@ -1553,7 +1564,7 @@ public:
 private:
   friend Decl;
 
-  llvm::Optional<ExternalSourceLocs *> getExternalSourceLocs(const Decl *D);
+  std::optional<ExternalSourceLocs *> getExternalSourceLocs(const Decl *D);
   void setExternalSourceLocs(const Decl *D, ExternalSourceLocs *Locs);
 
   friend TypeBase;
@@ -1563,6 +1574,13 @@ private:
   /// Provide context-level uniquing for SIL lowered type layouts and boxes.
   friend SILLayout;
   friend SILBoxType;
+
+public:
+  clang::DarwinSDKInfo *getDarwinSDKInfo() const;
+
+  /// Returns the string to use in diagnostics when printing the platform being
+  /// targetted.
+  StringRef getTargetPlatformStringForDiagnostics() const;
 };
 
 } // end namespace swift

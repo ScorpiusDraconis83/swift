@@ -23,6 +23,7 @@
 #include "swift/AST/Pattern.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "llvm/ADT/APInt.h"
 #include "DerivedConformances.h"
 #include "TypeCheckDecl.h"
@@ -102,7 +103,7 @@ deriveBodyRawRepresentable_raw(AbstractFunctionDecl *toRawDecl, void *) {
     auto *argList = ArgumentList::forImplicitCallTo(functionRef->getName(),
                                                     {selfRef, typeExpr}, C);
     auto call = CallExpr::createImplicit(C, functionRef, argList);
-    auto returnStmt = new (C) ReturnStmt(SourceLoc(), call);
+    auto *returnStmt = ReturnStmt::createImplicit(C, call);
     auto body = BraceStmt::create(C, SourceLoc(), ASTNode(returnStmt),
                                   SourceLoc());
     return { body, /*isTypeChecked=*/false };
@@ -112,23 +113,20 @@ deriveBodyRawRepresentable_raw(AbstractFunctionDecl *toRawDecl, void *) {
 
   SmallVector<ASTNode, 4> cases;
   for (auto elt : enumDecl->getAllElements()) {
-    auto pat = new (C)
-        EnumElementPattern(TypeExpr::createImplicit(enumType, C), SourceLoc(),
-                           DeclNameLoc(), DeclNameRef(), elt, nullptr,
-                           /*DC*/ toRawDecl);
-    pat->setImplicit();
+    auto *pat = EnumElementPattern::createImplicit(
+        enumType, elt, /*subPattern*/ nullptr, /*DC*/ toRawDecl);
 
     auto labelItem = CaseLabelItem(pat);
 
     auto returnExpr = cloneRawLiteralExpr(C, elt->getRawValueExpr());
-    auto returnStmt = new (C) ReturnStmt(SourceLoc(), returnExpr);
+    auto *returnStmt = ReturnStmt::createImplicit(C, returnExpr);
 
     auto body = BraceStmt::create(C, SourceLoc(),
                                   ASTNode(returnStmt), SourceLoc());
 
     cases.push_back(CaseStmt::create(C, CaseParentKind::Switch, SourceLoc(),
                                      labelItem, SourceLoc(), SourceLoc(), body,
-                                     /*case body var decls*/ llvm::None));
+                                     /*case body var decls*/ std::nullopt));
   }
 
   auto selfRef = DerivedConformance::createSelfDeclRef(toRawDecl);
@@ -159,22 +157,19 @@ static VarDecl *deriveRawRepresentable_raw(DerivedConformance &derived) {
   ASTContext &C = derived.Context;
 
   auto enumDecl = cast<EnumDecl>(derived.Nominal);
-  auto parentDC = derived.getConformanceContext();
   auto rawInterfaceType = enumDecl->getRawType();
-  auto rawType = parentDC->mapTypeIntoContext(rawInterfaceType);
 
   // Define the property.
   VarDecl *propDecl;
   PatternBindingDecl *pbDecl;
   std::tie(propDecl, pbDecl) = derived.declareDerivedProperty(
       DerivedConformance::SynthesizedIntroducer::Var, C.Id_rawValue,
-      rawInterfaceType, rawType, /*isStatic=*/false,
-      /*isFinal=*/false);
+      rawInterfaceType, /*isStatic=*/false, /*isFinal=*/false);
   addNonIsolatedToSynthesized(enumDecl, propDecl);
 
   // Define the getter.
-  auto getterDecl = DerivedConformance::addGetterToReadOnlyDerivedProperty(
-      propDecl, rawType);
+  auto getterDecl =
+      DerivedConformance::addGetterToReadOnlyDerivedProperty(propDecl);
   getterDecl->setBodySynthesizer(&deriveBodyRawRepresentable_raw);
 
   // If the containing module is not resilient, make sure clients can get at
@@ -242,11 +237,19 @@ struct RuntimeVersionCheck {
 /// \c versionCheck and returns true.
 static bool
 checkAvailability(const EnumElementDecl *elt, ASTContext &C,
-                  llvm::Optional<RuntimeVersionCheck> &versionCheck) {
+                  std::optional<RuntimeVersionCheck> &versionCheck) {
   auto *attr = elt->getAttrs().getPotentiallyUnavailable(C);
 
   // Is it always available?
   if (!attr)
+    return true;
+
+  // For type-checking purposes, iOS availability is inherited for visionOS
+  // targets. However, it is not inherited for the sake of code-generation
+  // of runtime availability queries, and is assumed to be available.
+  if ((attr->Platform == PlatformKind::iOS ||
+       attr->Platform == PlatformKind::iOSApplicationExtension) &&
+      C.LangOpts.Target.isXROS())
     return true;
 
   AvailableVersionComparison availability = attr->getVersionAvailability(C);
@@ -313,7 +316,7 @@ deriveBodyRawRepresentable_init(AbstractFunctionDecl *initDecl, void *) {
     // unavailable, skip it. If it might be unavailable at runtime, save
     // information about that check in versionCheck and keep processing this
     // element.
-    llvm::Optional<RuntimeVersionCheck> versionCheck(llvm::None);
+    std::optional<RuntimeVersionCheck> versionCheck(std::nullopt);
     if (!checkAvailability(elt, C, versionCheck))
       continue;
 
@@ -359,7 +362,7 @@ deriveBodyRawRepresentable_init(AbstractFunctionDecl *initDecl, void *) {
     cases.push_back(CaseStmt::create(C, CaseParentKind::Switch, SourceLoc(),
                                      CaseLabelItem(litPat), SourceLoc(),
                                      SourceLoc(), body,
-                                     /*case body var decls*/ llvm::None));
+                                     /*case body var decls*/ std::nullopt));
     ++Idx;
   }
 
@@ -372,7 +375,7 @@ deriveBodyRawRepresentable_init(AbstractFunctionDecl *initDecl, void *) {
   cases.push_back(CaseStmt::create(C, CaseParentKind::Switch, SourceLoc(),
                                    dfltLabelItem, SourceLoc(), SourceLoc(),
                                    dfltBody,
-                                   /*case body var decls*/ llvm::None));
+                                   /*case body var decls*/ std::nullopt));
 
   auto rawDecl = initDecl->getParameters()->get(0);
   auto rawRef = new (C) DeclRefExpr(rawDecl, DeclNameLoc(), /*implicit*/true);
@@ -410,8 +413,7 @@ deriveRawRepresentable_init(DerivedConformance &derived) {
 
   assert([&]() -> bool {
     return TypeChecker::conformsToKnownProtocol(
-        rawType, KnownProtocolKind::Equatable,
-        derived.getParentModule());
+        rawType, KnownProtocolKind::Equatable);
   }());
 
   auto *rawDecl = new (C)
@@ -423,15 +425,16 @@ deriveRawRepresentable_init(DerivedConformance &derived) {
   auto paramList = ParameterList::createWithoutLoc(rawDecl);
   
   DeclName name(C, DeclBaseName::createConstructor(), paramList);
-  
+
   auto initDecl =
-    new (C) ConstructorDecl(name, SourceLoc(),
-                            /*Failable=*/ true, /*FailabilityLoc=*/SourceLoc(),
-                            /*Async=*/false, /*AsyncLoc=*/SourceLoc(),
-                            /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(),
-                            /*ThrownType=*/TypeLoc(), paramList,
-                            /*GenericParams=*/nullptr, parentDC);
-  
+      new (C) ConstructorDecl(name, SourceLoc(),
+                              /*Failable=*/true, /*FailabilityLoc=*/SourceLoc(),
+                              /*Async=*/false, /*AsyncLoc=*/SourceLoc(),
+                              /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(),
+                              /*ThrownType=*/TypeLoc(), paramList,
+                              /*GenericParams=*/nullptr, parentDC,
+                              /*LifetimeDependentTypeRepr*/ nullptr);
+
   initDecl->setImplicit();
   initDecl->setBodySynthesizer(&deriveBodyRawRepresentable_init);
   addNonIsolatedToSynthesized(enumDecl, initDecl);
@@ -467,8 +470,7 @@ bool DerivedConformance::canDeriveRawRepresentable(DeclContext *DC,
 
   // The raw type must be Equatable, so that we have a suitable ~= for
   // synthesized switch statements.
-  if (!TypeChecker::conformsToKnownProtocol(rawType, KnownProtocolKind::Equatable,
-                                            DC->getParentModule()))
+  if (!TypeChecker::conformsToKnownProtocol(rawType, KnownProtocolKind::Equatable))
     return false;
 
   auto &C = type->getASTContext();
@@ -517,7 +519,7 @@ ValueDecl *DerivedConformance::deriveRawRepresentable(ValueDecl *requirement) {
   if (requirement->getBaseName() == Context.Id_rawValue)
     return deriveRawRepresentable_raw(*this);
 
-  if (requirement->getBaseName() == DeclBaseName::createConstructor())
+  if (requirement->getBaseName().isConstructor())
     return deriveRawRepresentable_init(*this);
 
   Context.Diags.diagnose(requirement->getLoc(),

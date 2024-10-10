@@ -141,8 +141,7 @@ public:
     assert(EntitiesStack.empty());
   }
 
-  bool shouldContinuePre(const Decl *D,
-                         llvm::Optional<BracketOptions> Bracket) {
+  bool shouldContinuePre(const Decl *D, std::optional<BracketOptions> Bracket) {
     assert(Bracket.has_value());
     if (!Bracket.value().shouldOpenExtension(D) &&
         isa<ExtensionDecl>(D))
@@ -151,7 +150,7 @@ public:
   }
 
   bool shouldContinuePost(const Decl *D,
-                          llvm::Optional<BracketOptions> Bracket) {
+                          std::optional<BracketOptions> Bracket) {
     assert(Bracket.has_value());
     if (!Bracket.value().shouldCloseNominal(D) && isa<NominalTypeDecl>(D))
       return false;
@@ -161,9 +160,10 @@ public:
     return true;
   }
 
-  void printSynthesizedExtensionPre(
-      const ExtensionDecl *ED, TypeOrExtensionDecl Target,
-      llvm::Optional<BracketOptions> Bracket) override {
+  void
+  printSynthesizedExtensionPre(const ExtensionDecl *ED,
+                               TypeOrExtensionDecl Target,
+                               std::optional<BracketOptions> Bracket) override {
     assert(!SynthesizedExtensionInfo.first);
     SynthesizedExtensionInfo = {ED, Target};
     if (!shouldContinuePre(ED, Bracket))
@@ -174,7 +174,7 @@ public:
 
   void printSynthesizedExtensionPost(
       const ExtensionDecl *ED, TypeOrExtensionDecl Target,
-      llvm::Optional<BracketOptions> Bracket) override {
+      std::optional<BracketOptions> Bracket) override {
     assert(SynthesizedExtensionInfo.first);
     SynthesizedExtensionInfo = {nullptr, {}};
     if (!shouldContinuePost(ED, Bracket))
@@ -187,7 +187,7 @@ public:
   }
 
   void printDeclPre(const Decl *D,
-                    llvm::Optional<BracketOptions> Bracket) override {
+                    std::optional<BracketOptions> Bracket) override {
     if (isa<ParamDecl>(D))
       return; // Parameters are handled specially in addParameters().
     if (!shouldContinuePre(D, Bracket))
@@ -211,7 +211,7 @@ public:
   }
 
   void printDeclPost(const Decl *D,
-                     llvm::Optional<BracketOptions> Bracket) override {
+                     std::optional<BracketOptions> Bracket) override {
     if (isa<ParamDecl>(D))
       return; // Parameters are handled specially in addParameters().
     if (!shouldContinuePost(D, Bracket))
@@ -274,7 +274,6 @@ static void initDocGenericParams(const Decl *D, DocEntityInfo &Info,
   // substitution).
   unsigned TypeContextDepth = 0;
   SubstitutionMap SubMap;
-  ModuleDecl *M = nullptr;
   Type BaseType;
   if (SynthesizedTarget) {
     BaseType = SynthesizedTarget.getBaseNominal()->getDeclaredInterfaceType();
@@ -284,12 +283,8 @@ static void initDocGenericParams(const Decl *D, DocEntityInfo &Info,
         DC = cast<ExtensionDecl>(D)->getExtendedNominal();
       else
         DC = D->getInnermostDeclContext()->getInnermostTypeContext();
-      M = DC->getParentModule();
-      SubMap = BaseType->getContextSubstitutionMap(M, DC);
-      if (!SubMap.empty()) {
-        TypeContextDepth = SubMap.getGenericSignature()
-            .getGenericParams().back()->getDepth() + 1;
-      }
+      SubMap = BaseType->getContextSubstitutionMap(DC);
+      TypeContextDepth = SubMap.getGenericSignature().getNextDepth();
     }
   }
 
@@ -303,9 +298,7 @@ static void initDocGenericParams(const Decl *D, DocEntityInfo &Info,
           return Type(type).subst(SubMap);
         return type;
       },
-      [&](CanType depType, Type substType, ProtocolDecl *proto) {
-        return M->lookupConformance(substType, proto);
-      },
+      LookUpConformanceInModule(),
       SubstFlags::DesugarMemberTypes);
   };
 
@@ -335,7 +328,13 @@ static void initDocGenericParams(const Decl *D, DocEntityInfo &Info,
   if (auto *typeDC = GC->getInnermostTypeContext())
     Proto = typeDC->getSelfProtocolDecl();
 
-  for (auto Req: GenericSig.getRequirements()) {
+  SmallVector<Requirement, 2> Reqs;
+  SmallVector<InverseRequirement, 2> InverseReqs;
+  GenericSig->getRequirementsWithInverses(Reqs, InverseReqs);
+  // FIXME: Handle InverseReqs, or change the above to getRequirements()
+  // and update tests to include Copyable/Escapable
+
+  for (auto Req: Reqs) {
     if (Proto &&
         Req.getKind() == RequirementKind::Conformance &&
         Req.getFirstType()->isEqual(Proto->getSelfInterfaceType()) &&
@@ -445,7 +444,7 @@ static bool initDocEntityInfo(const Decl *D,
   }
 
   Info.IsUnavailable = AvailableAttr::isUnavailable(D);
-  Info.IsDeprecated = D->getAttrs().getDeprecated(D->getASTContext()) != nullptr;
+  Info.IsDeprecated = D->getAttrs().isDeprecated(D->getASTContext());
   Info.IsOptional = D->getAttrs().hasAttribute<OptionalAttr>();
   if (auto *AFD = dyn_cast<AbstractFunctionDecl>(D)) {
     Info.IsAsync = AFD->hasAsync();
@@ -455,7 +454,7 @@ static bool initDocEntityInfo(const Decl *D,
   }
 
   if (!IsRef) {
-    llvm::raw_svector_ostream OS(Info.DocComment);
+    llvm::raw_svector_ostream OS(Info.DocCommentAsXML);
 
     {
       llvm::SmallString<128> DocBuffer;
@@ -503,12 +502,13 @@ static bool initDocEntityInfo(const Decl *D,
 
   switch(D->getDeclContext()->getContextKind()) {
     case DeclContextKind::AbstractClosureExpr:
+    case DeclContextKind::SerializedAbstractClosure:
     case DeclContextKind::TopLevelCodeDecl:
+    case DeclContextKind::SerializedTopLevelCodeDecl:
     case DeclContextKind::AbstractFunctionDecl:
     case DeclContextKind::SubscriptDecl:
     case DeclContextKind::EnumElementDecl:
     case DeclContextKind::Initializer:
-    case DeclContextKind::SerializedLocal:
     case DeclContextKind::ExtensionDecl:
     case DeclContextKind::GenericTypeDecl:
     case DeclContextKind::MacroDecl:
@@ -667,7 +667,7 @@ getDeclAttributes(const Decl *D, std::vector<const DeclAttribute*> &Scratch) {
     }
   }
 
-  return llvm::makeArrayRef(Scratch);
+  return llvm::ArrayRef(Scratch);
 }
 
 // Only reports @available.
@@ -708,6 +708,9 @@ static void reportAttributes(ASTContext &Ctx,
         PlatformUID = PlatformWatchOS; break;
       case PlatformKind::iOSApplicationExtension:
         PlatformUID = PlatformIOSAppExt; break;
+      case PlatformKind::visionOS:
+        // FIXME: Formal platform support in SourceKit is needed.
+        PlatformUID = UIdent(); break;
       case PlatformKind::macCatalystApplicationExtension:
         PlatformUID = PlatformMacCatalystAppExt; break;
       case PlatformKind::macOSApplicationExtension:
@@ -716,6 +719,9 @@ static void reportAttributes(ASTContext &Ctx,
         PlatformUID = PlatformtvOSAppExt; break;
       case PlatformKind::watchOSApplicationExtension:
         PlatformUID = PlatformWatchOSAppExt; break;
+      case PlatformKind::visionOSApplicationExtension:
+        // FIXME: Formal platform support in SourceKit is needed.
+        PlatformUID = UIdent(); break;
       case PlatformKind::OpenBSD:
         PlatformUID = PlatformOpenBSD; break;
       case PlatformKind::Windows:
@@ -993,17 +999,17 @@ public:
 
   PreWalkAction walkToDeclPre(Decl *D) override {
     if (D->isImplicit())
-      return Action::SkipChildren(); // Skip body.
+      return Action::SkipNode(); // Skip body.
 
     if (FuncEnts.empty())
-      return Action::SkipChildren();
+      return Action::SkipNode();
 
     if (!isa<AbstractFunctionDecl>(D) && !isa<SubscriptDecl>(D))
       return Action::Continue();
 
     // Ignore things that don't come from this buffer.
     if (!SM.getRangeForBuffer(BufferID).contains(D->getLoc()))
-      return Action::SkipChildren();
+      return Action::SkipNode();
 
     unsigned Offset = SM.getLocOffsetInBuffer(D->getLoc(), BufferID);
     auto Found = FuncEnts.end();
@@ -1016,14 +1022,14 @@ public:
         });
     }
     if (Found == FuncEnts.end() || (*Found)->LocOffset != Offset)
-      return Action::SkipChildren();
+      return Action::SkipNode();
     if (auto FD = dyn_cast<AbstractFunctionDecl>(D)) {
       addParameters(FD, **Found, SM, BufferID);
     } else {
       addParameters(cast<SubscriptDecl>(D), **Found, SM, BufferID);
     }
     FuncEnts = llvm::MutableArrayRef<TextEntity*>(Found+1, FuncEnts.end());
-    return Action::SkipChildren(); // skip body.
+    return Action::SkipNode(); // skip body.
   }
 };
 } // end anonymous namespace
@@ -1038,7 +1044,7 @@ static void addParameterEntities(CompilerInstance &CI,
     auto SF = dyn_cast<SourceFile>(Unit);
     if (!SF)
       continue;
-    FuncWalker Walker(CI.getSourceMgr(), *SF->getBufferID(), FuncEnts);
+    FuncWalker Walker(CI.getSourceMgr(), SF->getBufferID(), FuncEnts);
     SF->walk(Walker);
   }
 }
@@ -1052,7 +1058,7 @@ static void reportSourceAnnotations(const SourceTextInfo &IFaceInfo,
       continue;
 
     SyntaxModelContext SyntaxContext(*SF);
-    DocSyntaxWalker SyntaxWalker(CI.getSourceMgr(), *SF->getBufferID(),
+    DocSyntaxWalker SyntaxWalker(CI.getSourceMgr(), SF->getBufferID(),
                                  IFaceInfo.References, Consumer);
     SyntaxContext.walk(SyntaxWalker);
     SyntaxWalker.finished();
@@ -1071,7 +1077,7 @@ static bool getModuleInterfaceInfo(ASTContext &Ctx, StringRef ModuleName,
     return true;
 
   PrintOptions Options = PrintOptions::printDocInterface();
-  ModuleTraversalOptions TraversalOptions = llvm::None;
+  ModuleTraversalOptions TraversalOptions = std::nullopt;
   TraversalOptions |= ModuleTraversal::VisitSubmodules;
   TraversalOptions |= ModuleTraversal::VisitHidden;
 
@@ -1079,7 +1085,8 @@ static bool getModuleInterfaceInfo(ASTContext &Ctx, StringRef ModuleName,
   llvm::raw_svector_ostream OS(Text);
   AnnotatingPrinter Printer(OS);
 
-  printModuleInterface(M, llvm::None, TraversalOptions, Printer, Options, true);
+  printModuleInterface(M, std::nullopt, TraversalOptions, Printer, Options,
+                       true);
 
   Info.Text = std::string(OS.str());
   Info.TopEntities = std::move(Printer.TopEntities);
@@ -1290,9 +1297,8 @@ public:
     std::vector<CategorizedEdits> Results;
     for (unsigned I = 0, N = UIds.size(); I < N; I ++) {
       auto Pair = StartEnds[I];
-      Results.push_back({UIds[I],
-                         llvm::makeArrayRef(AllEdits.data() + Pair.first,
-                                             Pair.second - Pair.first)});
+      Results.push_back({UIds[I], llvm::ArrayRef(AllEdits.data() + Pair.first,
+                                                 Pair.second - Pair.first)});
     }
     Receiver(RequestResult<ArrayRef<CategorizedEdits>>::fromResult(Results));
   }
@@ -1422,7 +1428,7 @@ void SwiftLangSupport::findLocalRenameRanges(
 
     void handlePrimaryAST(ASTUnitRef AstUnit) override {
       auto &SF = AstUnit->getPrimarySourceFile();
-      swift::ide::RangeConfig Range{*SF.getBufferID(), Line, Column, Length};
+      swift::ide::RangeConfig Range{SF.getBufferID(), Line, Column, Length};
       SourceManager &SM = SF.getASTContext().SourceMgr;
       auto SyntacticRenameRanges =
           swift::ide::findLocalRenameRanges(&SF, Range);
@@ -1475,7 +1481,7 @@ SourceFile *SwiftLangSupport::getSyntacticSourceFile(
   unsigned BufferID = ParseCI.getInputBufferIDs().back();
   for (auto Unit : ParseCI.getMainModule()->getFiles()) {
     if (auto Current = dyn_cast<SourceFile>(Unit)) {
-      if (Current->getBufferID().value() == BufferID) {
+      if (Current->getBufferID() == BufferID) {
         SF = Current;
         break;
       }

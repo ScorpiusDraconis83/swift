@@ -18,13 +18,13 @@
 #ifndef SWIFT_PRINTINGDIAGNOSTICCONSUMER_H
 #define SWIFT_PRINTINGDIAGNOSTICCONSUMER_H
 
+#include "swift/AST/DiagnosticBridge.h"
 #include "swift/AST/DiagnosticConsumer.h"
 #include "swift/Basic/DiagnosticOptions.h"
 #include "swift/Basic/LLVM.h"
 
-#include "llvm/ADT/DenseMap.h"
-#include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/Process.h"
+#include "llvm/Support/raw_ostream.h"
 
 namespace swift {
 
@@ -42,15 +42,11 @@ class PrintingDiagnosticConsumer : public DiagnosticConsumer {
   SmallVector<std::string, 1> BufferedEducationalNotes;
   bool SuppressOutput = false;
 
+#if SWIFT_BUILD_SWIFT_SYNTAX
   /// swift-syntax rendering
-
-  /// A queued up source file known to the queued diagnostics.
-  using QueuedBuffer = void *;
-
-  /// The queued diagnostics structure.
-  void *queuedDiagnostics = nullptr;
-  llvm::DenseMap<unsigned, QueuedBuffer> queuedBuffers;
-
+  DiagnosticBridge DiagBridge;
+#endif
+ 
 public:
   PrintingDiagnosticConsumer(llvm::raw_ostream &stream = llvm::errs());
   ~PrintingDiagnosticConsumer();
@@ -90,6 +86,10 @@ public:
   }
 
 private:
+  /// Retrieve the SourceFileSyntax for the given buffer.
+  void *getSourceFileSyntax(SourceManager &SM, unsigned bufferID,
+                            StringRef displayName);
+
   void queueBuffer(SourceManager &sourceMgr, unsigned bufferID);
   void printDiagnostic(SourceManager &SM, const DiagnosticInfo &Info);
 };

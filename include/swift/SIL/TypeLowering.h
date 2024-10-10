@@ -170,10 +170,10 @@ enum IsInfiniteType_t : bool {
   IsInfiniteType = true,
 };
 
-/// Does this type contain at least one non-trivial, non-eager-move type?
-enum IsLexical_t : bool {
-  IsNotLexical = false,
-  IsLexical = true,
+/// Does this type contain any pack-like thing.
+enum HasPack_t : bool {
+  HasNoPack = false,
+  HasPack = true,
 };
 
 /// Extended type information used by SIL.
@@ -192,10 +192,12 @@ public:
       InfiniteFlag               = 1 << 5,
       HasRawPointerFlag          = 1 << 6,
       LexicalFlag                = 1 << 7,
+      HasPackFlag                = 1 << 8,
     };
     // clang-format on
 
-    uint8_t Flags;
+    uint16_t Flags;
+
   public:
     /// Construct a default RecursiveProperties, which corresponds to
     /// a trivial, loadable, fixed-layout type.
@@ -207,14 +209,15 @@ public:
         IsTypeExpansionSensitive_t isTypeExpansionSensitive =
             IsNotTypeExpansionSensitive,
         HasRawPointer_t hasRawPointer = DoesNotHaveRawPointer,
-        IsLexical_t isLexical = IsNotLexical)
+        IsLexical_t isLexical = IsNotLexical, HasPack_t hasPack = HasNoPack)
         : Flags((isTrivial ? 0U : NonTrivialFlag) |
                 (isFixedABI ? 0U : NonFixedABIFlag) |
                 (isAddressOnly ? AddressOnlyFlag : 0U) |
                 (isResilient ? ResilientFlag : 0U) |
                 (isTypeExpansionSensitive ? TypeExpansionSensitiveFlag : 0U) |
                 (hasRawPointer ? HasRawPointerFlag : 0U) |
-                (isLexical ? LexicalFlag : 0U)) {}
+                (isLexical ? LexicalFlag : 0U) |
+                (hasPack ? HasPackFlag : 0U)) {}
 
     constexpr bool operator==(RecursiveProperties p) const {
       return Flags == p.Flags;
@@ -236,7 +239,7 @@ public:
 
     static constexpr RecursiveProperties forOpaque() {
       return {IsNotTrivial, IsNotFixedABI, IsAddressOnly, IsNotResilient,
-              IsNotTypeExpansionSensitive, DoesNotHaveRawPointer, IsLexical};
+              IsNotTypeExpansionSensitive, DoesNotHaveRawPointer, IsLexical, HasNoPack};
     }
 
     static constexpr RecursiveProperties forResilient() {
@@ -272,6 +275,9 @@ public:
     IsLexical_t isLexical() const {
       return IsLexical_t((Flags & LexicalFlag) != 0);
     }
+    HasPack_t isOrContainsPack() const {
+      return HasPack_t((Flags & HasPackFlag) != 0);
+    }
 
     void setNonTrivial() { Flags |= NonTrivialFlag; }
     void setNonFixedABI() { Flags |= NonFixedABIFlag; }
@@ -285,6 +291,7 @@ public:
     void setLexical(IsLexical_t isLexical) {
       Flags = (Flags & ~LexicalFlag) | (isLexical ? LexicalFlag : 0);
     }
+    void setHasPack() { Flags |= HasPackFlag; }
   };
 
 private:
@@ -393,6 +400,11 @@ public:
   /// Should a value of this type have its lifetime tied to its lexical scope?
   bool isLexical() const {
     return Properties.isLexical();
+  }
+
+  /// Does this type feature a pack at some level of its type tree.
+  bool isOrContainsPack() const {
+    return Properties.isOrContainsPack();
   }
 
   ResilienceExpansion getResilienceExpansion() const {
@@ -677,6 +689,43 @@ enum class CaptureKind {
   Immutable
 };
 
+/// Interesting information about the lowering of a function type.
+struct FunctionTypeInfo {
+  /// The abstraction pattern that the type has been lowered under.
+  AbstractionPattern OrigType;
+
+  /// The formal type that the function is being used as.  When this
+  /// type is used to specify a type context (e.g. as the contextual
+  /// type info of a closure; see `TypeConverter::getClosureTypeInfo`),
+  /// this may be a subtype of the closure's formal type.
+  CanAnyFunctionType FormalType;
+
+  /// The expected lowered type.
+  CanSILFunctionType ExpectedLoweredType;
+};
+
+/// Return type of getGenericSignatureWithCapturedEnvironments().
+struct GenericSignatureWithCapturedEnvironments {
+  GenericSignature baseGenericSig;
+  GenericSignature genericSig;
+  ArrayRef<GenericEnvironment *> capturedEnvs;
+
+  explicit GenericSignatureWithCapturedEnvironments() {}
+
+  explicit GenericSignatureWithCapturedEnvironments(
+      GenericSignature baseGenericSig)
+    : baseGenericSig(baseGenericSig),
+      genericSig(baseGenericSig) {}
+
+  GenericSignatureWithCapturedEnvironments(
+      GenericSignature baseGenericSig,
+      GenericSignature genericSig,
+      ArrayRef<GenericEnvironment *> capturedEnvs)
+    : baseGenericSig(baseGenericSig),
+      genericSig(genericSig),
+      capturedEnvs(capturedEnvs) {}
+};
+
 /// TypeConverter - helper class for creating and managing TypeLowerings.
 class TypeConverter {
   friend class TypeLowering;
@@ -807,8 +856,7 @@ class TypeConverter {
   /// Second element is a ResilienceExpansion.
   llvm::DenseMap<std::pair<SILType, unsigned>, unsigned> TypeFields;
 
-  llvm::DenseMap<AbstractClosureExpr *, llvm::Optional<AbstractionPattern>>
-      ClosureAbstractionPatterns;
+  llvm::DenseMap<AbstractClosureExpr *, FunctionTypeInfo> ClosureInfos;
   llvm::DenseMap<SILDeclRef, TypeExpansionContext>
     CaptureTypeExpansionContexts;
 
@@ -816,7 +864,7 @@ class TypeConverter {
   
   // Types converted during foreign bridging.
 #define BRIDGING_KNOWN_TYPE(BridgedModule, BridgedType)                        \
-  llvm::Optional<CanType> BridgedType##Ty;
+  std::optional<CanType> BridgedType##Ty;
 #include "swift/SIL/BridgedTypes.def"
 
   const TypeLowering &getTypeLoweringForLoweredType(
@@ -1021,11 +1069,25 @@ public:
   const SILConstantInfo &getConstantInfo(TypeExpansionContext context,
                                          SILDeclRef constant);
 
-  /// Get the generic environment for a constant.
-  GenericSignature getConstantGenericSignature(SILDeclRef constant);
+  /// Get the generic signature for a constant.
+  GenericSignatureWithCapturedEnvironments
+  getGenericSignatureWithCapturedEnvironments(SILDeclRef constant);
+
+  /// Get the substitution map for calling a constant.
+  SubstitutionMap
+  getSubstitutionMapWithCapturedEnvironments(SILDeclRef constant,
+                                             const CaptureInfo &captureInfo,
+                                             SubstitutionMap subs);
 
   /// Get the generic environment for a constant.
   GenericEnvironment *getConstantGenericEnvironment(SILDeclRef constant);
+
+  /// Get the generic environment for SILGen to use. The substitution map
+  /// sends the generic parameters of the function's interface type into
+  /// archetypes, which will either be primary archetypes from this
+  /// environment, or local archetypes captured by this function.
+  std::tuple<GenericEnvironment *, ArrayRef<GenericEnvironment *>, SubstitutionMap>
+  getForwardingSubstitutionsForLowering(SILDeclRef constant);
 
   /// Returns the SIL type of a constant reference.
   SILType getConstantType(TypeExpansionContext context, SILDeclRef constant) {
@@ -1191,13 +1253,25 @@ public:
                                         SILDeclRef constant,
                                         CanAnyFunctionType origInterfaceType);
 
-  /// Get the boxed interface type to use for a capture of the given decl.
+  /// Get the interface type for a box that holds a mutable local 'var',
+  /// substituted for a closure that captures some superset of the local
+  /// environments captured by the 'var'.
   CanSILBoxType
   getInterfaceBoxTypeForCapture(ValueDecl *captured,
-                                CanType loweredInterfaceType,
+                                CanType loweredContextType,
+                                GenericSignature genericSig,
+                                ArrayRef<GenericEnvironment *> capturedEnvs,
                                 bool isMutable);
-  /// Get the boxed contextual type to use for a capture of the given decl
-  /// in the given generic environment.
+
+  /// Get the interface type for a box that holds a mutable local 'var',
+  /// given that the interface type of the 'var' might capture local
+  /// archetypes.
+  CanSILBoxType
+  getInterfaceBoxTypeForCapture(ValueDecl *captured,
+                                CanType loweredContextType,
+                                bool isMutable);
+
+  /// Get the contextual type for a box that holds a mutable local 'var'.
   CanSILBoxType
   getContextBoxTypeForCapture(ValueDecl *captured,
                               CanType loweredContextType,
@@ -1208,26 +1282,16 @@ public:
                                          SILType enumType,
                                          EnumElementDecl *elt);
 
-  /// Get the preferred abstraction pattern, if any, by which to lower a
-  /// declaration.
-  ///
-  /// This can be set using \c setAbstractionPattern , but only before
-  /// the abstraction pattern is queried using this function. Once the
-  /// abstraction pattern has been asked for, it may not be changed.
-  llvm::Optional<AbstractionPattern>
-  getConstantAbstractionPattern(SILDeclRef constant);
   TypeExpansionContext getCaptureTypeExpansionContext(SILDeclRef constant);
-  
-  /// Set the preferred abstraction pattern for a closure.
-  ///
-  /// The abstraction pattern can only be set before any calls to
-  /// \c getConstantAbstractionPattern on the same closure. It may not be
-  /// changed once it has been read.
-  void setAbstractionPattern(AbstractClosureExpr *closure,
-                             AbstractionPattern pattern);
-  
   void setCaptureTypeExpansionContext(SILDeclRef constant,
                                       SILModule &M);
+
+  const FunctionTypeInfo *getClosureTypeInfo(SILDeclRef constant);
+  const FunctionTypeInfo &getClosureTypeInfo(AbstractClosureExpr *closure);
+
+  void withClosureTypeInfo(AbstractClosureExpr *closure,
+                           const FunctionTypeInfo &closureInfo,
+                           llvm::function_ref<void()> operation);
 
   void setLoweredAddresses();
 
@@ -1264,15 +1328,21 @@ private:
   void verifyLowering(const TypeLowering &, AbstractionPattern origType,
                       CanType origSubstType,
                       TypeExpansionContext forExpansion);
-  bool visitAggregateLeaves(
-      Lowering::AbstractionPattern origType, CanType substType,
-      TypeExpansionContext context,
-      std::function<bool(CanType, Lowering::AbstractionPattern, ValueDecl *,
-                         llvm::Optional<unsigned>)>
-          isLeafAggregate,
-      std::function<bool(CanType, Lowering::AbstractionPattern, ValueDecl *,
-                         llvm::Optional<unsigned>)>
-          visit);
+  void verifyLexicalLowering(const TypeLowering &, AbstractionPattern origType,
+                             CanType origSubstType,
+                             TypeExpansionContext forExpansion);
+  void verifyTrivialLowering(const TypeLowering &, AbstractionPattern origType,
+                             CanType origSubstType,
+                             TypeExpansionContext forExpansion);
+  bool
+  visitAggregateLeaves(Lowering::AbstractionPattern origType, CanType substType,
+                       TypeExpansionContext context,
+                       std::function<bool(CanType, Lowering::AbstractionPattern,
+                                          ValueDecl *, std::optional<unsigned>)>
+                           isLeafAggregate,
+                       std::function<bool(CanType, Lowering::AbstractionPattern,
+                                          ValueDecl *, std::optional<unsigned>)>
+                           visit);
 #endif
 };
 
@@ -1281,9 +1351,10 @@ private:
 CanSILFunctionType getNativeSILFunctionType(
     Lowering::TypeConverter &TC, TypeExpansionContext context,
     Lowering::AbstractionPattern origType, CanAnyFunctionType substType,
-    SILExtInfo silExtInfo, llvm::Optional<SILDeclRef> origConstant = llvm::None,
-    llvm::Optional<SILDeclRef> constant = llvm::None,
-    llvm::Optional<SubstitutionMap> reqtSubs = llvm::None,
+    SILExtInfo silExtInfo,
+    std::optional<SILDeclRef> origConstant = std::nullopt,
+    std::optional<SILDeclRef> constant = std::nullopt,
+    std::optional<SubstitutionMap> reqtSubs = std::nullopt,
     ProtocolConformanceRef witnessMethodConformance = ProtocolConformanceRef());
 
 /// The thunk kinds used in the differentiation transform.
@@ -1313,8 +1384,8 @@ CanSILFunctionType buildSILFunctionThunkType(
     CanType &outputSubstType, GenericEnvironment *&genericEnv,
     SubstitutionMap &interfaceSubs, CanType &dynamicSelfType,
     bool withoutActuallyEscaping,
-    llvm::Optional<DifferentiationThunkKind> differentiationThunkKind =
-        llvm::None);
+    std::optional<DifferentiationThunkKind> differentiationThunkKind =
+        std::nullopt);
 
 } // namespace swift
 

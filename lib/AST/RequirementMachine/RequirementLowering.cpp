@@ -127,7 +127,7 @@
 //
 // The desugaring process eliminates requirements where both sides are
 // concrete by evaluating them immediately, reporting an error if the
-// requirement does not hold, or a warning if it is trivially true.
+// requirement does not hold, or silently discarding it otherwise.
 //
 // Conformance requirements with protocol compositions on the right hand side
 // are broken down into multiple conformance requirements.
@@ -150,6 +150,7 @@
 
 #include "RequirementLowering.h"
 #include "swift/AST/ASTContext.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/Requirement.h"
@@ -157,6 +158,7 @@
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/TypeMatcher.h"
 #include "swift/AST/TypeRepr.h"
+#include "swift/Basic/Assertions.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/SetVector.h"
 #include "Diagnostics.h"
@@ -186,8 +188,6 @@ static void desugarSameTypeRequirement(
     SmallVector<Position, 2> stack;
 
   public:
-    bool recordedErrors = false;
-
     explicit Matcher(SourceLoc loc,
                      SmallVectorImpl<Requirement> &result,
                      SmallVectorImpl<RequirementError> &errors)
@@ -200,7 +200,7 @@ static void desugarSameTypeRequirement(
     }
 
     void popPosition(Position pos) {
-      assert(stack.back() == pos);
+      ASSERT(stack.back() == pos);
       stack.pop_back();
     }
 
@@ -221,12 +221,45 @@ static void desugarSameTypeRequirement(
         break;
       }
 
-      // If one side is a parameter pack, this is a same-element requirement, which
-      // is not yet supported.
-      if (firstType->isParameterPack() != secondType->isParameterPack()) {
-        errors.push_back(RequirementError::forSameElement(
-            {kind, sugaredFirstType, secondType}, loc));
-        recordedErrors = true;
+      auto &ctx = firstType->getASTContext();
+      if (!ctx.LangOpts.hasFeature(Feature::SameElementRequirements)) {
+        // If one side is a parameter pack, this is a same-element requirement, which
+        // is not yet supported.
+        if (firstType->isParameterPack() != secondType->isParameterPack()) {
+          errors.push_back(RequirementError::forSameElement(
+              {kind, sugaredFirstType, secondType}, loc));
+          return true;
+        }
+      }
+
+      if (firstType->isValueParameter() || secondType->isValueParameter()) {
+        // FIXME: If we ever support other value types in the future besides
+        // 'Int', then we'd want to check their underlying value type to ensure
+        // they are the same.
+        if (firstType->isValueParameter() &&
+            !(secondType->isValueParameter() || secondType->is<IntegerType>())) {
+          errors.push_back(RequirementError::forInvalidValueGenericSameType(
+              sugaredFirstType, secondType, loc));
+          return true;
+        }
+
+        if (secondType->isValueParameter() &&
+            !(firstType->isValueParameter() || firstType->is<IntegerType>())) {
+          errors.push_back(RequirementError::forInvalidValueGenericSameType(
+              secondType, sugaredFirstType, loc));
+          return true;
+        }
+      }
+
+      if (!firstType->isValueParameter() && secondType->is<IntegerType>()) {
+        errors.push_back(RequirementError::forInvalidValueForTypeSameType(
+            sugaredFirstType, secondType, loc));
+        return true;
+      }
+
+      if (!secondType->isValueParameter() && firstType->is<IntegerType>()) {
+        errors.push_back(RequirementError::forInvalidValueForTypeSameType(
+            secondType, sugaredFirstType, loc));
         return true;
       }
 
@@ -247,23 +280,11 @@ static void desugarSameTypeRequirement(
 
       errors.push_back(RequirementError::forConflictingRequirement(
           {RequirementKind::SameType, sugaredFirstType, secondType}, loc));
-      recordedErrors = true;
       return true;
     }
   } matcher(loc, result, errors);
 
   (void) matcher.match(req.getFirstType(), req.getSecondType());
-
-  // If neither side is directly a type parameter, the type parameter
-  // must be in structural position where the enclosing type is redundant.
-  if (!req.getFirstType()->isTypeParameter() &&
-      !req.getSecondType()->isTypeParameter() &&
-      !matcher.recordedErrors) {
-    // FIXME: Add a tailored error message when requirements were
-    // recorded, e.g. Array<Int> == Array<T>. The outer type is
-    // redundant, but the inner requirement T == Int is not.
-    errors.push_back(RequirementError::forRedundantRequirement(req, loc));
-  }
 }
 
 static void desugarSuperclassRequirement(
@@ -282,7 +303,6 @@ static void desugarSuperclassRequirement(
   switch (req.checkRequirement(subReqs)) {
   case CheckRequirementResult::Success:
   case CheckRequirementResult::PackRequirement:
-    errors.push_back(RequirementError::forRedundantRequirement(req, loc));
     break;
 
   case CheckRequirementResult::RequirementFailure:
@@ -316,7 +336,6 @@ static void desugarLayoutRequirement(
   switch (req.checkRequirement(subReqs)) {
   case CheckRequirementResult::Success:
   case CheckRequirementResult::PackRequirement:
-    errors.push_back(RequirementError::forRedundantRequirement(req, loc));
     break;
 
   case CheckRequirementResult::RequirementFailure:
@@ -349,6 +368,15 @@ static void desugarConformanceRequirement(
 
   // Fast path.
   if (constraintType->is<ProtocolType>()) {
+    // Diagnose attempts to introduce a value generic like 'let N: P' where 'P'
+    // is some protocol in either the defining context or in an extension where
+    // clause.
+    if (req.getFirstType()->isValueParameter()) {
+      errors.push_back(
+        RequirementError::forInvalidValueGenericConformance(req, loc));
+      return;
+    }
+
     if (req.getFirstType()->isTypeParameter()) {
       result.push_back(req);
       return;
@@ -359,7 +387,6 @@ static void desugarConformanceRequirement(
     case CheckRequirementResult::Success:
     case CheckRequirementResult::PackRequirement:
     case CheckRequirementResult::ConditionalConformance:
-      errors.push_back(RequirementError::forRedundantRequirement(req, loc));
       break;
 
     case CheckRequirementResult::RequirementFailure:
@@ -396,11 +423,8 @@ static void desugarConformanceRequirement(
         // Only permit type-parameter subjects.
         errors.push_back(
             RequirementError::forInvalidRequirementSubject(req, loc));
-      } else if (subject->isParameterPack()) {
-        // Disallow parameter packs for now.
-        errors.push_back(RequirementError::forInvalidInverseSubject(req, loc));
       } else {
-        // Record inverse.
+        // Record and desugar inverses.
         auto &ctx = req.getFirstType()->getASTContext();
         for (auto ip : compositionType->getInverses())
           inverses.push_back({req.getFirstType(),
@@ -473,17 +497,11 @@ void swift::rewriting::desugarRequirements(
   SmallVector<StructuralRequirement, 2> result;
   for (auto req : reqs) {
     SmallVector<Requirement, 2> desugaredReqs;
-    SmallVector<RequirementError, 2> ignoredErrors;
-
-    if (req.inferred)
-      desugarRequirement(req.req, SourceLoc(), desugaredReqs,
-                         inverses, ignoredErrors);
-    else
-      desugarRequirement(req.req, req.loc, desugaredReqs,
-                         inverses, errors);
+    desugarRequirement(req.req, req.loc, desugaredReqs,
+                       inverses, errors);
 
     for (auto desugaredReq : desugaredReqs)
-      result.push_back({desugaredReq, req.loc, req.inferred});
+      result.push_back({desugaredReq, req.loc});
   }
 
   std::swap(reqs, result);
@@ -528,11 +546,27 @@ static void realizeTypeRequirement(DeclContext *dc,
   if (constraintType->isConstraintType()) {
     result.push_back({Requirement(RequirementKind::Conformance,
                                   subjectType, constraintType),
-                      loc, /*wasInferred=*/false});
+                      loc});
   } else if (constraintType->getClassOrBoundGenericClass()) {
     result.push_back({Requirement(RequirementKind::Superclass,
                                   subjectType, constraintType),
-                      loc, /*wasInferred=*/false});
+                      loc});
+  } else if (subjectType->isValueParameter() && !isa<ExtensionDecl>(dc)) {
+    // This is a correct value generic definition where 'let N: Int'.
+    //
+    // Note: This definition is only valid in non-extension contexts. If we are
+    // in an extension context then the user has written something like:
+    // 'extension T where N: Int' which is weird and not supported.
+    if (constraintType->isLegalValueGenericType()) {
+      return;
+    }
+
+    // Otherwise, we're trying to define a value generic parameter with an
+    // unsupported type right now e.g. 'let N: UInt8'.
+    errors.push_back(
+        RequirementError::forInvalidValueGenericType(subjectType,
+                                                     constraintType,
+                                                     loc));
   } else {
     errors.push_back(
         RequirementError::forInvalidTypeRequirement(subjectType,
@@ -558,6 +592,9 @@ struct InferRequirementsWalker : public TypeWalker {
     // don't have enough info to do any useful substitutions.
     if (ty->is<UnboundGenericType>())
       return Action::Stop;
+
+    if (!ty->hasTypeParameter())
+      return Action::SkipNode;
 
     return Action::Continue;
   }
@@ -588,7 +625,7 @@ struct InferRequirementsWalker : public TypeWalker {
         if (skipRequirement(rawReq, decl))
           continue;
 
-        reqs.push_back({rawReq.subst(subMap), SourceLoc(), /*inferred=*/true});
+        reqs.push_back({rawReq.subst(subMap), SourceLoc()});
       }
 
       return Action::Continue;
@@ -604,7 +641,7 @@ struct InferRequirementsWalker : public TypeWalker {
       auto countType = packExpansion->getCountType();
       for (auto pack : packReferences)
         reqs.push_back({Requirement(RequirementKind::SameShape, countType, pack),
-                        SourceLoc(), /*inferred=*/true});
+                        SourceLoc()});
     }
 
     // Infer requirements from `@differentiable` function types.
@@ -618,7 +655,7 @@ struct InferRequirementsWalker : public TypeWalker {
       auto addConformanceConstraint = [&](Type type, ProtocolDecl *protocol) {
         reqs.push_back({Requirement(RequirementKind::Conformance, type,
                                     protocol->getDeclaredInterfaceType()),
-                        SourceLoc(), /*inferred=*/true});
+                        SourceLoc()});
       };
 
       auto &ctx = module->getASTContext();
@@ -627,12 +664,11 @@ struct InferRequirementsWalker : public TypeWalker {
       if (differentiableProtocol && fnTy->isDifferentiable()) {
         auto addSameTypeConstraint = [&](Type firstType,
                                          AssociatedTypeDecl *assocType) {
-          auto secondType = assocType->getDeclaredInterfaceType()
-              ->castTo<DependentMemberType>()
-              ->substBaseType(module, firstType);
+          auto conformance = lookupConformance(firstType, differentiableProtocol);
+          auto secondType = conformance.getTypeWitness(firstType, assocType);
           reqs.push_back({Requirement(RequirementKind::SameType,
                                       firstType, secondType),
-                          SourceLoc(), /*inferred=*/true});
+                          SourceLoc()});
         };
         auto *tangentVectorAssocType =
             differentiableProtocol->getAssociatedType(ctx.Id_TangentVector);
@@ -660,7 +696,9 @@ struct InferRequirementsWalker : public TypeWalker {
       }
     }
 
-    if (!ty->isSpecialized())
+    // Both is<ExistentialType>() and isSpecialized() end up being true if we
+    // have invalid code where a protocol is nested inside a generic nominal.
+    if (ty->is<ExistentialType>() || !ty->isSpecialized())
       return Action::Continue;
 
     // Infer from generic nominal types.
@@ -672,7 +710,7 @@ struct InferRequirementsWalker : public TypeWalker {
       return Action::Continue;
 
     /// Retrieve the substitution.
-    auto subMap = ty->getContextSubstitutionMap(module, decl);
+    auto subMap = ty->getContextSubstitutionMap(decl);
 
     // Handle the requirements.
     // FIXME: Inaccurate TypeReprs.
@@ -680,7 +718,7 @@ struct InferRequirementsWalker : public TypeWalker {
       if (skipRequirement(rawReq, decl))
         continue;
 
-      reqs.push_back({rawReq.subst(subMap), SourceLoc(), /*inferred=*/true});
+      reqs.push_back({rawReq.subst(subMap), SourceLoc()});
     }
 
     return Action::Continue;
@@ -697,8 +735,7 @@ struct InferRequirementsWalker : public TypeWalker {
 /// We automatically infer 'T : Hashable' from the fact that 'struct Set'
 /// declares a Hashable requirement on its generic parameter.
 void swift::rewriting::inferRequirements(
-    Type type, SourceLoc loc,
-    ModuleDecl *module, DeclContext *dc,
+    Type type, ModuleDecl *module, DeclContext *dc,
     SmallVectorImpl<StructuralRequirement> &result) {
   if (!type)
     return;
@@ -728,13 +765,8 @@ void swift::rewriting::realizeRequirement(
     auto secondType = req.getSecondType();
 
     if (shouldInferRequirements) {
-      auto firstLoc = (reqRepr ? reqRepr->getSubjectRepr()->getStartLoc()
-                               : SourceLoc());
-      inferRequirements(firstType, firstLoc, moduleForInference, dc, result);
-
-      auto secondLoc = (reqRepr ? reqRepr->getConstraintRepr()->getStartLoc()
-                                : SourceLoc());
-      inferRequirements(secondType, secondLoc, moduleForInference, dc, result);
+      inferRequirements(firstType, moduleForInference, dc, result);
+      inferRequirements(secondType, moduleForInference, dc, result);
     }
 
     realizeTypeRequirement(dc, firstType, secondType, loc, result, errors);
@@ -744,29 +776,23 @@ void swift::rewriting::realizeRequirement(
   case RequirementKind::Layout: {
     if (shouldInferRequirements) {
       auto firstType = req.getFirstType();
-      auto firstLoc = (reqRepr ? reqRepr->getSubjectRepr()->getStartLoc()
-                               : SourceLoc());
-      inferRequirements(firstType, firstLoc, moduleForInference, dc, result);
+      inferRequirements(firstType, moduleForInference, dc, result);
     }
 
-    result.push_back({req, loc, /*wasInferred=*/false});
+    result.push_back({req, loc});
     break;
   }
 
   case RequirementKind::SameType: {
     if (shouldInferRequirements) {
       auto firstType = req.getFirstType();
-      auto firstLoc = (reqRepr ? reqRepr->getFirstTypeRepr()->getStartLoc()
-                               : SourceLoc());
-      inferRequirements(firstType, firstLoc, moduleForInference, dc, result);
+      inferRequirements(firstType, moduleForInference, dc, result);
 
       auto secondType = req.getSecondType();
-      auto secondLoc = (reqRepr ? reqRepr->getSecondTypeRepr()->getStartLoc()
-                                : SourceLoc());
-      inferRequirements(secondType, secondLoc, moduleForInference, dc, result);
+      inferRequirements(secondType, moduleForInference, dc, result);
     }
 
-    result.push_back({req, loc, /*wasInferred=*/false});
+    result.push_back({req, loc});
     break;
   }
   }
@@ -779,13 +805,37 @@ void swift::rewriting::applyInverses(
     SmallVectorImpl<StructuralRequirement> &result,
     SmallVectorImpl<RequirementError> &errors) {
 
-  if (!ctx.LangOpts.hasFeature(Feature::NoncopyableGenerics))
+  // No inverses to even validate.
+  if (inverseList.empty())
     return;
 
-  // Summarize the inverses and flag ones that are incorrect.
+  const bool allowInverseOnAssocType =
+      ctx.LangOpts.hasFeature(Feature::SuppressedAssociatedTypes);
+
+  // Summarize the inverses and diagnose ones that are incorrect.
   llvm::DenseMap<CanType, InvertibleProtocolSet> inverses;
   for (auto inverse : inverseList) {
     auto canSubject = inverse.subject->getCanonicalType();
+
+    // Inverses on associated types are experimental.
+    if (!allowInverseOnAssocType && canSubject->is<DependentMemberType>()) {
+      // Special exception: allow if we're building the stdlib.
+      if (!ctx.MainModule->isStdlibModule()) {
+        errors.push_back(RequirementError::forInvalidInverseSubject(inverse));
+        continue;
+      }
+    }
+
+    // Noncopyable checking support for parameter packs is not implemented yet.
+    if (canSubject->isParameterPack()) {
+      errors.push_back(RequirementError::forInvalidInverseSubject(inverse));
+      continue;
+    }
+
+    // Value generics never have inverse requirements (or the positive thereof).
+    if (canSubject->isValueParameter()) {
+      continue;
+    }
 
     // WARNING: possible quadratic behavior, but should be OK in practice.
     auto notInScope = llvm::none_of(gps, [=](Type t) {
@@ -810,15 +860,17 @@ void swift::rewriting::applyInverses(
 
     // Check if this inverse has already been seen.
     auto inverseKind = inverse.getKind();
-    if (state.contains(inverseKind)) {
-      errors.push_back(
-          RequirementError::forRedundantInverseRequirement(inverse));
+    if (state.contains(inverseKind))
       continue;
-    }
 
     state.insert(inverseKind);
     inverses[canSubject] = state;
   }
+
+  // Fast-path: if there are no valid inverses, then there are no requirements
+  // to be removed.
+  if (inverses.empty())
+    return;
 
   // Scan the structural requirements and cancel out any inferred requirements
   // based on the inverses we saw.
@@ -828,20 +880,10 @@ void swift::rewriting::applyInverses(
     if (req.getKind() != RequirementKind::Conformance)
       return false;
 
-    // Only consider requirements from defaults-expansion...
-    if (!structReq.fromDefault)
+    // Only consider requirements involving an invertible protocol.
+    auto proto = req.getProtocolDecl()->getInvertibleProtocolKind();
+    if (!proto)
       return false;
-
-    // involving an invertible protocol.
-    llvm::Optional<InvertibleProtocolKind> proto;
-    if (auto kp = req.getProtocolDecl()->getKnownProtocolKind())
-      if (auto ip = getInvertibleProtocolKind(*kp))
-        proto = *ip;
-
-    if (!proto) {
-      assert(false && "suspicious!");
-      return false;
-    }
 
     // See if this subject is in-scope.
     auto subject = req.getFirstType()->getCanonicalType();
@@ -872,21 +914,13 @@ void swift::rewriting::realizeInheritedRequirements(
 
     if (!inheritedType) continue;
 
-    // Ignore trivially circular protocol refinement (protocol P : P)
-    // since we diagnose that elsewhere. Adding a rule here would emit
-    // a useless redundancy warning.
-    if (auto *protoDecl = dyn_cast<ProtocolDecl>(decl)) {
-      if (inheritedType->isEqual(protoDecl->getDeclaredInterfaceType()))
-        continue;
+    if (shouldInferRequirements) {
+      inferRequirements(inheritedType, moduleForInference,
+                        decl->getInnermostDeclContext(), result);
     }
 
     auto *typeRepr = inheritedTypes.getTypeRepr(index);
     SourceLoc loc = (typeRepr ? typeRepr->getStartLoc() : SourceLoc());
-
-    if (shouldInferRequirements) {
-      inferRequirements(inheritedType, loc, moduleForInference,
-                        decl->getInnermostDeclContext(), result);
-    }
 
     realizeTypeRequirement(dc, type, inheritedType, loc, result, errors);
   }
@@ -911,14 +945,16 @@ void swift::rewriting::realizeInheritedRequirements(
 ArrayRef<StructuralRequirement>
 StructuralRequirementsRequest::evaluate(Evaluator &evaluator,
                                         ProtocolDecl *proto) const {
-  assert(!proto->hasLazyRequirementSignature());
+  ASSERT(!proto->hasLazyRequirementSignature());
 
   SmallVector<StructuralRequirement, 2> result;
   SmallVector<RequirementError, 2> errors;
   SmallVector<InverseRequirement> inverses;
 
   SmallVector<Type, 4> needsDefaultRequirements;
-  InverseRequirement::enumerateDefaultedParams(proto, needsDefaultRequirements);
+  needsDefaultRequirements.push_back(proto->getSelfInterfaceType());
+  for (auto *assocTypeDecl : proto->getAssociatedTypeMembers())
+    needsDefaultRequirements.push_back(assocTypeDecl->getDeclaredInterfaceType());
 
   auto &ctx = proto->getASTContext();
   auto selfTy = proto->getSelfInterfaceType();
@@ -941,7 +977,7 @@ StructuralRequirementsRequest::evaluate(Evaluator &evaluator,
       result.push_back({
           Requirement(RequirementKind::Conformance,
                       selfTy, inheritedProto->getDeclaredInterfaceType()),
-          SourceLoc(), /*wasInferred=*/false});
+          SourceLoc()});
     }
   }
 
@@ -960,11 +996,14 @@ StructuralRequirementsRequest::evaluate(Evaluator &evaluator,
     auto layout = LayoutConstraint::getLayoutConstraint(
         LayoutConstraintKind::Class, ctx);
     result.push_back({Requirement(RequirementKind::Layout, selfTy, layout),
-                      proto->getLoc(), /*inferred=*/true});
+                      SourceLoc()});
 
     desugarRequirements(result, inverses, errors);
-    InverseRequirement::expandDefaults(ctx, needsDefaultRequirements, result);
-    applyInverses(ctx, needsDefaultRequirements, inverses, result, errors);
+
+    SmallVector<StructuralRequirement, 2> defaults;
+    InverseRequirement::expandDefaults(ctx, needsDefaultRequirements, defaults);
+    applyInverses(ctx, needsDefaultRequirements, inverses, defaults, errors);
+    result.append(defaults);
 
     diagnoseRequirementErrors(ctx, errors,
                               AllowConcreteTypePolicy::NestedAssocTypes);
@@ -1002,38 +1041,43 @@ StructuralRequirementsRequest::evaluate(Evaluator &evaluator,
     // DependentMemberType X, and the right hand side is the
     // underlying type of the typealias.
     if (auto *typeAliasDecl = dyn_cast<TypeAliasDecl>(decl)) {
-      if (!typeAliasDecl->isGeneric()) {
-        // Ignore the typealias if we have an associated type with the same name
-        // in the same protocol. This is invalid anyway, but it's just here to
-        // ensure that we produce the same requirement signature on some tests
-        // with -requirement-machine-protocol-signatures=verify.
-        if (assocTypes.contains(typeAliasDecl->getName()))
-          continue;
+      if (typeAliasDecl->isGeneric())
+        continue;
 
-        // The structural type of a typealias will always be a TypeAliasType,
-        // so unwrap it to avoid a requirement that prints as 'Self.T == Self.T'
-        // in diagnostics.
-        auto underlyingType = typeAliasDecl->getStructuralType();
-        if (auto *aliasType = dyn_cast<TypeAliasType>(underlyingType.getPointer()))
-          underlyingType = aliasType->getSinglyDesugaredType();
+      // Ignore the typealias if we have an associated type with the same name
+      // in the same protocol. This is invalid anyway, but it's just here to
+      // ensure that we produce the same requirement signature on some tests
+      // with -requirement-machine-protocol-signatures=verify.
+      if (assocTypes.contains(typeAliasDecl->getName()))
+        continue;
 
-        if (underlyingType->is<UnboundGenericType>())
-          continue;
+      // The structural type of a typealias will always be a TypeAliasType,
+      // so unwrap it to avoid a requirement that prints as 'Self.T == Self.T'
+      // in diagnostics.
+      auto underlyingType = typeAliasDecl->getStructuralType();
+      if (underlyingType->is<UnboundGenericType>())
+        continue;
 
-        auto subjectType = DependentMemberType::get(
-            selfTy, typeAliasDecl->getName());
-        Requirement req(RequirementKind::SameType, subjectType,
-                        underlyingType);
-        result.push_back({req, typeAliasDecl->getLoc(),
-                          /*inferred=*/false});
-      }
+      auto subjectType = DependentMemberType::get(
+          selfTy, typeAliasDecl->getName());
+      Requirement req(RequirementKind::SameType, subjectType,
+                      underlyingType);
+      result.push_back({req, typeAliasDecl->getLoc()});
     }
   }
 
   desugarRequirements(result, inverses, errors);
 
-  InverseRequirement::expandDefaults(ctx, needsDefaultRequirements, result);
-  applyInverses(ctx, needsDefaultRequirements, inverses, result, errors);
+  SmallVector<StructuralRequirement, 2> defaults;
+  // We do not expand defaults for invertible protocols themselves.
+  // HACK: We don't expand for Sendable either. This shouldn't be needed after
+  // Swift 6.0
+  if (!proto->getInvertibleProtocolKind()
+      && !proto->isSpecificProtocol(KnownProtocolKind::Sendable))
+    InverseRequirement::expandDefaults(ctx, needsDefaultRequirements, defaults);
+
+  applyInverses(ctx, needsDefaultRequirements, inverses, defaults, errors);
+  result.append(defaults);
 
   diagnoseRequirementErrors(ctx, errors,
                             AllowConcreteTypePolicy::NestedAssocTypes);
@@ -1057,7 +1101,7 @@ TypeAliasRequirementsRequest::evaluate(Evaluator &evaluator,
   if (proto->isObjC())
     return ArrayRef<Requirement>();
 
-  assert(!proto->hasLazyRequirementSignature());
+  ASSERT(!proto->hasLazyRequirementSignature());
 
   SmallVector<Requirement, 2> result;
   SmallVector<RequirementError, 2> errors;
@@ -1067,33 +1111,38 @@ TypeAliasRequirementsRequest::evaluate(Evaluator &evaluator,
 
   auto getStructuralType = [](TypeDecl *typeDecl) -> Type {
     if (auto typealias = dyn_cast<TypeAliasDecl>(typeDecl)) {
-      if (typealias->getUnderlyingTypeRepr() != nullptr) {
-        auto type = typealias->getStructuralType();
-        if (auto *aliasTy = cast<TypeAliasType>(type.getPointer()))
-          return aliasTy->getSinglyDesugaredType();
-        return type;
-      }
+      // If the type alias was parsed from a user-written type representation,
+      // request a structural type to avoid unnecessary type checking work.
+      if (typealias->getUnderlyingTypeRepr() != nullptr)
+        return typealias->getStructuralType();
       return typealias->getUnderlyingType();
     }
 
     return typeDecl->getDeclaredInterfaceType();
   };
 
+  auto isSuitableType = [&](TypeDecl *req) -> bool {
+    // Ignore generic types.
+    if (auto genReq = dyn_cast<GenericTypeDecl>(req))
+      if (genReq->isGeneric())
+        return false;
+
+    // Ignore typealiases with UnboundGenericType, since they
+    // are like generic typealiases.
+    if (auto *typeAlias = dyn_cast<TypeAliasDecl>(req))
+      if (getStructuralType(typeAlias)->is<UnboundGenericType>())
+        return false;
+
+    return true;
+  };
+
   // Collect all typealiases from inherited protocols recursively.
   llvm::MapVector<Identifier, TinyPtrVector<TypeDecl *>> inheritedTypeDecls;
-  for (auto *inheritedProto : ctx.getRewriteContext().getInheritedProtocols(proto)) {
+  for (auto *inheritedProto : proto->getAllInheritedProtocols()) {
     for (auto req : inheritedProto->getMembers()) {
       if (auto *typeReq = dyn_cast<TypeDecl>(req)) {
-        // Ignore generic types.
-        if (auto genReq = dyn_cast<GenericTypeDecl>(req))
-          if (genReq->getGenericParams())
-            continue;
-
-        // Ignore typealiases with UnboundGenericType, since they
-        // are like generic typealiases.
-        if (auto *typeAlias = dyn_cast<TypeAliasDecl>(req))
-          if (getStructuralType(typeAlias)->is<UnboundGenericType>())
-            continue;
+        if (!isSuitableType(typeReq))
+          continue;
 
         inheritedTypeDecls[typeReq->getName()].push_back(typeReq);
       }
@@ -1103,10 +1152,13 @@ TypeAliasRequirementsRequest::evaluate(Evaluator &evaluator,
   // An inferred same-type requirement between the two type declarations
   // within this protocol or a protocol it inherits.
   auto recordInheritedTypeRequirement = [&](TypeDecl *first, TypeDecl *second) {
-    desugarRequirement(Requirement(RequirementKind::SameType,
-                                   getStructuralType(first),
-                                   getStructuralType(second)),
-                               SourceLoc(), result, ignoredInverses, errors);
+    auto firstType = getStructuralType(first);
+    auto secondType = getStructuralType(second);
+    ASSERT(!firstType->is<UnboundGenericType>());
+    ASSERT(!secondType->is<UnboundGenericType>());
+
+    desugarRequirement(Requirement(RequirementKind::SameType, firstType, secondType),
+                       SourceLoc(), result, ignoredInverses, errors);
   };
 
   // Local function to find the insertion point for the protocol's "where"
@@ -1232,25 +1284,31 @@ TypeAliasRequirementsRequest::evaluate(Evaluator &evaluator,
       const auto name = inherited.first;
       for (auto found : proto->lookupDirect(name)) {
         // We only want concrete type declarations.
-        auto type = dyn_cast<TypeDecl>(found);
-        if (!type || isa<AssociatedTypeDecl>(type)) continue;
+        auto typeReq = dyn_cast<TypeDecl>(found);
+        if (!typeReq || isa<AssociatedTypeDecl>(typeReq)) continue;
 
         // Ignore nominal types. They're always invalid declarations.
-        if (isa<NominalTypeDecl>(type))
+        if (isa<NominalTypeDecl>(typeReq))
+          continue;
+
+        // Ignore generic type aliases.
+        if (!isSuitableType(typeReq))
           continue;
 
         // ... from the same module as the protocol.
-        if (type->getModuleContext() != proto->getModuleContext()) continue;
+        if (typeReq->getModuleContext() != proto->getModuleContext()) continue;
 
         // Ignore types defined in constrained extensions; their equivalence
         // to the associated type would have to be conditional, which we cannot
         // model.
-        if (auto ext = dyn_cast<ExtensionDecl>(type->getDeclContext())) {
+        if (auto ext = dyn_cast<ExtensionDecl>(typeReq->getDeclContext())) {
           // FIXME: isConstrainedExtension() can cause request cycles because it
           // computes a generic signature. getTrailingWhereClause() should be good
           // enough for protocol extensions, which cannot specify constraints in
           // any other way right now (eg, via requirement inference or by
           // extending a bound generic type).
+          //
+          // FIXME: Protocol extensions with noncopyable generics can!
           if (ext->getTrailingWhereClause()) continue;
         }
 
@@ -1263,19 +1321,19 @@ TypeAliasRequirementsRequest::evaluate(Evaluator &evaluator,
                 dyn_cast<AssociatedTypeDecl>(inheritedType)) {
             // Infer a same-type requirement between the typealias' underlying
             // type and the inherited associated type.
-            recordInheritedTypeRequirement(inheritedAssocTypeDecl, type);
+            recordInheritedTypeRequirement(inheritedAssocTypeDecl, typeReq);
 
             // Warn that one should use where clauses for this.
             if (shouldWarnAboutRedeclaration) {
               auto inheritedFromProto = inheritedAssocTypeDecl->getProtocol();
               auto fixItWhere = getProtocolWhereLoc();
-              ctx.Diags.diagnose(type,
+              ctx.Diags.diagnose(typeReq,
                                  diag::typealias_override_associated_type,
                                  name,
                                  inheritedFromProto->getDeclaredInterfaceType())
                 .fixItInsertAfter(fixItWhere.Loc,
-                                  getConcreteTypeReq(type, fixItWhere.Item))
-                .fixItRemove(type->getSourceRange());
+                                  getConcreteTypeReq(typeReq, fixItWhere.Item))
+                .fixItRemove(typeReq->getSourceRange());
               ctx.Diags.diagnose(inheritedAssocTypeDecl, diag::decl_declared_here,
                                  inheritedAssocTypeDecl);
 
@@ -1286,7 +1344,7 @@ TypeAliasRequirementsRequest::evaluate(Evaluator &evaluator,
           }
 
           // Two typealiases that should be the same.
-          recordInheritedTypeRequirement(inheritedType, type);
+          recordInheritedTypeRequirement(inheritedType, typeReq);
         }
 
         // We can remove this entry.

@@ -1,8 +1,6 @@
 // RUN: %target-swift-frontend -disable-availability-checking -swift-version 6 %s -emit-sil -o /dev/null -verify
-// RUN: %target-swift-frontend -disable-availability-checking -swift-version 6 %s -emit-sil -o /dev/null -verify -enable-experimental-feature RegionBasedIsolation
 
 // REQUIRES: concurrency
-// REQUIRES: asserts
 
 @preconcurrency func unsafelySendableClosure(_ closure: @Sendable () -> Void) { }
 
@@ -26,30 +24,30 @@ struct X {
 @MainActor func onMainActor() { }
 
 func testInAsync(x: X) async {
-  let _: Int = unsafelySendableClosure // expected-error{{type '(@Sendable () -> Void) -> ()'}}
-  let _: Int = unsafelyMainActorClosure // expected-error{{type '(@MainActor () -> Void) -> ()'}}
-  let _: Int = unsafelyDoEverythingClosure // expected-error{{type '(@MainActor @Sendable () -> Void) -> ()'}}
-  let _: Int = x.unsafelyDoEverythingClosure // expected-error{{type '(@MainActor @Sendable () -> Void) -> ()'}}
-  let _: Int = X.unsafelyDoEverythingClosure // expected-error{{type '(X) -> (@MainActor @Sendable () -> Void) -> ()'}}
-  let _: Int = (X.unsafelyDoEverythingClosure)(x) // expected-error{{type '(@MainActor @Sendable () -> Void) -> ()'}}
+  let _: Int = unsafelySendableClosure // expected-error{{type '@Sendable (@Sendable () -> Void) -> ()'}}
+  let _: Int = unsafelyMainActorClosure // expected-error{{type '@Sendable (@MainActor @Sendable () -> Void) -> ()'}}
+  let _: Int = unsafelyDoEverythingClosure // expected-error{{type '@Sendable (@MainActor @Sendable () -> Void) -> ()'}}
+  let _: Int = x.unsafelyDoEverythingClosure // expected-error{{type '@Sendable (@MainActor @Sendable () -> Void) -> ()'}}
+  let _: Int = X.unsafelyDoEverythingClosure // expected-error{{type '@Sendable (X) -> @Sendable (@MainActor @Sendable () -> Void) -> ()'}}
+  let _: Int = (X.unsafelyDoEverythingClosure)(x) // expected-error{{type '@Sendable (@MainActor @Sendable () -> Void) -> ()'}}
 
   let _: Int = x.sendableVar // expected-error{{type '@Sendable () -> Void'}}
-  let _: Int = x.mainActorVar // expected-error{{type '@MainActor () -> Void'}}
+  let _: Int = x.mainActorVar // expected-error{{type '@MainActor @Sendable () -> Void'}}
 
   let _: Int = x[{ onMainActor() }] // expected-error{{type '@Sendable () -> Void'}}
   let _: Int = X[statically: { onMainActor() }] // expected-error{{type '@Sendable () -> Void'}}
 }
 
 func testElsewhere(x: X) {
-  let _: Int = unsafelySendableClosure // expected-error{{type '(@Sendable () -> Void) -> ()'}}
-  let _: Int = unsafelyMainActorClosure // expected-error{{type '(@MainActor () -> Void) -> ()'}}
-  let _: Int = unsafelyDoEverythingClosure // expected-error{{type '(@MainActor @Sendable () -> Void) -> ()'}}
-  let _: Int = x.unsafelyDoEverythingClosure // expected-error{{type '(@MainActor @Sendable () -> Void) -> ()'}}
-  let _: Int = X.unsafelyDoEverythingClosure // expected-error{{type '(X) -> (@MainActor @Sendable () -> Void) -> ()'}}
-  let _: Int = (X.unsafelyDoEverythingClosure)(x) // expected-error{{type '(@MainActor @Sendable () -> Void) -> ()'}}
+  let _: Int = unsafelySendableClosure // expected-error{{type '@Sendable (@Sendable () -> Void) -> ()'}}
+  let _: Int = unsafelyMainActorClosure // expected-error{{type '@Sendable (@MainActor @Sendable () -> Void) -> ()'}}
+  let _: Int = unsafelyDoEverythingClosure // expected-error{{type '@Sendable (@MainActor @Sendable () -> Void) -> ()'}}
+  let _: Int = x.unsafelyDoEverythingClosure // expected-error{{type '@Sendable (@MainActor @Sendable () -> Void) -> ()'}}
+  let _: Int = X.unsafelyDoEverythingClosure // expected-error{{type '@Sendable (X) -> @Sendable (@MainActor @Sendable () -> Void) -> ()'}}
+  let _: Int = (X.unsafelyDoEverythingClosure)(x) // expected-error{{type '@Sendable (@MainActor @Sendable () -> Void) -> ()'}}
 
   let _: Int = x.sendableVar // expected-error{{type '@Sendable () -> Void'}}
-  let _: Int = x.mainActorVar // expected-error{{type '@MainActor () -> Void'}}
+  let _: Int = x.mainActorVar // expected-error{{type '@MainActor @Sendable () -> Void'}}
 
   let _: Int = x[{ onMainActor() }] // expected-error{{type '@Sendable () -> Void'}}
   let _: Int = X[statically: { onMainActor() }] // expected-error{{type '@Sendable () -> Void'}}
@@ -59,18 +57,18 @@ func testElsewhere(x: X) {
 // expected-note@-1{{are implicitly asynchronous}}
 
 @preconcurrency @MainActor class MyModelClass {
- // expected-note@-1{{are implicitly asynchronous}}
  func f() { }
   // expected-note@-1{{are implicitly asynchronous}}
 }
 
 func testCalls(x: X) {
-  // expected-note@-1 3{{add '@MainActor' to make global function 'testCalls(x:)' part of global actor 'MainActor'}}
+  // expected-note@-1 2{{add '@MainActor' to make global function 'testCalls(x:)' part of global actor 'MainActor'}}
   onMainActorAlways() // expected-error{{call to main actor-isolated global function 'onMainActorAlways()' in a synchronous nonisolated context}}
 
-  let _: () -> Void = onMainActorAlways // expected-error{{converting function value of type '@MainActor () -> ()' to '() -> Void' loses global actor 'MainActor'}}
+  let _: () -> Void = onMainActorAlways // expected-error{{converting function value of type '@MainActor @Sendable () -> ()' to '() -> Void' loses global actor 'MainActor'}}
 
-  let c = MyModelClass() // expected-error{{call to main actor-isolated initializer 'init()' in a synchronous nonisolated context}}
+  let c = MyModelClass() // okay, synthesized init() is 'nonisolated'
+
   c.f() // expected-error{{call to main actor-isolated instance method 'f()' in a synchronous nonisolated context}}
 }
 
@@ -78,10 +76,10 @@ func testCallsWithAsync() async {
   onMainActorAlways() // expected-error{{expression is 'async' but is not marked with 'await'}}
   // expected-note@-1{{calls to global function 'onMainActorAlways()' from outside of its actor context are implicitly asynchronous}}
 
-  let _: () -> Void = onMainActorAlways // expected-error{{converting function value of type '@MainActor () -> ()' to '() -> Void' loses global actor 'MainActor'}}
+  let _: () -> Void = onMainActorAlways // expected-error{{converting function value of type '@MainActor @Sendable () -> ()' to '() -> Void' loses global actor 'MainActor'}}
 
-  let c = MyModelClass() // expected-error{{expression is 'async' but is not marked with 'await'}}
-  // expected-note@-1{{calls to initializer 'init()' from outside of its actor context are implicitly asynchronous}}
+  let c = MyModelClass() // okay, synthesized init() is 'nonisolated'
+
   c.f() // expected-error{{expression is 'async' but is not marked with 'await'}}
   // expected-note@-1{{calls to instance method 'f()' from outside of its actor context are implicitly asynchronous}}
 }
@@ -114,3 +112,71 @@ func aFailedExperiment(@_unsafeSendable _ body: @escaping () -> Void) { }
 
 func anothingFailedExperiment(@_unsafeMainActor _ body: @escaping () -> Void) { }
 // expected-warning@-1{{'_unsafeMainActor' attribute has been removed in favor of @preconcurrency}}
+
+// Override matching with @preconcurrency properties.
+do {
+  class Base {
+    @preconcurrency
+    open var test1 : ([any Sendable])? // expected-note {{overridden declaration is here}}
+
+    @preconcurrency
+    open var test2: [String: [Int: any Sendable]] // expected-note {{overridden declaration is here}}
+
+    @preconcurrency
+    open var test3: any Sendable // expected-note {{overridden declaration is here}}
+
+    @preconcurrency
+    open var test4: (((Any)?) -> Void)? { // expected-note {{overridden declaration is here}}
+      nil
+    }
+
+    @preconcurrency
+    open var test5: (@MainActor () -> Void)? { // expected-note {{overridden declaration is here}}
+      nil
+    }
+
+    @preconcurrency
+    func test6(_: (@MainActor () -> Void)? = nil) { // expected-note {{overridden declaration is here}}
+    }
+
+    init() {
+      self.test1 = nil
+      self.test2 = [:]
+      self.test3 = 42
+    }
+  }
+
+  class Test : Base {
+    override var test1: [Any]? {
+      // expected-error@-1 {{declaration 'test1' has a type with different sendability from any potential overrides}}
+      get { nil }
+      set { }
+    }
+
+    override var test2: [String: [Int: Any]] {
+      // expected-error@-1 {{declaration 'test2' has a type with different sendability from any potential overrides}}
+      get { [:] }
+      set {}
+    }
+
+    override var test3: Any {
+      // expected-error@-1 {{declaration 'test3' has a type with different sendability from any potential overrides}}
+      get { 42 }
+      set { }
+    }
+
+    override var test4: (((any Sendable)?) -> Void)? {
+      // expected-error@-1 {{declaration 'test4' has a type with different sendability from any potential overrides}}
+      nil
+    }
+
+    override var test5: (() -> Void)? {
+      // expected-error@-1 {{declaration 'test5' has a type with different global actor isolation from any potential overrides}}
+      nil
+    }
+
+    override func test6(_: (() -> Void)?) {
+      // expected-error@-1 {{declaration 'test6' has a type with different global actor isolation from any potential overrides}}
+    }
+  }
+}

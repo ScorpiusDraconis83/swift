@@ -15,13 +15,18 @@
 // declaration of members (such as constructors).
 //
 //===----------------------------------------------------------------------===//
+
+#include "TypeCheckAvailability.h"
 #include "TypeChecker.h"
 #include "TypoCorrection.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/Initializer.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/NameLookupRequests.h"
 #include "swift/AST/ProtocolConformance.h"
+#include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/TopCollection.h"
 #include <algorithm>
 
@@ -152,8 +157,7 @@ namespace {
 
       // Dig out the protocol conformance.
       auto *foundProto = cast<ProtocolDecl>(foundDC);
-      auto conformance = DC->getParentModule()->lookupConformance(
-          conformingType, foundProto);
+      auto conformance = lookupConformance(conformingType, foundProto);
       if (conformance.isInvalid()) {
         if (foundInType->isExistentialType()) {
           // If there's no conformance, we have an existential
@@ -219,6 +223,8 @@ convertToUnqualifiedLookupOptions(NameLookupOptions options) {
     newOptions |= UnqualifiedLookupFlags::IncludeUsableFromInline;
   if (options.contains(NameLookupFlags::ExcludeMacroExpansions))
     newOptions |= UnqualifiedLookupFlags::ExcludeMacroExpansions;
+  if (options.contains(NameLookupFlags::IgnoreMissingImports))
+    newOptions |= UnqualifiedLookupFlags::IgnoreMissingImports;
 
   return newOptions;
 }
@@ -322,6 +328,8 @@ LookupResult TypeChecker::lookupMember(DeclContext *dc,
   NLOptions subOptions = (NL_QualifiedDefault | NL_ProtocolMembers);
   if (options.contains(NameLookupFlags::IgnoreAccessControl))
     subOptions |= NL_IgnoreAccessControl;
+  if (options.contains(NameLookupFlags::IgnoreMissingImports))
+    subOptions |= NL_IgnoreMissingImports;
 
   // We handle our own overriding/shadowing filtering.
   subOptions &= ~NL_RemoveOverridden;
@@ -418,6 +426,8 @@ LookupTypeResult TypeChecker::lookupMemberType(DeclContext *dc,
 
   if (options.contains(NameLookupFlags::IgnoreAccessControl))
     subOptions |= NL_IgnoreAccessControl;
+  if (options.contains(NameLookupFlags::IgnoreMissingImports))
+    subOptions |= NL_IgnoreMissingImports;
   if (options.contains(NameLookupFlags::IncludeUsableFromInline))
     subOptions |= NL_IncludeUsableFromInline;
 
@@ -473,8 +483,7 @@ LookupTypeResult TypeChecker::lookupMemberType(DeclContext *dc,
     }
 
     // Substitute the base into the member's type.
-    auto memberType = substMemberTypeWithBase(dc->getParentModule(),
-                                              typeDecl, type);
+    auto memberType = substMemberTypeWithBase(typeDecl, type);
 
     // If we haven't seen this type result yet, add it to the result set.
     if (types.insert(memberType->getCanonicalType()).second)
@@ -489,20 +498,22 @@ LookupTypeResult TypeChecker::lookupMemberType(DeclContext *dc,
       // member entirely.
       auto *protocol = cast<ProtocolDecl>(assocType->getDeclContext());
 
-      auto conformance = dc->getParentModule()->lookupConformance(type, protocol);
+      auto conformance = lookupConformance(type, protocol);
       if (!conformance) {
         // FIXME: This is an error path. Should we try to recover?
         continue;
       }
 
       // Use the type witness.
-      auto concrete = conformance.getConcrete();
+      auto *concrete = conformance.getConcrete();
+      auto *normal = concrete->getRootNormalConformance();
 
       // This is the only case where NormalProtocolConformance::
       // getTypeWitnessAndDecl() returns a null type.
-      if (concrete->getState() ==
-          ProtocolConformanceState::CheckingTypeWitnesses)
+      if (dc->getASTContext().evaluator.hasActiveRequest(
+            ResolveTypeWitnessesRequest{normal})) {
         continue;
+      }
 
       auto *typeDecl =
         concrete->getTypeWitnessAndDecl(assocType).getWitnessDecl();
@@ -512,7 +523,7 @@ LookupTypeResult TypeChecker::lookupMemberType(DeclContext *dc,
         continue;
 
       auto memberType =
-          substMemberTypeWithBase(dc->getParentModule(), typeDecl, type);
+          substMemberTypeWithBase(typeDecl, type);
       if (types.insert(memberType->getCanonicalType()).second)
         result.addResult({typeDecl, memberType, assocType});
     }
@@ -542,7 +553,7 @@ unsigned TypeChecker::getCallEditDistance(DeclNameRef writtenName,
 
   // Don't typo-correct to a name with a leading underscore unless the typed
   // name also begins with an underscore.
-  if (correctedBase.startswith("_") && !writtenBase.startswith("_")) {
+  if (correctedBase.starts_with("_") && !writtenBase.starts_with("_")) {
     return UnreasonableCallEditDistance;
   }
 
@@ -581,6 +592,10 @@ void TypeChecker::performTypoCorrection(DeclContext *DC, DeclRefKind refKind,
                                         TypoCorrectionResults &corrections,
                                         GenericSignature genericSig,
                                         unsigned maxResults) {
+  // Even when typo correction is disabled, we want to make sure people are
+  // calling into it the right way.
+  assert(!baseTypeOrNull || !baseTypeOrNull->hasTypeParameter() || genericSig);
+
   // Disable typo-correction if we won't show the diagnostic anyway or if
   // we've hit our typo correction limit.
   auto &Ctx = DC->getASTContext();
@@ -623,8 +638,8 @@ void TypeChecker::performTypoCorrection(DeclContext *DC, DeclRefKind refKind,
                              /*includeProtocolExtensionMembers*/true,
                              genericSig);
   } else {
-    lookupVisibleDecls(consumer, DC, /*top level*/ true,
-                       corrections.Loc.getBaseNameLoc());
+    lookupVisibleDecls(consumer, corrections.Loc.getBaseNameLoc(), DC,
+                       /*top level*/ true);
   }
 
   // Impose a maximum distance from the best score.
@@ -709,7 +724,7 @@ void SyntacticTypoCorrection::addFixits(InFlightDiagnostic &diagnostic) const {
   // because of the reordering rules.
 }
 
-llvm::Optional<SyntacticTypoCorrection>
+std::optional<SyntacticTypoCorrection>
 TypoCorrectionResults::claimUniqueCorrection() {
   // Look for a unique base name.  We ignore the rest of the name for now
   // because we don't actually typo-correct any of that.
@@ -724,20 +739,178 @@ TypoCorrectionResults::claimUniqueCorrection() {
     // If this is a different name from the last candidate, we don't have
     // a unique correction.
     else if (uniqueCorrectedName != candidateName)
-      return llvm::None;
+      return std::nullopt;
   }
 
   // If we didn't find any candidates, we're done.
   if (uniqueCorrectedName.empty())
-    return llvm::None;
+    return std::nullopt;
 
   // If the corrected name doesn't differ from the written name in its base
   // name, it's not simple enough for this (for now).
   if (WrittenName.getBaseName() == uniqueCorrectedName)
-    return llvm::None;
+    return std::nullopt;
 
   // Flag that we've claimed the correction.
   ClaimedCorrection = true;
 
   return SyntacticTypoCorrection(WrittenName, Loc, uniqueCorrectedName);
+}
+
+struct MissingImportFixItInfo {
+  OptionSet<ImportFlags> flags;
+  std::optional<AccessLevel> accessLevel;
+};
+
+class MissingImportFixItCache {
+  SourceFile &sf;
+  llvm::DenseMap<const ModuleDecl *, MissingImportFixItInfo> infos;
+
+public:
+  MissingImportFixItCache(SourceFile &sf) : sf(sf){};
+
+  MissingImportFixItInfo getInfo(const ModuleDecl *mod) {
+    auto existing = infos.find(mod);
+    if (existing != infos.end())
+      return existing->getSecond();
+
+    MissingImportFixItInfo info;
+
+    // Find imports of the defining module in other source files and aggregate
+    // the attributes and access level usage on those imports collectively. This
+    // information can be used to emit a fix-it that is consistent with
+    // how the module is imported in the rest of the module.
+    auto parentModule = sf.getParentModule();
+    bool foundImport = false;
+    bool anyImportHasAccessLevel = false;
+    for (auto file : parentModule->getFiles()) {
+      if (auto otherSF = dyn_cast<SourceFile>(file)) {
+        unsigned flagsInSourceFile = 0x0;
+        otherSF->forEachImportOfModule(
+            mod, [&](AttributedImport<ImportedModule> &import) {
+              foundImport = true;
+              anyImportHasAccessLevel |= import.accessLevelRange.isValid();
+              flagsInSourceFile |= import.options.toRaw();
+            });
+        info.flags |= ImportFlags(flagsInSourceFile);
+      }
+    }
+
+    // Add an appropriate access level as long as it would not conflict with
+    // existing imports that lack access levels.
+    if (!foundImport || anyImportHasAccessLevel)
+      info.accessLevel = sf.getMaxAccessLevelUsingImport(mod);
+
+    infos[mod] = info;
+    return info;
+  }
+};
+
+static void diagnoseMissingImportForMember(const ValueDecl *decl,
+                                           SourceFile *sf, SourceLoc loc) {
+  auto &ctx = sf->getASTContext();
+  auto definingModule = decl->getModuleContextForNameLookup();
+  ctx.Diags.diagnose(loc, diag::candidate_from_missing_import,
+                     decl->getDescriptiveKind(), decl->getName(),
+                     definingModule);
+}
+
+static void
+diagnoseAndFixMissingImportForMember(const ValueDecl *decl, SourceFile *sf,
+                                     SourceLoc loc,
+                                     MissingImportFixItCache &fixItCache) {
+
+  diagnoseMissingImportForMember(decl, sf, loc);
+
+  auto &ctx = sf->getASTContext();
+  auto definingModule = decl->getModuleContextForNameLookup();
+  SourceLoc bestLoc = ctx.Diags.getBestAddImportFixItLoc(decl, sf);
+  if (!bestLoc.isValid())
+    return;
+
+  llvm::SmallString<64> importText;
+
+  // Add flags that must be used consistently on every import in every file.
+  auto fixItInfo = fixItCache.getInfo(definingModule);
+  if (fixItInfo.flags.contains(ImportFlags::ImplementationOnly))
+    importText += "@_implementationOnly ";
+  if (fixItInfo.flags.contains(ImportFlags::WeakLinked))
+    importText += "@_weakLinked ";
+
+  auto explicitAccessLevel = fixItInfo.accessLevel;
+  bool isPublicImport =
+      explicitAccessLevel
+          ? *explicitAccessLevel >= AccessLevel::Public
+          : !ctx.LangOpts.hasFeature(Feature::InternalImportsByDefault);
+
+  // Add flags that are only appropriate on public imports.
+  if (isPublicImport) {
+    if (fixItInfo.flags.contains(ImportFlags::SPIOnly))
+      importText += "@_spiOnly ";
+  }
+
+  // Add @_spi groups if needed for the declaration.
+  if (decl->isSPI()) {
+    auto spiGroups = decl->getSPIGroups();
+    if (!spiGroups.empty()) {
+      importText += "@_spi(";
+      importText += spiGroups[0].str();
+      importText += ") ";
+    }
+  }
+
+  if (explicitAccessLevel) {
+    importText += getAccessLevelSpelling(*explicitAccessLevel);
+    importText += " ";
+  }
+
+  importText += "import ";
+  importText += definingModule->getName().str();
+  importText += "\n";
+  ctx.Diags.diagnose(bestLoc, diag::candidate_add_import, definingModule)
+      .fixItInsert(bestLoc, importText);
+}
+
+bool swift::maybeDiagnoseMissingImportForMember(const ValueDecl *decl,
+                                                const DeclContext *dc,
+                                                SourceLoc loc) {
+  if (dc->isDeclImported(decl))
+    return false;
+
+  if (dc->getASTContext().LangOpts.EnableCXXInterop) {
+    // With Cxx interop enabled, there are some declarations that always belong
+    // to the Clang header import module which should always be implicitly
+    // visible. However, that module is not implicitly imported in source files
+    // so we need to special case it here and avoid diagnosing.
+    if (decl->getModuleContextForNameLookup()->isClangHeaderImportModule())
+      return false;
+  }
+
+  auto sf = dc->getParentSourceFile();
+  if (!sf)
+    return false;
+
+  auto &ctx = dc->getASTContext();
+
+  // In lazy typechecking mode just emit the diagnostic immediately without a
+  // fix-it since there won't be an opportunity to emit delayed diagnostics.
+  if (ctx.TypeCheckerOpts.EnableLazyTypecheck) {
+    diagnoseMissingImportForMember(decl, sf, loc);
+    return true;
+  }
+
+  sf->addDelayedMissingImportForMemberDiagnostic(decl, loc);
+  return false;
+}
+
+void swift::diagnoseMissingImports(SourceFile &sf) {
+  auto delayedDiags = sf.takeDelayedMissingImportForMemberDiagnostics();
+  auto fixItCache = MissingImportFixItCache(sf);
+
+  for (auto declAndLocs : delayedDiags) {
+    for (auto loc : declAndLocs.second) {
+      diagnoseAndFixMissingImportForMember(declAndLocs.first, &sf, loc,
+                                           fixItCache);
+    }
+  }
 }

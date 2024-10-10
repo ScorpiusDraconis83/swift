@@ -12,6 +12,7 @@
 
 #include "swift/SIL/SILConstants.h"
 #include "swift/AST/DiagnosticsSIL.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Demangling/Demangle.h"
 #include "swift/SIL/SILBuilder.h"
 #include "llvm/ADT/DenseSet.h"
@@ -145,7 +146,7 @@ void SymbolicValue::print(llvm::raw_ostream &os, unsigned indent) const {
     }
     os.indent(indent) << "] values: [\n";
     for (SymbolicClosureArgument closureArg : args) {
-      llvm::Optional<SymbolicValue> value = closureArg.second;
+      std::optional<SymbolicValue> value = closureArg.second;
       if (!value.has_value()) {
         os.indent(indent + 2) << "nil\n";
         continue;

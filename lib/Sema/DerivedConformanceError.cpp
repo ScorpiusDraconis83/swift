@@ -49,8 +49,7 @@ deriveBodyBridgedNSError_enum_nsErrorDomain(AbstractFunctionDecl *domainDecl,
   auto *argList = ArgumentList::forImplicitSingle(
       C, C.getIdentifier("reflecting"), selfRef);
   auto *initReflectingCall = CallExpr::createImplicit(C, stringType, argList);
-  auto ret =
-    new (C) ReturnStmt(SourceLoc(), initReflectingCall, /*implicit*/ true);
+  auto *ret = ReturnStmt::createImplicit(C, initReflectingCall);
 
   auto body = BraceStmt::create(C, SourceLoc(), ASTNode(ret), SourceLoc());
   return { body, /*isTypeChecked=*/false };
@@ -74,7 +73,7 @@ deriveBodyBridgedNSError_printAsObjCEnum_nsErrorDomain(
   StringRef value(C.AllocateCopy(getErrorDomainStringForObjC(ED)));
 
   auto string = new (C) StringLiteralExpr(value, SourceRange(), /*implicit*/ true);
-  auto ret = new (C) ReturnStmt(SourceLoc(), string, /*implicit*/ true);
+  auto *ret = ReturnStmt::createImplicit(C, SourceLoc(), string);
   auto body = BraceStmt::create(C, SourceLoc(),
                                 ASTNode(ret),
                                 SourceLoc());
@@ -99,13 +98,12 @@ deriveBridgedNSError_enum_nsErrorDomain(
   PatternBindingDecl *pbDecl;
   std::tie(propDecl, pbDecl) = derived.declareDerivedProperty(
       DerivedConformance::SynthesizedIntroducer::Var,
-      derived.Context.Id_nsErrorDomain, stringTy, stringTy, /*isStatic=*/true,
+      derived.Context.Id_nsErrorDomain, stringTy, /*isStatic=*/true,
       /*isFinal=*/true);
   addNonIsolatedToSynthesized(derived.Nominal, propDecl);
 
   // Define the getter.
-  auto getterDecl = derived.addGetterToReadOnlyDerivedProperty(
-      propDecl, stringTy);
+  auto getterDecl = derived.addGetterToReadOnlyDerivedProperty(propDecl);
   getterDecl->setBodySynthesizer(synthesizer);
 
   derived.addMembersToConformanceContext({propDecl, pbDecl});

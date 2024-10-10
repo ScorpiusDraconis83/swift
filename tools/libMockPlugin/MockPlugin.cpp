@@ -102,7 +102,7 @@ static const llvm::json::Value substitute(const llvm::json::Value &value,
   }
 
   auto str = value.getAsString();
-  if (!str || !str->startswith("=req")) {
+  if (!str || !str->starts_with("=req")) {
     // Not a substitution.
     return value;
   }
@@ -111,9 +111,9 @@ static const llvm::json::Value substitute(const llvm::json::Value &value,
   const llvm::json::Value *subst = &req;
   while (!path.empty()) {
     // '.' <alphanum> -> object key.
-    if (path.startswith(".")) {
+    if (path.starts_with(".")) {
       if (subst->kind() != llvm::json::Value::Object)
-        return "<substition error: not an object>";
+        return "<substitution error: not an object>";
       path = path.substr(1);
       auto keyLength =
           path.find_if([](char c) { return !llvm::isAlnum(c) && c != '_'; });
@@ -123,22 +123,22 @@ static const llvm::json::Value substitute(const llvm::json::Value &value,
       continue;
     }
     // '[' <digit>+ ']' -> array index.
-    if (path.startswith("[")) {
+    if (path.starts_with("[")) {
       if (subst->kind() != llvm::json::Value::Array)
-        return "<substition error: not an array>";
+        return "<substitution error: not an array>";
       path = path.substr(1);
       auto idxlength = path.find_if([](char c) { return !llvm::isDigit(c); });
       size_t idx;
       (void)path.slice(0, idxlength).getAsInteger(10, idx);
       subst = &(*subst->getAsArray())[idx];
       path = path.substr(idxlength);
-      if (!path.startswith("]"))
-        return "<substition error: missing ']' after digits>";
+      if (!path.starts_with("]"))
+        return "<substitution error: missing ']' after digits>";
       path = path.substr(1);
       continue;
     }
     // Malformed.
-    return "<substition error: malformed path>";
+    return "<substitution error: malformed path>";
   }
   return *subst;
 }
@@ -225,7 +225,7 @@ int TestRunner::run() {
     // Handle
     auto *item = findMatchItem(*request_obj);
     if (!item) {
-      llvm::errs() << "cound't find matching item for request: " << *request_obj
+      llvm::errs() << "couldn't find matching item for request: " << *request_obj
                    << "\n";
       return 1;
     }

@@ -71,7 +71,7 @@ void SourceLoader::collectVisibleTopLevelModuleNames(
   // TODO: Implement?
 }
 
-bool SourceLoader::canImportModule(ImportPath::Module path,
+bool SourceLoader::canImportModule(ImportPath::Module path, SourceLoc loc,
                                    ModuleVersionInfo *versionInfo,
                                    bool isTestableDependencyLookup) {
   // FIXME: Swift submodules?
@@ -157,11 +157,10 @@ void SourceLoader::loadExtensions(NominalTypeDecl *nominal,
 ModuleDependencyVector
 SourceLoader::getModuleDependencies(Identifier moduleName,
                                     StringRef moduleOutputPath,
-                                    llvm::IntrusiveRefCntPtr<llvm::cas::CachingOnDiskFileSystem> CacheFS,
                                     const llvm::DenseSet<clang::tooling::dependencies::ModuleID> &alreadySeenClangModules,
                                     clang::tooling::dependencies::DependencyScanningTool &clangScanningTool,
                                     InterfaceSubContextDelegate &delegate,
-                                    llvm::TreePathPrefixMapper* mapper,
+                                    llvm::PrefixMapper* mapper,
                                     bool isTestableImport) {
   // FIXME: Implement?
   return {};

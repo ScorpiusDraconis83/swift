@@ -42,9 +42,11 @@ generate_revision_inc(llvm_revision_inc LLVM "${LLVM_MAIN_SRC_DIR}")
 generate_revision_inc(swift_revision_inc Swift "${SWIFT_SOURCE_DIR}")
 
 add_swift_host_library(swiftBasic STATIC
+  Assertions.cpp
   BasicBridging.cpp
   BasicSourceInfo.cpp
   Cache.cpp
+  CASOptions.cpp
   ClusteredBitVector.cpp
   DiverseStack.cpp
   Edit.cpp
@@ -66,6 +68,7 @@ add_swift_host_library(swiftBasic STATIC
   Program.cpp
   QuotedString.cpp
   Sandbox.cpp
+  SmallBitVector.cpp
   SourceLoc.cpp
   StableHasher.cpp
   Statistic.cpp

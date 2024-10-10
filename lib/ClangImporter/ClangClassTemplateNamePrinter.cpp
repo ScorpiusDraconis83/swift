@@ -28,6 +28,11 @@ struct TemplateInstantiationNamePrinter
                                    ImportNameVersion version)
       : swiftCtx(swiftCtx), nameImporter(nameImporter), version(version) {}
 
+  std::string VisitType(const clang::Type *type) {
+    // Print "_" as a fallback if we couldn't emit a more meaningful type name.
+    return "_";
+  }
+
   std::string VisitBuiltinType(const clang::BuiltinType *type) {
     Type swiftType = nullptr;
     switch (type->getKind()) {
@@ -51,7 +56,7 @@ struct TemplateInstantiationNamePrinter
     }
 
     if (swiftType) {
-      if (swiftType->is<NominalType>()) {
+      if (swiftType->is<NominalType>() || swiftType->isVoid()) {
         return swiftType->getStringAsComponent();
       }
     }
@@ -61,6 +66,8 @@ struct TemplateInstantiationNamePrinter
   std::string VisitRecordType(const clang::RecordType *type) {
     auto tagDecl = type->getAsTagDecl();
     if (auto namedArg = dyn_cast_or_null<clang::NamedDecl>(tagDecl)) {
+      if (auto typeDefDecl = tagDecl->getTypedefNameForAnonDecl())
+        namedArg = typeDefDecl;
       llvm::SmallString<128> storage;
       llvm::raw_svector_ostream buffer(storage);
       nameImporter->importName(namedArg, version, clang::DeclarationName())
@@ -108,6 +115,28 @@ struct TemplateInstantiationNamePrinter
 
     return buffer.str().str();
   }
+
+  std::string VisitFunctionProtoType(const clang::FunctionProtoType *type) {
+    llvm::SmallString<128> storage;
+    llvm::raw_svector_ostream buffer(storage);
+
+    buffer << "((";
+    llvm::interleaveComma(type->getParamTypes(), buffer,
+                          [&](const clang::QualType &paramType) {
+                            buffer << Visit(paramType.getTypePtr());
+                          });
+    buffer << ") -> ";
+    buffer << Visit(type->getReturnType().getTypePtr());
+    buffer << ")";
+
+    return buffer.str().str();
+  }
+
+  std::string VisitVectorType(const clang::VectorType *type) {
+    return (Twine("SIMD") + std::to_string(type->getNumElements()) + "<" +
+            Visit(type->getElementType().getTypePtr()) + ">")
+        .str();
+  }
 };
 
 std::string swift::importer::printClassTemplateSpecializationName(
@@ -127,8 +156,11 @@ std::string swift::importer::printClassTemplateSpecializationName(
         // Use import name here so builtin types such as "int" map to their
         // Swift equivalent ("CInt").
         if (arg.getKind() == clang::TemplateArgument::Type) {
-          auto ty = arg.getAsType().getTypePtr();
-          buffer << templateNamePrinter.Visit(ty);
+          auto ty = arg.getAsType();
+          buffer << templateNamePrinter.Visit(ty.getTypePtr());
+          if (ty.isConstQualified()) {
+            buffer << "_const";
+          }
           return;
         } else if (arg.getKind() == clang::TemplateArgument::Integral) {
           buffer << "_";

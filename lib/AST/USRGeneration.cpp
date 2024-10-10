@@ -19,6 +19,7 @@
 #include "swift/AST/SwiftNameTranslation.h"
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/USRGeneration.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Demangling/Demangler.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
@@ -258,7 +259,7 @@ swift::USRGenerationRequest::evaluate(Evaluator &evaluator,
 }
 
 std::string ide::demangleUSR(StringRef mangled) {
-  if (mangled.startswith(getUSRSpacePrefix())) {
+  if (mangled.starts_with(getUSRSpacePrefix())) {
     mangled = mangled.substr(getUSRSpacePrefix().size());
   }
   SmallString<128> buffer;

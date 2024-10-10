@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/Parse/ParseBridging.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Bridging/ASTGen.h"
 #include "swift/Parse/Parser.h"
 
@@ -34,6 +35,7 @@ BridgedExpr BridgedLegacyParser_parseExpr(BridgedLegacyParser p,
   return result.getPtrOrNull();
 }
 
+// FIXME: We need to be able to return multiple declarations here.
 BridgedDecl BridgedLegacyParser_parseDecl(BridgedLegacyParser p,
                                           BridgedSourceLoc loc,
                                           BridgedDeclContext DC) {
@@ -46,11 +48,16 @@ BridgedDecl BridgedLegacyParser_parseDecl(BridgedLegacyParser p,
   // FIXME: IsAtStartOfLineOrPreviousHadSemi should be passed in from ASTGen.
   // IfConfigsAreDeclAttrs: true because ASTGen thinks the current location is
   // a start of a decl.
-  ParserResult<Decl> result = P.parseDecl(
+  Decl *resultDecl = nullptr;
+  P.parseDecl(
       /*IsAtStartOfLineOrPreviousHadSemi=*/true,
-      /*IfConfigsAreDeclAttrs=*/true, [&](Decl *decl) {},
+      /*IfConfigsAreDeclAttrs=*/true, [&](Decl *decl) {
+        // FIXME: We need to capture all of these declarations, not just
+        // the last one.
+        resultDecl = decl;
+      },
       /*fromASTGen=*/true);
-  return result.getPtrOrNull();
+  return resultDecl;
 }
 
 BridgedStmt BridgedLegacyParser_parseStmt(BridgedLegacyParser p,

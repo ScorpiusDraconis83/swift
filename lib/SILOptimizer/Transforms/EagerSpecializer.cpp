@@ -34,6 +34,7 @@
 
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/Type.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/SILFunction.h"
 #include "swift/SILOptimizer/Analysis/BasicCalleeAnalysis.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
@@ -72,6 +73,9 @@ static bool isTrivialReturnBlock(SILBasicBlock *RetBB) {
   //   % = tuple ()
   //   return % : $()
   if (RetOperand->getType().isVoid()) {
+    if (!RetBB->args_empty())
+      return false;
+
     auto *TupleI = dyn_cast<TupleInst>(RetBB->begin());
     if (!TupleI || !TupleI->getType().isVoid())
       return false;
@@ -731,7 +735,7 @@ SILValue EagerDispatch::emitArgumentConversion(
     // loadable on the caller's side?
     auto argConv = substConv.getSILArgumentConvention(ArgIdx);
     SILValue Val;
-    if (!argConv.isGuaranteedConvention()) {
+    if (!argConv.isGuaranteedConventionInCaller()) {
       Val = Builder.emitLoadValueOperation(Loc, CastArg,
                                            LoadOwnershipQualifier::Take);
     } else {

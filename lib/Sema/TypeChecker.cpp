@@ -23,6 +23,7 @@
 #include "TypeCheckType.h"
 #include "CodeSynthesis.h"
 #include "MiscDiagnostics.h"
+#include "swift/AST/ASTBridging.h"
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/Attr.h"
@@ -37,6 +38,7 @@
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Statistic.h"
 #include "swift/Basic/STLExtras.h"
 #include "swift/Parse/Lexer.h"
@@ -284,46 +286,60 @@ TypeCheckSourceFileRequest::evaluate(Evaluator &eval, SourceFile *SF) const {
     for (auto D : SF->getTopLevelDecls()) {
       if (auto *TLCD = dyn_cast<TopLevelCodeDecl>(D)) {
         TypeChecker::typeCheckTopLevelCodeDecl(TLCD);
-        TypeChecker::contextualizeTopLevelCode(TLCD);
       } else {
         TypeChecker::typeCheckDecl(D);
       }
     }
 
-    // Type-check macro-generated or implicitly-synthesized extensions.
+    // Type-check macro-generated or implicitly-synthesized decls.
     if (auto *synthesizedSF = SF->getSynthesizedFile()) {
       for (auto *decl : synthesizedSF->getTopLevelDecls()) {
-        auto extension = cast<ExtensionDecl>(decl);
+        assert(isa<ExtensionDecl>(decl) || isa<ProtocolDecl>(decl));
 
-        // Limit typechecking of synthesized _impicit_ extensions to conformance
-        // checking. This is done because a conditional conformance to Copyable
-        // is synthesized as an extension, based on the markings of `~Copyable`
-        // in a value type. This call to `checkConformancesInContext` will
-        // the actual check to verify that the conditional extension is correct,
-        // as it may be an invalid conformance.
-        if (extension->isImplicit())
-          TypeChecker::checkConformancesInContext(extension);
-        else
-          TypeChecker::typeCheckDecl(extension);
+        // Limit typechecking of synthesized _implicit_ extensions to
+        // conformance checking. This is done because a conditional
+        // conformance to Copyable is synthesized as an extension, based on
+        // the markings of ~Copyable in a value type. This call to
+        // checkConformancesInContext will the actual check to verify that
+        // the conditional extension is correct, as it may be an invalid
+        // conformance.
+        if (auto *extension = dyn_cast<ExtensionDecl>(decl)) {
+          if (extension->isImplicit()) {
+            TypeChecker::checkConformancesInContext(extension);
+            continue;
+          }
+        }
+
+        // For other kinds of decls, do normal typechecking.
+        TypeChecker::typeCheckDecl(decl);
       }
     }
     SF->typeCheckDelayedFunctions();
   }
 
-  diagnoseUnnecessaryPreconcurrencyImports(*SF);
+  // If region based isolation is enabled, we diagnose unnecessary
+  // preconcurrency imports in the SIL pipeline in the
+  // DiagnoseUnnecessaryPreconcurrencyImports pass.
+  if (!Ctx.LangOpts.hasFeature(Feature::RegionBasedIsolation))
+    diagnoseUnnecessaryPreconcurrencyImports(*SF);
   diagnoseUnnecessaryPublicImports(*SF);
+  diagnoseMissingImports(*SF);
 
   // Check to see if there are any inconsistent imports.
+  // Whole-module @_implementationOnly imports.
   evaluateOrDefault(
       Ctx.evaluator,
       CheckInconsistentImplementationOnlyImportsRequest{SF->getParentModule()},
       {});
 
+  // Whole-module @_spiOnly imports.
   evaluateOrDefault(
       Ctx.evaluator,
       CheckInconsistentSPIOnlyImportsRequest{SF},
       {});
 
+  // Whole-module ambiguous bare imports defaulting to public, when other
+  // imports are marked 'internal'.
   if (!Ctx.LangOpts.hasFeature(Feature::InternalImportsByDefault)) {
     evaluateOrDefault(
       Ctx.evaluator,
@@ -331,6 +347,13 @@ TypeCheckSourceFileRequest::evaluate(Evaluator &eval, SourceFile *SF) const {
       {});
   }
 
+  // Per-file inconsistent access-levels on imports of the same module.
+  evaluateOrDefault(
+    Ctx.evaluator,
+    CheckInconsistentAccessLevelOnImportSameFileRequest{SF},
+    {});
+
+  // Whole-module inconsistent @_weakLinked.
   evaluateOrDefault(
       Ctx.evaluator,
       CheckInconsistentWeakLinkedImportsRequest{SF->getParentModule()}, {});
@@ -355,10 +378,12 @@ void swift::performWholeModuleTypeChecking(SourceFile &SF) {
   FrontendStatsTracer tracer(Ctx.Stats,
                              "perform-whole-module-type-checking");
   switch (SF.Kind) {
+  case SourceFileKind::DefaultArgument:
   case SourceFileKind::Library:
   case SourceFileKind::Main:
   case SourceFileKind::MacroExpansion:
     diagnoseObjCMethodConflicts(SF);
+    diagnoseObjCCategoryConflicts(SF);
     diagnoseObjCUnsatisfiedOptReqConflicts(SF);
     diagnoseUnintendedObjCMethodOverrides(SF);
     diagnoseAttrsAddedByAccessNote(SF);
@@ -401,6 +426,7 @@ void swift::loadDerivativeConfigurations(SourceFile &SF) {
   };
 
   switch (SF.Kind) {
+  case SourceFileKind::DefaultArgument:
   case SourceFileKind::Library:
   case SourceFileKind::MacroExpansion:
   case SourceFileKind::Main: {
@@ -430,14 +456,14 @@ Type swift::performTypeResolution(TypeRepr *TyR, ASTContext &Ctx,
                                   GenericSignature GenericSig,
                                   SILTypeResolutionContext *SILContext,
                                   DeclContext *DC, bool ProduceDiagnostics) {
-  TypeResolutionOptions options = llvm::None;
+  TypeResolutionOptions options = std::nullopt;
   if (SILContext) {
     options |= TypeResolutionFlags::SILMode;
     if (SILContext->IsSILType)
       options |= TypeResolutionFlags::SILType;
   }
 
-  llvm::Optional<DiagnosticSuppression> suppression;
+  std::optional<DiagnosticSuppression> suppression;
   if (!ProduceDiagnostics)
     suppression.emplace(Ctx.Diags);
 
@@ -470,14 +496,14 @@ namespace {
     }
 
     PreWalkAction walkToTypeReprPre(TypeRepr *T) override {
-    if (auto *declRefTR = dyn_cast<DeclRefTypeRepr>(T)) {
-      if (auto *identBase =
-              dyn_cast<IdentTypeRepr>(declRefTR->getBaseComponent())) {
-        auto name = identBase->getNameRef().getBaseIdentifier();
-        if (auto *paramDecl = params->lookUpGenericParam(name))
-          identBase->setValue(paramDecl, dc);
+      // Only unqualified identifiers can reference generic parameters.
+      auto *unqualIdentTR = dyn_cast<UnqualifiedIdentTypeRepr>(T);
+      if (unqualIdentTR && !unqualIdentTR->hasGenericArgList()) {
+        auto name = unqualIdentTR->getNameRef().getBaseIdentifier();
+        if (auto *paramDecl = params->lookUpGenericParam(name)) {
+          unqualIdentTR->setValue(paramDecl, dc);
+        }
       }
-    }
 
       return Action::Continue();
     }
@@ -487,7 +513,7 @@ namespace {
 /// Expose TypeChecker's handling of GenericParamList to SIL parsing.
 GenericSignature
 swift::handleSILGenericParams(GenericParamList *genericParams,
-                              DeclContext *DC) {
+                              DeclContext *DC, bool allowInverses) {
   if (genericParams == nullptr)
     return nullptr;
 
@@ -512,7 +538,9 @@ swift::handleSILGenericParams(GenericParamList *genericParams,
   auto request = InferredGenericSignatureRequest{
       /*parentSig=*/nullptr,
       nestedList.back(), WhereClauseOwner(),
-      {}, {}, /*allowConcreteGenericParams=*/true};
+      {}, {}, genericParams->getLAngleLoc(),
+      /*isExtension=*/false,
+      allowInverses};
   return evaluateOrDefault(DC->getASTContext().evaluator, request,
                            GenericSignatureWithError()).getPointer();
 }
@@ -545,9 +573,9 @@ bool swift::typeCheckForCodeCompletion(
                                                  callback);
 }
 
-Expr *swift::resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE, DeclContext *Context,
-                                bool replaceInvalidRefsWithErrors) {
-  return TypeChecker::resolveDeclRefExpr(UDRE, Context, replaceInvalidRefsWithErrors);
+Expr *swift::resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE,
+                                DeclContext *Context) {
+  return TypeChecker::resolveDeclRefExpr(UDRE, Context);
 }
 
 void TypeChecker::checkForForbiddenPrefix(ASTContext &C, DeclBaseName Name) {
@@ -560,7 +588,7 @@ void TypeChecker::checkForForbiddenPrefix(ASTContext &C, DeclBaseName Name) {
 
   StringRef Str = Name.getIdentifier().str();
   for (auto forbiddenPrefix : C.TypeCheckerOpts.DebugForbidTypecheckPrefixes) {
-    if (Str.startswith(forbiddenPrefix)) {
+    if (Str.starts_with(forbiddenPrefix)) {
       llvm::report_fatal_error(Twine("forbidden typecheck occurred: ") + Str);
     }
   }
@@ -570,11 +598,11 @@ DeclTypeCheckingSemantics
 TypeChecker::getDeclTypeCheckingSemantics(ValueDecl *decl) {
   // Check for a @_semantics attribute.
   if (auto semantics = decl->getAttrs().getAttribute<SemanticsAttr>()) {
-    if (semantics->Value.equals("typechecker.type(of:)"))
+    if (semantics->Value == "typechecker.type(of:)")
       return DeclTypeCheckingSemantics::TypeOf;
-    if (semantics->Value.equals("typechecker.withoutActuallyEscaping(_:do:)"))
+    if (semantics->Value == "typechecker.withoutActuallyEscaping(_:do:)")
       return DeclTypeCheckingSemantics::WithoutActuallyEscaping;
-    if (semantics->Value.equals("typechecker._openExistential(_:do:)"))
+    if (semantics->Value == "typechecker._openExistential(_:do:)")
       return DeclTypeCheckingSemantics::OpenExistential;
   }
   return DeclTypeCheckingSemantics::Normal;
@@ -582,11 +610,11 @@ TypeChecker::getDeclTypeCheckingSemantics(ValueDecl *decl) {
 
 bool TypeChecker::isDifferentiable(Type type, bool tangentVectorEqualsSelf,
                                    DeclContext *dc,
-                                   llvm::Optional<TypeResolutionStage> stage) {
+                                   std::optional<TypeResolutionStage> stage) {
   if (stage)
     type = dc->mapTypeIntoContext(type);
   auto tanSpace = type->getAutoDiffTangentSpace(
-      LookUpConformanceInModule(dc->getParentModule()));
+      LookUpConformanceInModule());
   if (!tanSpace)
     return false;
   // If no `Self == Self.TangentVector` requirement, return true.
@@ -597,8 +625,8 @@ bool TypeChecker::isDifferentiable(Type type, bool tangentVectorEqualsSelf,
 }
 
 bool TypeChecker::diagnoseInvalidFunctionType(
-    FunctionType *fnTy, SourceLoc loc, llvm::Optional<FunctionTypeRepr *> repr,
-    DeclContext *dc, llvm::Optional<TypeResolutionStage> stage) {
+    FunctionType *fnTy, SourceLoc loc, std::optional<FunctionTypeRepr *> repr,
+    DeclContext *dc, std::optional<TypeResolutionStage> stage) {
   // Some of the below checks trigger cycles if we don't have a generic
   // signature yet; we'll run the checks again in
   // TypeResolutionStage::Interface.
@@ -737,4 +765,37 @@ bool TypeChecker::diagnoseInvalidFunctionType(
   }
 
   return hadAnyError;
+}
+
+extern "C" intptr_t swift_ASTGen_evaluatePoundIfCondition(
+                        BridgedASTContext astContext,
+                        void *_Nonnull diagEngine,
+                        BridgedStringRef sourceFileBuffer,
+                        BridgedStringRef conditionText,
+                        bool);
+
+std::pair<bool, bool> EvaluateIfConditionRequest::evaluate(
+    Evaluator &evaluator, SourceFile *sourceFile, SourceRange conditionRange,
+    bool shouldEvaluate
+) const {
+  // FIXME: When we migrate to SwiftParser, use the parsed syntax tree.
+  ASTContext &ctx = sourceFile->getASTContext();
+  auto &sourceMgr = ctx.SourceMgr;
+
+  // Extract the full buffer containing the condition.
+  auto bufferID = sourceMgr.findBufferContainingLoc(conditionRange.Start);
+  StringRef sourceFileText = sourceMgr.getEntireTextForBuffer(bufferID);
+
+  // Extract the condition text from that buffer.
+  auto conditionCharRange = Lexer::getCharSourceRangeFromSourceRange(sourceMgr, conditionRange);
+  StringRef conditionText = sourceMgr.extractText(conditionCharRange, bufferID);
+
+  // Evaluate the condition.
+  intptr_t evalResult = swift_ASTGen_evaluatePoundIfCondition(
+      ctx, &ctx.Diags, sourceFileText, conditionText, shouldEvaluate
+  );
+
+  bool isActive = (evalResult & 0x01) != 0;
+  bool allowSyntaxErrors = (evalResult & 0x02) != 0;
+  return std::pair(isActive, allowSyntaxErrors);
 }

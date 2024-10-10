@@ -7,7 +7,7 @@
 
 func invokedDeinit() {}
 
-@_moveOnly enum MaybeFile {
+enum MaybeFile: ~Copyable {
   case some(File)
   case none
 
@@ -41,7 +41,7 @@ func invokedDeinit() {}
   // CHECK-SIL:    release_value [[FILE]] : $File
 }
 
-@_moveOnly struct File {
+struct File: ~Copyable {
   let fd: Int
   static var nextFD: Int = 0
 
@@ -71,7 +71,7 @@ func invokedDeinit() {}
   }
 }
 
-@_moveOnly struct PointerTree {
+struct PointerTree: ~Copyable {
   let left: UnsafePointer<UInt>?
   let file: Int = 0
   lazy var popularity: Int = 0
@@ -145,7 +145,7 @@ final class Wallet {
   var numCards = 0
 }
 
-@_moveOnly enum Ticket {
+enum Ticket: ~Copyable {
   case empty
   case within(Wallet)
 
@@ -172,7 +172,7 @@ final class Wallet {
   // CHECK:    destroy_value [[DD]] : $Ticket
 
   // CHECK-SIL-LABEL: sil hidden @$s4test6TicketO06changeB08inWalletyAA0E0CSg_tF : $@convention(method) (@guaranteed Optional<Wallet>, @owned Ticket) -> () {
-  // CHECK-SIL:    [[SELF_REF:%.*]] = alloc_stack [lexical] $Ticket, var, name "self", implicit 
+  // CHECK-SIL:    [[SELF_REF:%.*]] = alloc_stack [lexical] [var_decl] $Ticket, var, name "self"
   // CHECK-SIL:    switch_enum {{.*}} : $Optional<Wallet>, case #Optional.some!enumelt: {{.*}}, case #Optional.none!enumelt: [[NO_WALLET_BB:bb[0-9]+]]
   //
   // >> now we begin the destruction sequence, which involves pattern matching on self to destroy its innards

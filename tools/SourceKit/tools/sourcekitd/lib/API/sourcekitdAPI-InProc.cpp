@@ -10,23 +10,24 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "sourcekitd/DictionaryKeys.h"
-#include "sourcekitd/Internal.h"
-#include "sourcekitd/CodeCompletionResultsArray.h"
-#include "sourcekitd/DocStructureArray.h"
-#include "sourcekitd/DocSupportAnnotationArray.h"
-#include "sourcekitd/RawData.h"
-#include "sourcekitd/TokenAnnotationsArray.h"
-#include "sourcekitd/ExpressionTypeArray.h"
-#include "sourcekitd/VariableTypeArray.h"
-#include "sourcekitd/Logging.h"
 #include "SourceKit/Core/LLVM.h"
 #include "SourceKit/Support/UIdent.h"
-#include "swift/Basic/ThreadSafeRefCounted.h"
+#include "sourcekitd/CodeCompletionResultsArray.h"
+#include "sourcekitd/DeclarationsArray.h"
+#include "sourcekitd/DictionaryKeys.h"
+#include "sourcekitd/DocStructureArray.h"
+#include "sourcekitd/DocSupportAnnotationArray.h"
+#include "sourcekitd/ExpressionTypeArray.h"
+#include "sourcekitd/Internal.h"
+#include "sourcekitd/Logging.h"
+#include "sourcekitd/RawData.h"
+#include "sourcekitd/TokenAnnotationsArray.h"
+#include "sourcekitd/VariableTypeArray.h"
 #include "swift/Basic/StringExtras.h"
+#include "swift/Basic/ThreadSafeRefCounted.h"
 #include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
+#include "llvm/ADT/StringRef.h"
 
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -73,8 +74,8 @@ public:
   virtual size_t getCount() const { return 0; }
 
   virtual sourcekitd_uid_t getUID() const { return nullptr; }
-  virtual Optional<int64_t> getInt64() const { return None; }
-  virtual Optional<StringRef> getString() const { return None; }
+  virtual std::optional<int64_t> getInt64() const { return std::nullopt; }
+  virtual std::optional<StringRef> getString() const { return std::nullopt; }
   virtual const char *getCString() const { return nullptr; }
   virtual bool getBool() const { return false; }
   virtual const void *getDataPtr() const { return nullptr; }
@@ -165,8 +166,8 @@ public:
     return SOURCEKITD_VARIANT_TYPE_STRING;
   }
 
-  Optional<StringRef> getString() const override {
-    return Optional<StringRef>(Storage);
+  std::optional<StringRef> getString() const override {
+    return std::optional<StringRef>(Storage);
   }
 
   const char *getCString() const override {
@@ -188,9 +189,7 @@ public:
     return SOURCEKITD_VARIANT_TYPE_INT64;
   }
 
-  Optional<int64_t> getInt64() const override {
-    return Storage;
-  }
+  std::optional<int64_t> getInt64() const override { return Storage; }
 
   static bool classof(const SKDObject *O) {
     return O->getKind() == ObjectKind::Int64;
@@ -249,6 +248,7 @@ public:
   sourcekitd_variant_type_t getVariantType() const override {
     switch (getBufferKind()) {
       case CustomBufferKind::TokenAnnotationsArray:
+      case CustomBufferKind::DeclarationsArray:
       case CustomBufferKind::DocSupportAnnotationArray:
       case CustomBufferKind::CodeCompletionResultsArray:
       case CustomBufferKind::DocStructureArray:
@@ -711,19 +711,21 @@ sourcekitd_uid_t RequestDict::getUID(UIdent Key) const {
   return Object ? Object->getUID() : nullptr;
 }
 
-Optional<StringRef> RequestDict::getString(UIdent Key) const {
+std::optional<StringRef> RequestDict::getString(UIdent Key) const {
   if (auto Object = static_cast<SKDObject *>(Dict)->get(SKDUIDFromUIdent(Key))) {
     return Object->getString();
   }
-  return None;
+  return std::nullopt;
 }
 
-Optional<RequestDict> RequestDict::getDictionary(SourceKit::UIdent Key) const {
+std::optional<RequestDict>
+RequestDict::getDictionary(SourceKit::UIdent Key) const {
   SKDDictionary *DictObject = nullptr;
   if (auto Object = static_cast<SKDObject *>(Dict)->get(SKDUIDFromUIdent(Key))) {
     DictObject = dyn_cast<SKDDictionary>(Object);
   }
-  return DictObject ? Optional<RequestDict>(RequestDict(DictObject)) : None;
+  return DictObject ? std::optional<RequestDict>(RequestDict(DictObject))
+                    : std::nullopt;
 }
 
 bool RequestDict::getStringArray(SourceKit::UIdent Key,
@@ -793,10 +795,11 @@ bool RequestDict::getInt64(SourceKit::UIdent Key, int64_t &Val,
   return false;
 }
 
-Optional<int64_t> RequestDict::getOptionalInt64(SourceKit::UIdent Key) const {
+std::optional<int64_t>
+RequestDict::getOptionalInt64(SourceKit::UIdent Key) const {
   auto Object = static_cast<SKDObject *>(Dict)->get(SKDUIDFromUIdent(Key));
   if (!Object)
-    return None;
+    return std::nullopt;
   return Object->getInt64().value_or(0);
 }
 
@@ -975,6 +978,10 @@ static sourcekitd_variant_t variantFromSKDObject(SKDObjectRef Object) {
       case CustomBufferKind::TokenAnnotationsArray:
         return {{ (uintptr_t)getVariantFunctionsForTokenAnnotationsArray(),
           (uintptr_t)DataObject->getDataPtr(), 0 }};
+      case CustomBufferKind::DeclarationsArray:
+        return {
+            {(uintptr_t)sourcekitd::getVariantFunctionsForDeclarationsArray(),
+             (uintptr_t)DataObject->getDataPtr(), 0}};
       case CustomBufferKind::DocSupportAnnotationArray:
         return {{ (uintptr_t)getVariantFunctionsForDocSupportAnnotationArray(),
           (uintptr_t)DataObject->getDataPtr(), 0 }};

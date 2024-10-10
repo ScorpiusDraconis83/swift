@@ -1,3 +1,5 @@
+// RUN: %target-typecheck-verify-swift -I %S/Inputs -cxx-interoperability-mode=swift-5.9
+// RUN: %target-typecheck-verify-swift -I %S/Inputs -cxx-interoperability-mode=swift-6
 // RUN: %target-typecheck-verify-swift -I %S/Inputs -cxx-interoperability-mode=upcoming-swift
 
 import MemberInline
@@ -76,3 +78,22 @@ let _ = derivedConstIterWithUD.pointee
 
 var derivedIntWrapper = DerivedFromLoadableIntWrapperWithUsingDecl()
 derivedIntWrapper += LoadableIntWrapper()
+
+let classWithSuccessorAvailable = ClassWithSuccessorAvailable()
+let _ = classWithSuccessorAvailable.successor();
+let classWithSuccessorUnavailable = ClassWithSuccessorUnavailable()
+let _ = classWithSuccessorUnavailable.successor(); // expected-error {{'successor()' is unavailable in Swift}}
+
+var classWithOperatorStarAvailable = ClassWithOperatorStarAvailable()
+let _ = classWithOperatorStarAvailable.pointee
+let derivedClassWithOperatorStarAvailable = DerivedClassWithOperatorStarAvailable()
+let _ = derivedClassWithOperatorStarAvailable.pointee
+
+var classWithOperatorStarUnavailable = ClassWithOperatorStarUnavailable()
+let _ = classWithOperatorStarUnavailable.pointee // expected-error {{'pointee' is unavailable in Swift}}
+
+// FIXME: The below test should also fail with 'pointee' is unavailable in Swift error, 
+// but currently pointee is not hidden in derived classes.
+let derivedClassWithOperatorStarUnavailable = DerivedClassWithOperatorStarUnavailable()
+let _ = derivedClassWithOperatorStarUnavailable.pointee  
+

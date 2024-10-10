@@ -51,6 +51,7 @@ function(get_test_dependencies SDK result_var_name)
 
   if (SWIFT_INCLUDE_TOOLS)
     list(APPEND deps_binaries
+      libMockPlugin
       lldb-moduleimport-test
       swift-frontend
       swift-demangle
@@ -58,10 +59,15 @@ function(get_test_dependencies SDK result_var_name)
       swift-ide-test
       swift-refactor
       swift-reflection-dump
-      swift-remoteast-test)
+      swift-remoteast-test
+      swift-scan-test)
 
     if(SWIFT_BUILD_SOURCEKIT)
       list(APPEND deps_binaries sourcekitd-test complete-test)
+    endif()
+
+    if(SWIFT_BUILD_SWIFT_SYNTAX)
+      list(APPEND deps_binaries swift-plugin-server)
     endif()
   endif()
 
@@ -100,12 +106,15 @@ function(get_test_dependencies SDK result_var_name)
   if(("${SDK}" STREQUAL "IOS") OR
      ("${SDK}" STREQUAL "TVOS") OR
      ("${SDK}" STREQUAL "WATCHOS") OR
+     ("${SDK}" STREQUAL "XROS") OR
      ("${SDK}" STREQUAL "OSX") OR
      ("${SDK}" STREQUAL "IOS_SIMULATOR") OR
      ("${SDK}" STREQUAL "TVOS_SIMULATOR") OR
      ("${SDK}" STREQUAL "WATCHOS_SIMULATOR") OR
+     ("${SDK}" STREQUAL "XROS_SIMULATOR") OR
      ("${SDK}" STREQUAL "FREESTANDING") OR
      ("${SDK}" STREQUAL "LINUX") OR
+     ("${SDK}" STREQUAL "LINUX_STATIC") OR
      ("${SDK}" STREQUAL "CYGWIN") OR
      ("${SDK}" STREQUAL "FREEBSD") OR
      ("${SDK}" STREQUAL "OPENBSD") OR
@@ -209,6 +218,11 @@ normalize_boolean_spelling(SWIFT_ENABLE_DISPATCH)
 normalize_boolean_spelling(SWIFT_STDLIB_ENABLE_OBJC_INTEROP)
 normalize_boolean_spelling(SWIFT_ENABLE_BACKTRACING)
 normalize_boolean_spelling(SWIFT_BUILD_SWIFT_SYNTAX)
+normalize_boolean_spelling(SWIFT_ENABLE_SYNCHRONIZATION)
+normalize_boolean_spelling(SWIFT_ENABLE_VOLATILE)
+normalize_boolean_spelling(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB)
+normalize_boolean_spelling(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB_CROSS_COMPILING)
+normalize_boolean_spelling(SWIFT_BUILD_REMOTE_MIRROR)
 is_build_type_optimized("${SWIFT_STDLIB_BUILD_TYPE}" SWIFT_OPTIMIZED)
 
 # Get 'SWIFT_HOST_SDKROOT' for lit.site.cfg.in
@@ -231,7 +245,6 @@ set(TEST_SUBSETS
     only_validation
     only_long
     only_stress
-    only_early_swiftdriver
 )
 
 if(NOT "${COVERAGE_DB}" STREQUAL "")
@@ -311,8 +324,8 @@ foreach(SDK ${SWIFT_SDKS})
         endif()
       endif()
 
-      if(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB AND TARGET "embedded-stdlib")
-        list(APPEND test_dependencies "embedded-stdlib")
+      if(TARGET "embedded-libraries")
+        list(APPEND test_dependencies "embedded-libraries")
       endif()
 
       if(NOT "${COVERAGE_DB}" STREQUAL "")
@@ -327,7 +340,7 @@ foreach(SDK ${SWIFT_SDKS})
 
       set(command_upload_stdlib)
       set(command_upload_swift_reflection_test)
-      if("${SDK}" STREQUAL "IOS" OR "${SDK}" STREQUAL "TVOS" OR "${SDK}" STREQUAL "WATCHOS")
+      if("${SDK}" STREQUAL "IOS" OR "${SDK}" STREQUAL "TVOS" OR "${SDK}" STREQUAL "WATCHOS" OR "${SDK}" STREQUAL "XROS")
         # These are supported testing SDKs, but their implementation of
         # `command_upload_stdlib` is hidden.
       elseif("${SDK}" STREQUAL "ANDROID" AND NOT "${SWIFT_HOST_VARIANT}" STREQUAL "android")
@@ -405,6 +418,18 @@ foreach(SDK ${SWIFT_SDKS})
           list(APPEND LIT_ARGS "--param" "observation")
         endif()
 
+        if(SWIFT_ENABLE_SYNCHRONIZATION)
+          list(APPEND LIT_ARGS "--param" "synchronization")
+        endif()
+
+        if(SWIFT_ENABLE_VOLATILE)
+          list(APPEND LIT_ARGS "--param" "volatile")
+        endif()
+
+        if(SWIFT_BUILD_REMOTE_MIRROR)
+          list(APPEND LIT_ARGS "--param" "remote_mirror")
+        endif()
+
         list(APPEND LIT_ARGS "--param" "threading=${SWIFT_SDK_${SDK}_THREADING_PACKAGE}")
 
         # Enable on-crash backtracing if supported
@@ -421,7 +446,6 @@ foreach(SDK ${SWIFT_SDKS})
              (test_subset STREQUAL "validation") OR
              (test_subset STREQUAL "only_long") OR
              (test_subset STREQUAL "only_stress") OR
-             (test_subset STREQUAL "only_early_swiftdriver") OR
              (test_subset STREQUAL "all"))
             list(APPEND directories "${test_bin_dir}")
           endif()

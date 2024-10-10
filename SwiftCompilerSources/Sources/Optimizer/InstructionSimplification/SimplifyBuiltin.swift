@@ -32,8 +32,15 @@ extension BuiltinInst : OnoneSimplifyable {
            .Strideof,
            .Alignof:
         optimizeTargetTypeConst(context)
-      case .DestroyArray,
-           .CopyArray,
+      case .DestroyArray:
+        if let elementType = substitutionMap.replacementTypes[0],
+           elementType.isTrivial(in: parentFunction)
+        {
+          context.erase(instruction: self)
+          return
+        }
+        optimizeArgumentToThinMetatype(argument: 0, context)
+      case .CopyArray,
            .TakeArrayNoAlias,
            .TakeArrayFrontToBack,
            .TakeArrayBackToFront,
@@ -44,11 +51,6 @@ extension BuiltinInst : OnoneSimplifyable {
            .AllocVector,
            .IsPOD:
         optimizeArgumentToThinMetatype(argument: 0, context)
-      case .CreateAsyncTask:
-        // In embedded Swift, CreateAsyncTask needs a thin metatype
-        if context.options.enableEmbeddedSwift {
-          optimizeArgumentToThinMetatype(argument: 1, context)
-        }
       case .ICMP_EQ:
         constantFoldIntegerEquality(isEqual: true, context)
       case .ICMP_NE:
@@ -101,6 +103,8 @@ private extension BuiltinInst {
     guard let callee = calleeOfOnce, callee.isDefinition else {
       return
     }
+    context.notifyDependency(onBodyOf: callee)
+
     // If the callee is side effect-free we can remove the whole builtin "once".
     // We don't use the callee's memory effects but instead look at all callee instructions
     // because memory effects are not computed in the Onone pipeline, yet.
@@ -108,6 +112,10 @@ private extension BuiltinInst {
     // or contains the side-effect instruction `alloc_global` right at the beginning.
     if callee.instructions.contains(where: hasSideEffectForBuiltinOnce) {
       return
+    }
+    for use in uses {
+      let ga = use.instruction as! GlobalAddrInst
+      ga.clearToken(context)
     }
     context.erase(instruction: self)
   }
@@ -142,19 +150,20 @@ private extension BuiltinInst {
   }
 
   func optimizeAssertConfig(_ context: SimplifyContext) {
-    let literal: IntegerLiteralInst
-    switch context.options.assertConfiguration {
-    case .enabled:
+    // The values for the assert_configuration call are:
+    // 0: Debug
+    // 1: Release
+    // 2: Fast / Unchecked
+    let config = context.options.assertConfiguration
+    switch config {
+    case .debug, .release, .unchecked:
       let builder = Builder(before: self, context)
-      literal = builder.createIntegerLiteral(1,  type: type)
-    case .disabled:
-      let builder = Builder(before: self, context)
-      literal = builder.createIntegerLiteral(0,  type: type)
-    default:
+      let literal = builder.createIntegerLiteral(config.integerValue, type: type)
+      uses.replaceAll(with: literal, context)
+      context.erase(instruction: self)
+    case .unknown:
       return
     }
-    uses.replaceAll(with: literal, context)
-    context.erase(instruction: self)
   }
   
   func optimizeTargetTypeConst(_ context: SimplifyContext) {
@@ -199,7 +208,7 @@ private extension BuiltinInst {
       return
     }
     
-    let instanceType = type.instanceTypeOfMetatype(in: parentFunction)
+    let instanceType = type.loweredInstanceTypeOfMetatype(in: parentFunction)
     let builder = Builder(before: self, context)
     let newMetatype = builder.createMetatype(of: instanceType, representation: .Thin)
     operands[argument].set(to: newMetatype, context)
@@ -276,69 +285,34 @@ private func typesOfValuesAreEqual(_ lhs: Value, _ rhs: Value, in function: Func
   if lhsMetatype.isDynamicSelfMetatype != rhsMetatype.isDynamicSelfMetatype {
     return nil
   }
-  let lhsTy = lhsMetatype.instanceTypeOfMetatype(in: function)
-  let rhsTy = rhsMetatype.instanceTypeOfMetatype(in: function)
+  let lhsTy = lhsMetatype.loweredInstanceTypeOfMetatype(in: function)
+  let rhsTy = rhsMetatype.loweredInstanceTypeOfMetatype(in: function)
 
   // Do we know the exact types? This is not the case e.g. if a type is passed as metatype
   // to the function.
   let typesAreExact = lhsExistential.metatype is MetatypeInst &&
                       rhsExistential.metatype is MetatypeInst
 
-  switch (lhsTy.typeKind, rhsTy.typeKind) {
-  case (_, .unknown), (.unknown, _):
-    return nil
-  case (let leftKind, let rightKind) where leftKind != rightKind:
-    // E.g. a function type is always different than a struct, regardless of what archetypes
-    // the two types may contain.
+  if typesAreExact {
+    // We need to compare the not lowered types, because function types may differ in their original version
+    // but are equal in the lowered version, e.g.
+    //   ((Int, Int) -> ())
+    //   (((Int, Int)) -> ())
+    //
+    if lhsMetatype == rhsMetatype {
+      return true
+    }
+    // Comparing types of different classes which are in a sub-class relation is not handled by the
+    // cast optimizer (below).
+    if lhsTy.isClass && rhsTy.isClass && lhsTy.nominal != rhsTy.nominal {
+      return false
+    }
+  }
+
+  // If casting in either direction doesn't work, the types cannot be equal.
+  if !(canDynamicallyCast(from: lhsTy, to: rhsTy, in: function, sourceTypeIsExact: typesAreExact) ?? true) ||
+     !(canDynamicallyCast(from: rhsTy, to: lhsTy, in: function, sourceTypeIsExact: typesAreExact) ?? true) {
     return false
-  case (.struct, .struct), (.enum, .enum):
-    // Two different structs/enums are always not equal, regardless of what archetypes
-    // the two types may contain.
-    if lhsTy.nominal != rhsTy.nominal {
-      return false
-    }
-  case (.class, .class):
-    // In case of classes this only holds if we know the exact types.
-    // Otherwise one class could be a sub-class of the other class.
-    if typesAreExact && lhsTy.nominal != rhsTy.nominal {
-      return false
-    }
-  default:
-    break
   }
-
-  if !typesAreExact {
-    // Types which e.g. come from type parameters may differ at runtime while the declared AST types are the same.
-    return nil
-  }
-
-  if lhsTy.hasArchetype || rhsTy.hasArchetype {
-    // We don't know anything about archetypes. They may be identical at runtime or not.
-    // We could do something more sophisticated here, e.g. look at conformances. But for simplicity,
-    // we are just conservative.
-    return nil
-  }
-
-  // Generic ObjectiveC class, which are specialized for different NSObject types have different AST types
-  // but the same runtime metatype.
-  if lhsTy.isOrContainsObjectiveCClass || rhsTy.isOrContainsObjectiveCClass {
-    return nil
-  }
-
-  return lhsTy == rhsTy
-}
-
-private extension Type {
-  enum TypeKind {
-    case `struct`, `class`, `enum`, tuple, function, unknown
-  }
-
-  var typeKind: TypeKind {
-    if isStruct  { return .struct }
-    if isClass  { return .class }
-    if isEnum  { return .enum }
-    if isTuple    { return .tuple }
-    if isFunction { return .function }
-    return .unknown
-  }
+  return nil
 }

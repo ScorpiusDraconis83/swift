@@ -31,6 +31,7 @@
 
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/IRGenOptions.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/DynamicCasts.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILModule.h"
@@ -91,8 +92,7 @@ llvm::Value *irgen::emitCheckedCast(IRGenFunction &IGF,
 FailableCastResult irgen::emitClassIdenticalCast(IRGenFunction &IGF,
                                                  llvm::Value *from,
                                                  SILType fromType,
-                                                 SILType toType,
-                                                 GenericSignature fnSig) {
+                                                 SILType toType) {
   // Check metatype objects directly. Don't try to find their meta-metatype.
   auto isMetatype = false;
   if (auto metaType = toType.getAs<MetatypeType>()) {
@@ -129,7 +129,7 @@ FailableCastResult irgen::emitClassIdenticalCast(IRGenFunction &IGF,
   // =>
   // icmp eq %1, @metadata.Sub
   llvm::Value *objectMetadata = isMetatype ? from :
-    emitHeapMetadataRefForHeapObject(IGF, from, fromType, fnSig);
+    emitHeapMetadataRefForHeapObject(IGF, from, fromType);
 
   objectMetadata = IGF.Builder.CreateBitCast(objectMetadata,
                                              targetMetadata->getType());
@@ -160,7 +160,7 @@ getDynamicCastArguments(IRGenFunction &IGF,
     return argsBuf;
       
   case CheckedCastMode::Conditional:
-    return llvm::makeArrayRef(argsBuf, n-3);
+    return llvm::ArrayRef(argsBuf, n - 3);
     break;
   }
   llvm_unreachable("covered switch");
@@ -532,8 +532,8 @@ llvm::Value *irgen::emitMetatypeToAnyObjectDowncast(IRGenFunction &IGF,
 /// Emit a checked cast to a protocol or protocol composition.
 void irgen::emitScalarExistentialDowncast(
     IRGenFunction &IGF, llvm::Value *value, SILType srcType, SILType destType,
-    CheckedCastMode mode, llvm::Optional<MetatypeRepresentation> metatypeKind,
-    GenericSignature fnSig, Explosion &ex) {
+    CheckedCastMode mode, std::optional<MetatypeRepresentation> metatypeKind,
+    Explosion &ex) {
   auto srcInstanceType = srcType.getASTType();
   auto destInstanceType = destType.getASTType();
   while (auto metatypeType = dyn_cast<ExistentialMetatypeType>(
@@ -726,7 +726,7 @@ void irgen::emitScalarExistentialDowncast(
 
   // If we're doing a conditional cast, and the ObjC protocol checks failed,
   // then the cast is done.
-  llvm::Optional<ConditionalDominanceScope> condition;
+  std::optional<ConditionalDominanceScope> condition;
   llvm::BasicBlock *origBB = nullptr, *successBB = nullptr, *contBB = nullptr;
   if (!objcProtos.empty()) {
     switch (mode) {
@@ -764,8 +764,7 @@ void irgen::emitScalarExistentialDowncast(
     // Get the type metadata for the instance.
     metadataValue = emitDynamicTypeOfHeapObject(IGF, value,
                                                 MetatypeRepresentation::Thick,
-                                                srcType,
-                                                fnSig);
+                                                srcType);
   }
 
   // Look up witness tables for the protocols that need them.
@@ -848,7 +847,6 @@ void irgen::emitScalarCheckedCast(IRGenFunction &IGF,
                                   SILType targetLoweredType,
                                   CanType targetFormalType,
                                   CheckedCastMode mode,
-                                  GenericSignature fnSig,
                                   Explosion &out) {
   assert(sourceLoweredType.isObject());
   assert(targetLoweredType.isObject());
@@ -883,7 +881,7 @@ void irgen::emitScalarCheckedCast(IRGenFunction &IGF,
 
   bool sourceWrappedInOptional = false;
 
-  llvm::Optional<ConditionalDominanceScope> domScope;
+  std::optional<ConditionalDominanceScope> domScope;
   if (auto sourceOptObjectType = sourceLoweredType.getOptionalObjectType()) {
     // Translate the value from an enum representation to a possibly-null
     // representation.  Note that we assume that this projection is safe
@@ -937,7 +935,6 @@ void irgen::emitScalarCheckedCast(IRGenFunction &IGF,
       emitScalarExistentialDowncast(IGF, metatypeVal, sourceLoweredType,
                                     targetLoweredType, mode,
                                     existential->getRepresentation(),
-                                    fnSig,
                                     out);
       return;
 
@@ -1006,16 +1003,16 @@ void irgen::emitScalarCheckedCast(IRGenFunction &IGF,
   llvm::Value *instance;
   if (sourceLoweredType.isExistentialType()) {
     instance = emitClassExistentialProjection(IGF, value, sourceLoweredType,
-                                              CanArchetypeType(), fnSig);
+                                              CanArchetypeType());
   } else {
     instance = value.claimNext();
   }
 
   if (targetFormalType.isExistentialType()) {
     Explosion outRes;
-    emitScalarExistentialDowncast(IGF, instance, sourceLoweredType,
-                                  targetLoweredType, mode,
-                                  /*not a metatype*/ llvm::None, fnSig, outRes);
+    emitScalarExistentialDowncast(
+        IGF, instance, sourceLoweredType, targetLoweredType, mode,
+        /*not a metatype*/ std::nullopt, outRes);
     returnNilCheckedResult(IGF.Builder, outRes);
     return;
   }
@@ -1106,7 +1103,7 @@ llvm::Value *irgen::emitFastClassCastIfPossible(
     
   // Load the isa pointer.
   llvm::Value *objMetadata = emitHeapMetadataRefForHeapObject(IGF, instance,
-      sourceFormalType, GenericSignature(), /*suppress cast*/ true);
+      sourceFormalType, /*suppress cast*/ true);
   llvm::Value *rhs = IGF.Builder.CreateBitCast(objMetadata, IGF.IGM.Int8PtrTy);
   
   // return isa_ptr == metadata_ptr ? instance : nullptr

@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/IDE/CodeCompletionCache.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Cache.h"
 #include "swift/Basic/StringExtras.h"
 #include "llvm/ADT/APInt.h"
@@ -52,10 +53,10 @@ CodeCompletionCache::ValueRefCntPtr CodeCompletionCache::createValue() {
   return ValueRefCntPtr(new Value);
 }
 
-llvm::Optional<CodeCompletionCache::ValueRefCntPtr>
+std::optional<CodeCompletionCache::ValueRefCntPtr>
 CodeCompletionCache::get(const Key &K) {
   auto &TheCache = Impl->TheCache;
-  llvm::Optional<ValueRefCntPtr> V = TheCache.get(K);
+  std::optional<ValueRefCntPtr> V = TheCache.get(K);
   if (V) {
     // Check whether V is up to date.
     llvm::sys::fs::file_status ModuleStatus;
@@ -63,7 +64,7 @@ CodeCompletionCache::get(const Key &K) {
         V.value()->ModuleModificationTime !=
         ModuleStatus.getLastModificationTime()) {
       // Cache is stale.
-      V = llvm::None;
+      V = std::nullopt;
       TheCache.remove(K);
     }
   } else if (nextCache && (V = nextCache->get(K))) {
@@ -104,7 +105,7 @@ CodeCompletionCache::~CodeCompletionCache() {}
 /// This should be incremented any time we commit a change to the format of the
 /// cached results. This isn't expected to change very often.
 static constexpr uint32_t onDiskCompletionCacheVersion =
-    11; // Added macro roles
+    12; // Removed 'IsAsync'.
 
 /// Deserializes CodeCompletionResults from \p in and stores them in \p V.
 /// \see writeCacheModule.
@@ -236,7 +237,6 @@ static bool readCachedModule(llvm::MemoryBuffer *in,
     auto diagSeverity =
         static_cast<CodeCompletionDiagnosticSeverity>(*cursor++);
     auto isSystem = static_cast<bool>(*cursor++);
-    auto isAsync = static_cast<bool>(*cursor++);
     auto hasAsyncAlternative = static_cast<bool>(*cursor++);
     auto chunkIndex = read32le(cursor);
     auto moduleIndex = read32le(cursor);
@@ -267,9 +267,9 @@ static bool readCachedModule(llvm::MemoryBuffer *in,
 
     ContextFreeCodeCompletionResult *result =
         new (*V.Allocator) ContextFreeCodeCompletionResult(
-            kind, associatedKind, opKind, roles, isSystem, isAsync,
-            hasAsyncAlternative, string, moduleName, briefDocComment,
-            makeArrayRef(assocUSRs).copy(*V.Allocator),
+            kind, associatedKind, opKind, roles, isSystem,
+                                                           hasAsyncAlternative, string, moduleName, briefDocComment,
+            llvm::ArrayRef(assocUSRs).copy(*V.Allocator),
             CodeCompletionResultType(resultTypes), notRecommended, diagSeverity,
             diagMessage, filterName, nameForDiagnostics);
 
@@ -428,7 +428,6 @@ static void writeCachedModule(llvm::raw_ostream &out,
       LE.write(static_cast<uint8_t>(R->getNotRecommendedReason()));
       LE.write(static_cast<uint8_t>(R->getDiagnosticSeverity()));
       LE.write(static_cast<uint8_t>(R->isSystem()));
-      LE.write(static_cast<uint8_t>(R->isAsync()));
       LE.write(static_cast<uint8_t>(R->hasAsyncAlternative()));
       LE.write(
           static_cast<uint32_t>(addCompletionString(R->getCompletionString())));
@@ -506,17 +505,17 @@ static std::string getName(StringRef cacheDirectory,
   return std::string(name.str());
 }
 
-llvm::Optional<CodeCompletionCache::ValueRefCntPtr>
+std::optional<CodeCompletionCache::ValueRefCntPtr>
 OnDiskCodeCompletionCache::get(const Key &K) {
   // Try to find the cached file.
   auto bufferOrErr = llvm::MemoryBuffer::getFile(getName(cacheDirectory, K));
   if (!bufferOrErr)
-    return llvm::None;
+    return std::nullopt;
 
   // Read the cached results, failing if they are out of date.
   auto V = CodeCompletionCache::createValue();
   if (!readCachedModule(bufferOrErr.get().get(), K, *V))
-    return llvm::None;
+    return std::nullopt;
 
   return V;
 }
@@ -548,12 +547,12 @@ std::error_code OnDiskCodeCompletionCache::set(const Key &K, ValueRefCntPtr V) {
   return llvm::sys::fs::rename(tmpName.str(), name);
 }
 
-llvm::Optional<CodeCompletionCache::ValueRefCntPtr>
+std::optional<CodeCompletionCache::ValueRefCntPtr>
 OnDiskCodeCompletionCache::getFromFile(StringRef filename) {
   // Try to find the cached file.
   auto bufferOrErr = llvm::MemoryBuffer::getFile(filename);
   if (!bufferOrErr)
-    return llvm::None;
+    return std::nullopt;
 
   // Make up a key for readCachedModule.
   CodeCompletionCache::Key K{/*ModuleFilename=*/filename.str(),
@@ -571,7 +570,7 @@ OnDiskCodeCompletionCache::getFromFile(StringRef filename) {
   auto V = CodeCompletionCache::createValue();
   if (!readCachedModule(bufferOrErr.get().get(), K, *V,
                         /*allowOutOfDate*/ true))
-    return llvm::None;
+    return std::nullopt;
 
   return V;
 }

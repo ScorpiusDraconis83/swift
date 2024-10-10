@@ -12,12 +12,12 @@
 // RUN: %validate-json %t/deps.json &>/dev/null
 
 /// check cas-fs content
-// RUN: %S/Inputs/SwiftDepsExtractor.py %t/deps.json E casFSRootID > %t/E_fs.casid
-// RUN: llvm-cas --cas %t/cas --ls-tree-recursive @%t/E_fs.casid | %FileCheck %s -check-prefix FS_ROOT_E
-// RUN: %S/Inputs/SwiftDepsExtractor.py %t/deps.json F casFSRootID > %t/F_fs.casid
-// RUN: llvm-cas --cas %t/cas --ls-tree-recursive @%t/F_fs.casid | %FileCheck %s -check-prefix FS_ROOT_F
-// RUN: %S/Inputs/SwiftDepsExtractor.py %t/deps.json Test casFSRootID > %t/Test_fs.casid
-// RUN: llvm-cas --cas %t/cas --ls-tree-recursive @%t/Test_fs.casid | %FileCheck %s -check-prefix FS_ROOT_TEST
+// RUN: %{python} %S/Inputs/SwiftDepsExtractor.py %t/deps.json E casFSRootID > %t/E_fs.casid
+// RUN: %cache-tool -cas-path %t/cas -cache-tool-action print-include-tree-list @%t/E_fs.casid | %FileCheck %s -check-prefix FS_ROOT_E
+// RUN: %{python} %S/Inputs/SwiftDepsExtractor.py %t/deps.json F casFSRootID > %t/F_fs.casid
+// RUN: %cache-tool -cas-path %t/cas -cache-tool-action print-include-tree-list @%t/F_fs.casid | %FileCheck %s -check-prefix FS_ROOT_F
+// RUN: %{python} %S/Inputs/SwiftDepsExtractor.py %t/deps.json Test casFSRootID > %t/Test_fs.casid
+// RUN: %cache-tool -cas-path %t/cas -cache-tool-action print-include-tree-list @%t/Test_fs.casid | %FileCheck %s -check-prefix FS_ROOT_TEST
 
 // FS_ROOT_E-DAG: layouts-x86_64.yaml
 // FS_ROOT_E-DAG: E.swiftinterface

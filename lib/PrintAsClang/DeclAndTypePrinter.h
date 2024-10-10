@@ -15,6 +15,8 @@
 
 #include "OutputLanguageMode.h"
 
+#include "swift/AST/Decl.h"
+#include "swift/AST/Module.h"
 #include "swift/AST/Type.h"
 // for OptionalTypeKind
 #include "swift/ClangImporter/ClangImporter.h"
@@ -26,6 +28,7 @@ namespace clang {
 
 namespace swift {
 
+class AccessorDecl;
 class PrimitiveTypeMapping;
 class ValueDecl;
 class SwiftToClangInteropContext;
@@ -41,6 +44,7 @@ struct CxxDeclEmissionScope {
   /// lexical scope.
   llvm::StringMap<llvm::SmallVector<const AbstractFunctionDecl *, 2>>
       emittedFunctionOverloads;
+  llvm::StringMap<const AccessorDecl *> emittedAccessorMethodNames;
 };
 
 /// Responsible for printing a Swift Decl or Type in Objective-C, to be
@@ -57,7 +61,7 @@ private:
   raw_ostream &os;
   raw_ostream &prologueOS;
   raw_ostream &outOfLineDefinitionsOS;
-  const DelayedMemberSet &delayedMembers;
+  const DelayedMemberSet &objcDelayedMembers;
   CxxDeclEmissionScope *cxxDeclEmissionScope;
   PrimitiveTypeMapping &typeMapping;
   SwiftToClangInteropContext &interopContext;
@@ -84,7 +88,8 @@ public:
                      llvm::StringSet<> &exposedModules,
                      OutputLanguageMode outputLang)
       : M(mod), os(out), prologueOS(prologueOS),
-        outOfLineDefinitionsOS(outOfLineDefinitionsOS), delayedMembers(delayed),
+        outOfLineDefinitionsOS(outOfLineDefinitionsOS),
+        objcDelayedMembers(delayed),
         cxxDeclEmissionScope(&topLevelEmissionScope), typeMapping(typeMapping),
         interopContext(interopContext), minRequiredAccess(access),
         requiresExposedAttribute(requiresExposedAttribute),
@@ -113,6 +118,9 @@ public:
   void print(const Decl *D);
   void print(Type ty);
 
+  /// Prints the name of the type including generic arguments.
+  void printTypeName(raw_ostream &os, Type ty, const ModuleDecl *moduleContext);
+
   void printAvailability(raw_ostream &os, const Decl *D);
 
   /// Is \p ED empty of members and protocol conformances to include?
@@ -139,6 +147,8 @@ public:
   static std::pair<Type, OptionalTypeKind>
   getObjectTypeAndOptionality(const ValueDecl *D, Type ty);
 };
+
+bool isStringNestedType(const ValueDecl *VD, StringRef Typename);
 
 } // end namespace swift
 

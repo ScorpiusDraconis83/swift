@@ -20,9 +20,7 @@ extension ASTGenError {
     MessageID(domain: "ASTGen", id: "\(Self.self)")
   }
 
-  var severity: DiagnosticSeverity {
-    .error
-  }
+  var severity: DiagnosticSeverity { .error }
 }
 
 /// An error emitted when a token is of an unexpected kind.
@@ -111,4 +109,13 @@ struct UnknownAccessorSpecifierError: ASTGenError {
   var message: String {
     "unknown accessor specifier '\(specifier.text)'"
   }
+}
+
+struct RegexParserError: ASTGenError {
+  var message: String
+  init(_ message: String) {
+    self.message = message
+  }
+
+  var severity: DiagnosticSeverity { .error }
 }

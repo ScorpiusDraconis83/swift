@@ -25,6 +25,7 @@
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
 #include "swift/Parse/ParseVersion.h"
 #include "clang/CAS/CASOptions.h"
+#include "clang/CAS/IncludeTree.h"
 #include "llvm/CAS/ActionCache.h"
 #include "llvm/CAS/BuiltinUnifiedCASDatabases.h"
 #include "llvm/CAS/ObjectStore.h"
@@ -45,7 +46,8 @@ enum class SwiftCacheToolAction {
   PrintBaseKey,
   PrintOutputKeys,
   ValidateOutputs,
-  RenderDiags
+  RenderDiags,
+  PrintIncludeTreeList,
 };
 
 struct OutputEntry {
@@ -147,6 +149,8 @@ public:
               .Case("print-output-keys", SwiftCacheToolAction::PrintOutputKeys)
               .Case("validate-outputs", SwiftCacheToolAction::ValidateOutputs)
               .Case("render-diags", SwiftCacheToolAction::RenderDiags)
+              .Case("print-include-tree-list",
+                    SwiftCacheToolAction::PrintIncludeTreeList)
               .Default(SwiftCacheToolAction::Invalid);
 
     if (ActionKind == SwiftCacheToolAction::Invalid) {
@@ -169,6 +173,8 @@ public:
       return validateOutputs();
     case SwiftCacheToolAction::RenderDiags:
       return renderDiags();
+    case SwiftCacheToolAction::PrintIncludeTreeList:
+      return printIncludeTreeList();
     case SwiftCacheToolAction::Invalid:
       return 0; // No action. Probably just print help. Return.
     }
@@ -187,9 +193,9 @@ private:
     }
     // drop swift-frontend executable path and leading `-frontend` from
     // command-line.
-    if (StringRef(FrontendArgs[0]).endswith("swift-frontend"))
+    if (StringRef(FrontendArgs[0]).ends_with("swift-frontend"))
       FrontendArgs.erase(FrontendArgs.begin());
-    if (StringRef(FrontendArgs[0]).equals("-frontend"))
+    if (StringRef(FrontendArgs[0]) == "-frontend")
       FrontendArgs.erase(FrontendArgs.begin());
 
     SmallVector<std::unique_ptr<llvm::MemoryBuffer>, 4>
@@ -220,7 +226,7 @@ private:
                              MainExecutablePath))
       return true;
 
-    if (!Invocation.getFrontendOptions().EnableCaching) {
+    if (!Invocation.getCASOptions().EnableCaching) {
       llvm::errs() << "Requested command-line arguments do not enable CAS\n";
       return true;
     }
@@ -240,12 +246,12 @@ private:
     return false;
   }
 
-  llvm::Optional<ObjectRef> getBaseKey() {
+  std::optional<ObjectRef> getBaseKey() {
     auto BaseKey = Instance.getCompilerBaseKey();
     if (!BaseKey) {
       Instance.getDiags().diagnose(SourceLoc(), diag::error_cas,
                                    "Base Key doesn't exist");
-      return llvm::None;
+      return std::nullopt;
     }
 
     return *BaseKey;
@@ -269,6 +275,7 @@ private:
   int printOutputKeys();
   int validateOutputs();
   int renderDiags();
+  int printIncludeTreeList();
 };
 
 } // end anonymous namespace
@@ -284,10 +291,10 @@ int SwiftCacheToolInvocation::printOutputKeys() {
 
   std::vector<OutputEntry> OutputKeys;
   bool hasError = false;
-  auto addFromInputFile = [&](const InputFile &Input) {
+  auto addFromInputFile = [&](const InputFile &Input, unsigned InputIndex) {
     auto InputPath = Input.getFileName();
     auto OutputKey =
-        createCompileJobCacheKeyForOutput(CAS, *BaseKey, InputPath);
+        createCompileJobCacheKeyForOutput(CAS, *BaseKey, InputIndex);
     if (!OutputKey) {
       llvm::errs() << "cannot create cache key for " << InputPath << ": "
                    << toString(OutputKey.takeError()) << "\n";
@@ -310,9 +317,10 @@ int SwiftCacheToolInvocation::printOutputKeys() {
               Outputs.emplace_back(file_types::getTypeName(ID), File);
             });
   };
-  llvm::for_each(
-      Invocation.getFrontendOptions().InputsAndOutputs.getAllInputs(),
-      addFromInputFile);
+  auto AllInputs =
+      Invocation.getFrontendOptions().InputsAndOutputs.getAllInputs();
+  for (unsigned Index = 0; Index < AllInputs.size(); ++Index)
+    addFromInputFile(AllInputs[Index], Index);
 
   // Add diagnostics file.
   if (!OutputKeys.empty())
@@ -485,6 +493,38 @@ int SwiftCacheToolInvocation::renderDiags() {
   };
 
   return llvm::any_of(Inputs, renderDiagsFromFile);
+}
+
+int SwiftCacheToolInvocation::printIncludeTreeList() {
+  auto error = [](llvm::Error err) {
+    llvm::errs() << llvm::toString(std::move(err)) << "\n";
+    return 1;
+  };
+  auto DB = CASOpts.getOrCreateDatabases();
+  if (!DB) {
+    return error(DB.takeError());
+  }
+  auto CAS = DB->first;
+  for (auto &input: Inputs) {
+    auto ID = CAS->parseID(input);
+    if (!ID)
+      return error(ID.takeError());
+
+    auto Ref = CAS->getReference(*ID);
+    if (!Ref) {
+      llvm::errs() << "CAS object not found: " << input << "\n";
+      return 1;
+    }
+
+    auto fileList = clang::cas::IncludeTree::FileList::get(*CAS, *Ref);
+    if (!fileList)
+      return error(fileList.takeError());
+
+    if (auto err = fileList->print(llvm::outs()))
+      return error(std::move(err));
+  }
+
+  return 0;
 }
 
 int swift_cache_tool_main(ArrayRef<const char *> Args, const char *Argv0,
